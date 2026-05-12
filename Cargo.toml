@@ -10,3 +10,7 @@ rayon = ["dep:rayon"]
 [dependencies]
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = { version = "1", optional = true }
+
+[[example]]
+name = "parallel_buggy_stack"
+required-features = ["rayon"]
