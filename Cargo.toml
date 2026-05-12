@@ -1,0 +1,12 @@
+[package]
+name = "mutation-invariant-fuzzer"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rayon = ["dep:rayon"]
+
+[dependencies]
+rand = { version = "0.9", features = ["small_rng"] }
+rayon = { version = "1", optional = true }
