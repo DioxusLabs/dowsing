@@ -1,5 +1,5 @@
 [package]
-name = "mutation-invariant-fuzzer"
+name = "iterator-fuzz"
 version = "0.1.0"
 edition = "2024"
 

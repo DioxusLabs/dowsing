@@ -1,4 +1,4 @@
-# mutation-invariant-fuzzer
+# iterator-fuzz
 
 Small Rust helper for deterministic state-machine fuzzing.
 
@@ -18,7 +18,7 @@ The pipeline is a plain `Iterator`, so `.take(N)`, `.inspect(..)`, `try_for_each
 with it.
 
 ```rust
-use mutation_invariant_fuzzer::{CaseIteratorExt, Fuzzer, Step};
+use iterator_fuzz::{CaseIteratorExt, Fuzzer, Step};
 use rand::{
     Rng,
     distr::{Distribution, StandardUniform},
@@ -133,7 +133,7 @@ Enable the optional `rayon` feature to fan out seeds across cores:
 
 ```toml
 [dependencies]
-mutation-invariant-fuzzer = { version = "0.1", features = ["rayon"] }
+iterator-fuzz = { version = "0.1", features = ["rayon"] }
 ```
 
 `SequencesBuilder::par()` produces a rayon `IndexedParallelIterator`, and the
@@ -142,7 +142,7 @@ stages. Closures must be `Fn + Send + Sync` (not `FnMut`), since each thread inv
 worker builds its own `State` via `init`.
 
 ```rust
-use mutation_invariant_fuzzer::{Fuzzer, parallel::ParCaseIteratorExt};
+use iterator_fuzz::{Fuzzer, parallel::ParCaseIteratorExt};
 use rayon::iter::ParallelIterator;
 
 let bug = Fuzzer::sequences(StandardUniform)
