@@ -655,7 +655,10 @@ pub mod parallel {
             step: Step,
         ) -> impl ParallelIterator<Item = FailedCase<Op>>
         where
-            State: Send,
+            // No `State: Send` bound — `State` is created via `init()` and consumed
+            // entirely on the worker thread that processes the case. It never crosses
+            // a thread boundary, so even `!Send` state (e.g. `dioxus_core::VirtualDom`)
+            // is safe to use here.
             Init: Fn() -> State + Sync + Send,
             Step: for<'a> Fn(&mut State, crate::Step<'a, Op>) -> Result<(), String> + Sync + Send,
         {
@@ -680,7 +683,10 @@ pub mod parallel {
         ) -> impl ParallelIterator<Item = MinimizedFailure<Op>>
         where
             Op: Clone,
-            State: Send,
+            // No `State: Send` bound — `State` is created via `init()` and consumed
+            // entirely on the worker thread that processes the case. It never crosses
+            // a thread boundary, so even `!Send` state (e.g. `dioxus_core::VirtualDom`)
+            // is safe to use here.
             Init: Fn() -> State + Sync + Send,
             Step: for<'a> Fn(&mut State, crate::Step<'a, Op>) -> Result<(), String> + Sync + Send,
             Cost: CostModel<Op> + Sync + Send,

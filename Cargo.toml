@@ -6,11 +6,18 @@ edition = "2024"
 [features]
 default = []
 rayon = ["dep:rayon"]
+dioxus = ["dep:dioxus", "dep:dioxus-core"]
 
 [dependencies]
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = { version = "1", optional = true }
+dioxus = { path = "../dioxus/packages/dioxus", default-features = false, features = ["macro", "html", "signals", "hooks"], optional = true }
+dioxus-core = { path = "../dioxus/packages/core", optional = true }
 
 [[example]]
 name = "parallel_buggy_stack"
 required-features = ["rayon"]
+
+[[example]]
+name = "dioxus_vdom"
+required-features = ["dioxus", "rayon"]
