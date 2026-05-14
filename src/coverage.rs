@@ -768,11 +768,3 @@ pub struct NoopSequenceMutator;
 impl<Op> SequenceMutator<Op> for NoopSequenceMutator {
     fn mutate(&mut self, _ops: &[Op], _emit: &mut dyn FnMut(Vec<Op>)) {}
 }
-
-pub(crate) struct PendingCoverageCase<Op> {
-    pub(crate) case: CoverageCase<Op>,
-    pub(crate) priority: u64,
-    pub(crate) order: u64,
-}
-
-pub(crate) const DEFAULT_SEED_INTERVAL: usize = 1;

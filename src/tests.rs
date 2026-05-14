@@ -628,7 +628,8 @@ fn coverage_guided_evaluates_initial_cases_before_generated_seeds() {
                 .steps(1)
                 .materialize(),
         )
-        .explore_coverage(TestCapture::new());
+        .explore_coverage(TestCapture::new())
+        .seed_ratio(1);
 
     for _ in 0..2 {
         let case = explorer
@@ -662,8 +663,7 @@ fn coverage_guided_mutates_accepted_cases() {
             candidate.push(Op::Peek);
             emit(candidate);
         })
-        .rounds(1)
-        .mutations_per_entry(1);
+        .mutate_depth(1);
 
     for _ in 0..2 {
         let case = explorer
@@ -692,8 +692,8 @@ fn coverage_guided_returns_to_seed_stream_between_mutations() {
             candidate.push(Op::Peek);
             emit(candidate);
         })
-        .rounds(4)
-        .mutations_per_entry(1);
+        .mutate_depth(1)
+        .seed_ratio(2);
 
     for _ in 0..3 {
         let case = explorer
@@ -708,6 +708,89 @@ fn coverage_guided_returns_to_seed_stream_between_mutations() {
     assert_eq!(accepted[0].seed, Some(0));
     assert_eq!(accepted[1].parent, Some(accepted[0].id));
     assert_eq!(accepted[2].seed, Some(1));
+}
+
+#[test]
+fn coverage_guided_energy_concentrates_on_rare_features() {
+    // A capture that gives root 0 a rare feature and root 1 a common one. Subsequent
+    // executions only hit the common feature, so frequency for `COMMON` grows
+    // unboundedly while `RARE` stays at 1. Entropic energy should drive nearly all
+    // mutation samples to root 0 once the run is warm.
+    const RARE: u64 = 1;
+    const COMMON: u64 = 2;
+
+    #[derive(Debug, Clone)]
+    struct LabelledCapture {
+        next_seq: u64,
+    }
+    impl CoverageCapture for LabelledCapture {
+        type Token = u64;
+        fn start_capture(&mut self) -> Result<Self::Token, String> {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            Ok(seq)
+        }
+        fn finish_capture(
+            &mut self,
+            token: Self::Token,
+            outcome: Result<(), String>,
+        ) -> Result<CoverageEvaluation, String> {
+            let mut coverage = CoverageSet::new();
+            match token {
+                0 => {
+                    coverage.insert(CoverageId(RARE));
+                    coverage.insert(CoverageId(1_000));
+                }
+                _ => {
+                    coverage.insert(CoverageId(COMMON));
+                }
+            }
+            Ok(CoverageEvaluation::from_outcome(outcome, coverage))
+        }
+    }
+
+    let mut explorer = Fuzzer::sequences(StandardUniform)
+        .base_seed(0)
+        .seeds(2)
+        .steps(1)
+        .materialize::<Op>()
+        .explore_coverage(LabelledCapture { next_seq: 0 })
+        .mutate(|ops: &[Op], emit: &mut dyn FnMut(Vec<Op>)| {
+            let mut candidate = ops.to_vec();
+            candidate.push(Op::Peek);
+            emit(candidate);
+        })
+        .mutate_depth(1)
+        .seed_ratio(4)
+        .rng_seed(0xC0FFEE);
+
+    for _ in 0..2 {
+        let case = explorer
+            .next()
+            .expect("seed case")
+            .expect("seed should start");
+        case.finish().expect("seed should pass");
+    }
+    assert_eq!(explorer.corpus().len(), 2);
+
+    let mut lineage_rare = 0usize;
+    let mut lineage_common = 0usize;
+    for _ in 0..400 {
+        let case = explorer.next().expect("more cases").expect("case starts");
+        let parent = case.meta().parent;
+        case.finish().expect("case passes");
+        match parent {
+            Some(0) => lineage_rare += 1,
+            Some(1) => lineage_common += 1,
+            _ => {}
+        }
+    }
+
+    assert!(
+        lineage_rare > lineage_common * 4,
+        "rare-feature root should dominate the weighted sample: \
+         lineage_rare={lineage_rare}, lineage_common={lineage_common}"
+    );
 }
 
 #[test]

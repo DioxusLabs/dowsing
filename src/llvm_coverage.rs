@@ -198,6 +198,7 @@ impl LlvmCoverageCase<'_> {
 /// greybox search features.
 pub struct LlvmCounterCoverage {
     counter_count: usize,
+    bucketing: bool,
 }
 
 impl LlvmCounterCoverage {
@@ -210,7 +211,17 @@ impl LlvmCounterCoverage {
         }
         Ok(Self {
             counter_count: counter_count as usize,
+            bucketing: true,
         })
+    }
+
+    /// Toggle AFL-style hit-count bucketing. When `true` (default), each `(counter_index,
+    /// bucket)` pair becomes a distinct [`CoverageId`] so that executing the same edge a
+    /// different number of times produces different coverage. When `false`, coverage is
+    /// binary — any nonzero counter contributes a single ID per index.
+    pub fn with_bucketing(mut self, enabled: bool) -> Self {
+        self.bucketing = enabled;
+        self
     }
 
     /// Reset counters, run one case, and return its outcome plus covered counter IDs.
@@ -241,7 +252,7 @@ impl CoverageCapture for LlvmCounterCoverage {
         _token: Self::Token,
         outcome: Result<(), String>,
     ) -> Result<CoverageEvaluation, String> {
-        let coverage = counter_coverage(self.counter_count)?;
+        let coverage = counter_coverage(self.counter_count, self.bucketing)?;
         Ok(CoverageEvaluation::from_outcome(outcome, coverage))
     }
 }
@@ -266,7 +277,8 @@ impl LlvmCounterCoverageCase<'_> {
 
     /// Finish this case by reading the current nonzero LLVM counters.
     pub fn finish(self, outcome: Result<(), String>) -> Result<CoverageEvaluation, String> {
-        let coverage = counter_coverage(self.collector.counter_count)?;
+        let coverage =
+            counter_coverage(self.collector.counter_count, self.collector.bucketing)?;
         Ok(CoverageEvaluation::from_outcome(outcome, coverage))
     }
 }
@@ -344,7 +356,7 @@ fn counter_bounds() -> Result<(*const u64, *const u64), String> {
     Ok((begin, end))
 }
 
-fn counter_coverage(counter_count: usize) -> Result<CoverageSet, String> {
+fn counter_coverage(counter_count: usize, bucketing: bool) -> Result<CoverageSet, String> {
     let (begin, end) = counter_bounds()?;
     let current_count = unsafe { end.offset_from(begin) };
     if current_count < 0 || current_count as usize != counter_count {
@@ -356,11 +368,34 @@ fn counter_coverage(counter_count: usize) -> Result<CoverageSet, String> {
     let mut coverage = CoverageSet::new();
     for index in 0..counter_count {
         let counter = unsafe { std::ptr::read_volatile(begin.add(index)) };
-        if counter != 0 {
-            coverage.insert(CoverageId(index as u64));
+        if counter == 0 {
+            continue;
         }
+        let id = if bucketing {
+            ((index as u64) << 8) | u64::from(hit_count_bucket(counter))
+        } else {
+            index as u64
+        };
+        coverage.insert(CoverageId(id));
     }
     Ok(coverage)
+}
+
+/// Classic AFL hit-count bucketing. Maps a raw counter value to one of eight buckets so
+/// inputs that hit the same edge a wildly different number of times produce distinct
+/// coverage features.
+fn hit_count_bucket(counter: u64) -> u8 {
+    match counter {
+        0 => 0,
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        4..=7 => 3,
+        8..=15 => 4,
+        16..=31 => 5,
+        32..=127 => 6,
+        _ => 7,
+    }
 }
 
 fn ensure_success(

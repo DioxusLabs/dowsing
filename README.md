@@ -162,8 +162,8 @@ let mut explorer = exact_roots
     )
     .explore_coverage(coverage)
     .mutate(mutate_ops)
-    .rounds(6)
-    .mutations_per_entry(64)
+    .mutate_depth(5)
+    .seed_ratio(8)
     .accepted_limit(128);
 
 while let Some(case) = explorer.next() {
