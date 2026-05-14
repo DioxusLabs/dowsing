@@ -123,7 +123,11 @@ fn main() {
         None => println!("no bug found in 256 seeds × 64 ops"),
         Some(bug) => {
             println!("seed {} failed:", bug.seed);
-            println!("  original {} ops -> minimized to {} ops", bug.ops.len(), bug.minimized_ops.len());
+            println!(
+                "  original {} ops -> minimized to {} ops",
+                bug.ops.len(),
+                bug.minimized_ops.len()
+            );
             println!("  minimized repro:");
             for (i, op) in bug.minimized_ops.iter().enumerate() {
                 println!("    {i}: {op:?}");

@@ -127,6 +127,52 @@ top of them.
 The reducer only removes operations. It preserves order and accepts a candidate when it still fails
 and improves `(total_cost, length)`.
 
+`minimize_with_transforms` and `reduce_preserving_with_transforms` accept a `SequenceMutator`
+callback. The mutator emits valid rewritten operation sequences for your domain; the library
+decides whether each candidate keeps the failure, keeps required coverage, or adds new coverage.
+
+## Coverage-guided exploration
+
+Enable `llvm-coverage` and build the harness with LLVM source coverage instrumentation. The
+coverage-guided adapter is still an iterator: it yields accepted cases that fail or add real source
+coverage.
+
+```rust
+use iterator_fuzz::{CaseIteratorExt, Fuzzer, llvm_coverage::LlvmCoverage, replay_ops};
+
+let mut coverage = LlvmCoverage::new(
+    std::env::current_exe()?,
+    [std::path::PathBuf::from("src")],
+    "target/iterator-fuzz-cov/my-harness",
+)?;
+
+let corpus: Vec<_> = Fuzzer::sequences(StandardUniform)
+    .base_seed(0)
+    .seeds(128)
+    .steps(256)
+    .coverage_guided(move |ops| {
+        coverage
+            .evaluate(|| replay_ops(ops, State::new, apply_and_check))
+            .expect("failed to collect LLVM coverage")
+    })
+    .mutate(mutate_ops)
+    .shrink(simplify_ops)
+    .rounds(6)
+    .mutations_per_entry(64)
+    .take(128)
+    .collect();
+```
+
+Run the harness with instrumentation:
+
+```sh
+rustup component add llvm-tools-preview
+RUSTFLAGS="-Cinstrument-coverage" cargo run --features llvm-coverage --example my_harness
+```
+
+`LlvmCoverage` resets counters before each candidate, writes a per-case `.profraw`, exports source
+regions with `llvm-cov`, and feeds those region IDs to `coverage_guided`.
+
 ## Parallel fuzzing (rayon)
 
 Enable the optional `rayon` feature to fan out seeds across cores:

@@ -7,22 +7,34 @@
 //! goes through `diff_keyed_children` somewhere.
 //!
 //! Run with `cargo run --release --example dioxus_vdom --features "dioxus rayon"`.
+//!
+//! Coverage-guided:
+//!
+//! ```sh
+//! RUSTFLAGS="-Cinstrument-coverage" \
+//!   FUZZ_COVERAGE=1 FUZZ_SEEDS=128 FUZZ_STEPS=128 FUZZ_COVERAGE_CASES=64 \
+//!   cargo run --example dioxus_vdom --features "dioxus rayon llvm-coverage"
+//! ```
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use dioxus::prelude::*;
 use dioxus_core::{
     AttributeValue, ElementId, Mutations, ScopeId, Template, TemplateAttribute, TemplateNode,
     VirtualDom, WriteMutations,
 };
-use iterator_fuzz::{Fuzzer, Step, parallel::ParCaseIteratorExt};
-use rayon::iter::ParallelIterator;
+use iterator_fuzz::{
+    CaseIteratorExt, Fuzzer, Step, llvm_coverage::LlvmCoverage, parallel::ParCaseIteratorExt,
+    replay_ops,
+};
 use rand::{
     Rng,
     distr::{Distribution, StandardUniform},
 };
+use rayon::iter::ParallelIterator;
 
 // ---------- Model ---------------------------------------------------------------------------
 
@@ -713,12 +725,6 @@ impl WriteMutations for TrackingTree {
         self.id_map.insert(id.0, target);
     }
 
-    fn create_placeholder(&mut self, id: ElementId) {
-        let idx = self.alloc(NodeKind::Placeholder);
-        self.id_map.insert(id.0, idx);
-        self.stack.push(idx);
-    }
-
     fn create_text_node(&mut self, value: &str, id: ElementId) {
         let idx = self.alloc(NodeKind::Text(value.to_string()));
         self.id_map.insert(id.0, idx);
@@ -741,12 +747,12 @@ impl WriteMutations for TrackingTree {
         self.insert_detached(parent, pos, new_kids);
     }
 
-    fn replace_placeholder_with_nodes(&mut self, path: &'static [u8], m: usize) {
+    fn insert_children_at_path(&mut self, path: &'static [u8], m: usize) {
         let new_kids = self.pop_m(m);
         let top = *self
             .stack
             .last()
-            .expect("replace_placeholder_with_nodes with empty stack");
+            .expect("insert_children_at_path with empty stack");
         let target = self.walk_path(top, path);
         self.unhook_all(&new_kids);
         let (parent, pos) = self.detach_from_parent(target);
@@ -813,6 +819,10 @@ impl WriteMutations for TrackingTree {
         }
         let idx = self.lookup(id);
         self.stack.push(idx);
+    }
+
+    fn pop_root(&mut self) {
+        self.stack.pop().expect("pop_root with empty stack");
     }
 }
 
@@ -926,18 +936,95 @@ fn cost(op: &Op) -> u64 {
     op.slots.iter().filter(|s| s.is_some()).count() as u64
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn coverage_sources() -> Vec<PathBuf> {
+    std::env::var_os("FUZZ_COVERAGE_SOURCES")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_else(|| vec![PathBuf::from("../dioxus/packages/core/src")])
+}
+
+fn coverage_collector() -> LlvmCoverage {
+    let object = std::env::var_os("FUZZ_COVERAGE_OBJECT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_exe().expect("failed to locate current executable"));
+    let workdir = std::env::var_os("FUZZ_COVERAGE_WORKDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target/iterator-fuzz-cov/dioxus-vdom-example"));
+    let mut coverage = LlvmCoverage::new(object, coverage_sources(), workdir)
+        .expect("failed to initialize LLVM coverage");
+    if let Some(path) = std::env::var_os("LLVM_PROFDATA") {
+        coverage = coverage.llvm_profdata(path);
+    }
+    if let Some(path) = std::env::var_os("LLVM_COV") {
+        coverage = coverage.llvm_cov(path);
+    }
+    coverage
+}
+
+fn run_coverage_guided() {
+    let seeds = env_u64("FUZZ_SEEDS", 128);
+    let steps = env_usize("FUZZ_STEPS", 128);
+    let max_cases = env_usize("FUZZ_COVERAGE_CASES", 64);
+    let mut coverage = coverage_collector();
+    let mut explorer = Fuzzer::sequences(StandardUniform)
+        .base_seed(0)
+        .seeds(seeds)
+        .steps(steps)
+        .coverage_guided(move |ops: &[Op]| {
+            coverage
+                .evaluate(|| replay_ops(ops, Harness::fresh, apply_step))
+                .expect("failed to collect LLVM coverage")
+        })
+        .cost(cost);
+
+    println!("coverage-guided fuzzing {seeds} seeds x {steps} ops, accepting up to {max_cases}");
+    let mut accepted = 0usize;
+    for case in (&mut explorer).take(max_cases) {
+        accepted += 1;
+        println!(
+            "accepted #{accepted}: seed {:?}, len {}, +{} coverage ids",
+            case.seed,
+            case.len,
+            case.unique_coverage.len()
+        );
+        if let Err(error) = &case.outcome {
+            println!("failure after {} ops: {error}", case.ops.len());
+            break;
+        }
+    }
+    let stats = explorer.stats();
+    println!(
+        "coverage summary: generated {}, executed {}, accepted {}, failures {}, coverage ids {}",
+        stats.generated, stats.executed, stats.accepted, stats.failures, stats.coverage_ids
+    );
+}
+
 fn main() {
-    let seeds: u64 = std::env::var("FUZZ_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32_768);
-    let steps: usize = std::env::var("FUZZ_STEPS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512);
+    if std::env::var_os("FUZZ_COVERAGE").is_some() {
+        run_coverage_guided();
+        return;
+    }
+
+    let seeds = env_u64("FUZZ_SEEDS", 32_768);
+    let steps = env_usize("FUZZ_STEPS", 512);
 
     let workers = rayon::current_num_threads();
-    println!("fuzzing {seeds} seeds × {steps} ops across {workers} rayon workers (keyed-list focus)");
+    println!(
+        "fuzzing {seeds} seeds × {steps} ops across {workers} rayon workers (keyed-list focus)"
+    );
 
     // VirtualDom is `!Send`, but each parallel case constructs its own Harness
     // inside the worker via `Harness::fresh` and never sends it elsewhere.

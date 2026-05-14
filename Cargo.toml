@@ -7,10 +7,12 @@ edition = "2024"
 default = []
 rayon = ["dep:rayon"]
 dioxus = ["dep:dioxus", "dep:dioxus-core"]
+llvm-coverage = ["dep:serde_json"]
 
 [dependencies]
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
 dioxus = { path = "../dioxus/packages/dioxus", default-features = false, features = ["macro", "html", "signals", "hooks"], optional = true }
 dioxus-core = { path = "../dioxus/packages/core", optional = true }
 
@@ -20,4 +22,4 @@ required-features = ["rayon"]
 
 [[example]]
 name = "dioxus_vdom"
-required-features = ["dioxus", "rayon"]
+required-features = ["dioxus", "rayon", "llvm-coverage"]
