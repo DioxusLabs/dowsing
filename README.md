@@ -134,33 +134,60 @@ decides whether each candidate keeps the failure, keeps required coverage, or ad
 ## Coverage-guided exploration
 
 Enable `llvm-coverage` and build the harness with LLVM source coverage instrumentation. The
-coverage-guided adapter is still an iterator: it yields accepted cases that fail or add real source
-coverage.
+coverage-guided adapter is still an iterator: it yields runnable cases. Each case starts coverage
+capture before it is yielded; calling `finish` (or dropping the case) ends capture, accepts
+interesting cases, and queues mutation-derived follow-up cases.
 
 ```rust
-use iterator_fuzz::{CaseIteratorExt, Fuzzer, llvm_coverage::LlvmCoverage, replay_ops};
+use iterator_fuzz::{
+    CaseIteratorExt, Fuzzer, InputCase, InputCaseIteratorExt, MeasuredCaseIteratorExt,
+    llvm_coverage::LlvmCoverage, replay_ops,
+};
 
-let mut coverage = LlvmCoverage::new(
+let coverage = LlvmCoverage::new(
     std::env::current_exe()?,
     [std::path::PathBuf::from("src")],
     "target/iterator-fuzz-cov/my-harness",
 )?;
 
-let corpus: Vec<_> = Fuzzer::sequences(StandardUniform)
+let exact_roots = vec![InputCase::root(None, vec![Op::Peek])];
+let mut explorer = exact_roots
+    .into_iter()
+    .chain(
+        Fuzzer::sequences(StandardUniform)
+            .base_seed(0)
+            .seeds(128)
+            .steps(256)
+            .materialize(),
+    )
+    .explore_coverage(coverage)
+    .mutate(mutate_ops)
+    .rounds(6)
+    .mutations_per_entry(64)
+    .accepted_limit(128);
+
+while let Some(case) = explorer.next() {
+    let mut case = case?;
+    case.set_outcome(replay_ops(case.ops(), State::new, apply_and_check));
+    case.finish()?;
+}
+
+let corpus = explorer.corpus();
+```
+
+For simpler workflows, the coverage pieces can be composed directly:
+
+```rust
+let accepted = Fuzzer::sequences(StandardUniform)
     .base_seed(0)
     .seeds(128)
     .steps(256)
-    .coverage_guided(move |ops| {
-        coverage
-            .evaluate(|| replay_ops(ops, State::new, apply_and_check))
-            .expect("failed to collect LLVM coverage")
+    .materialize()
+    .measure_coverage(move |ops| {
+        coverage.evaluate(|| replay_ops(ops, State::new, apply_and_check))
     })
-    .mutate(mutate_ops)
-    .shrink(simplify_ops)
-    .rounds(6)
-    .mutations_per_entry(64)
-    .take(128)
-    .collect();
+    .maximize_coverage()
+    .collect::<Result<Vec<_>, _>>()?;
 ```
 
 Run the harness with instrumentation:
@@ -171,7 +198,7 @@ RUSTFLAGS="-Cinstrument-coverage" cargo run --features llvm-coverage --example m
 ```
 
 `LlvmCoverage` resets counters before each candidate, writes a per-case `.profraw`, exports source
-regions with `llvm-cov`, and feeds those region IDs to `coverage_guided`.
+regions with `llvm-cov`, and feeds those region IDs to `explore_coverage`.
 
 ## Parallel fuzzing (rayon)
 

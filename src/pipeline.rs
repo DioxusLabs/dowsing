@@ -1,7 +1,13 @@
-struct FuzzConfig {
-    base_seed: u64,
-    seeds: u64,
-    steps: usize,
+use crate::{
+    CostModel, InputCase, SequenceMutator, replay_ops, reduce_with_cost,
+    reduce_with_cost_and_transforms,
+};
+use rand::{Rng, SeedableRng, distr::Distribution, rngs::SmallRng};
+
+pub(crate) struct FuzzConfig {
+    pub(crate) base_seed: u64,
+    pub(crate) seeds: u64,
+    pub(crate) steps: usize,
 }
 
 impl Default for FuzzConfig {
@@ -17,96 +23,85 @@ impl Default for FuzzConfig {
 /// A single replay step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step<'a, Op> {
+    pub(crate) index: usize,
+    pub(crate) op: &'a Op,
+}
+
+impl<'a, Op> Step<'a, Op> {
     /// Index of this operation in the replayed sequence.
-    pub index: usize,
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     /// Operation being applied.
-    pub op: &'a Op,
+    pub fn op(&self) -> &'a Op {
+        self.op
+    }
 }
 
 /// A generated operation sequence for a single seed.
 ///
 /// The case is lazy: it carries only the `seed`, the number of `steps`, and a clone of the
 /// sampling distribution. Ops are regenerated deterministically each time you ask for them, so
-/// passing cases never allocate a `Vec<Op>`.
-///
-/// - [`replay`](GeneratedCase::replay) streams ops through your step function with no allocation.
-/// - [`iter_ops`](GeneratedCase::iter_ops) yields each `Op` lazily.
-/// - [`ops`](GeneratedCase::ops) materializes the full op list as a `Vec<Op>` (needed for
-///   [`reduce_with_cost`]).
+/// passing cases never allocate a `Vec<Op>`. The op type is determined by the caller's
+/// `Distribution<Op>` impl when ops are produced — `GeneratedCase` itself does not carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GeneratedCase<Op, Dist> {
-    /// Seed used to deterministically derive the op stream.
-    pub seed: u64,
-    /// Number of ops this case contains.
-    pub steps: usize,
-    distribution: Dist,
-    _op: PhantomData<fn() -> Op>,
+pub struct GeneratedCase<Dist> {
+    pub(crate) seed: u64,
+    pub(crate) steps: usize,
+    pub(crate) distribution: Dist,
 }
 
-impl<Op, Dist> GeneratedCase<Op, Dist>
-where
-    Dist: Distribution<Op>,
-{
+impl<Dist> GeneratedCase<Dist> {
+    /// Seed used to deterministically derive the op stream.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Number of ops this case contains.
+    pub fn steps(&self) -> usize {
+        self.steps
+    }
+
     /// Materialize this case's full op list as a `Vec<Op>`. Allocates `steps` items.
-    pub fn ops(&self) -> Vec<Op> {
+    pub fn ops<Op>(&self) -> Vec<Op>
+    where
+        Dist: Distribution<Op>,
+    {
         self.iter_ops().collect()
     }
 
     /// Stream ops lazily without allocating a `Vec`. Each call re-seeds from `seed`.
-    pub fn iter_ops(&self) -> CaseOps<'_, Op, Dist> {
-        CaseOps {
-            rng: SmallRng::seed_from_u64(self.seed),
-            distribution: &self.distribution,
-            remaining: self.steps,
-            _op: PhantomData,
-        }
+    pub fn iter_ops<Op>(&self) -> impl ExactSizeIterator<Item = Op> + '_
+    where
+        Dist: Distribution<Op>,
+    {
+        let mut rng = SmallRng::seed_from_u64(self.seed);
+        let dist = &self.distribution;
+        (0..self.steps).map(move |_| rng.sample(dist))
     }
 
     /// Replay this case lazily: stream ops through `step` (no `Vec` allocation), returning the
     /// first `Err`.
-    pub fn replay<State, Init, Fold>(&self, mut init: Init, mut step: Fold) -> Result<(), String>
+    pub fn replay<Op, State, Init, Fold>(
+        &self,
+        mut init: Init,
+        mut step: Fold,
+    ) -> Result<(), String>
     where
+        Dist: Distribution<Op>,
         Init: FnMut() -> State,
         Fold: for<'a> FnMut(&mut State, Step<'a, Op>) -> Result<(), String>,
     {
         let mut state = init();
         let mut rng = SmallRng::seed_from_u64(self.seed);
         for index in 0..self.steps {
-            let op = rng.sample(&self.distribution);
+            let op: Op = rng.sample(&self.distribution);
             step(&mut state, Step { index, op: &op })?;
         }
         Ok(())
     }
 }
-
-/// Iterator that lazily samples a [`GeneratedCase`]'s ops one at a time.
-pub struct CaseOps<'a, Op, Dist> {
-    rng: SmallRng,
-    distribution: &'a Dist,
-    remaining: usize,
-    _op: PhantomData<fn() -> Op>,
-}
-
-impl<'a, Op, Dist> Iterator for CaseOps<'a, Op, Dist>
-where
-    Dist: Distribution<Op>,
-{
-    type Item = Op;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        Some(self.rng.sample(self.distribution))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<'a, Op, Dist> ExactSizeIterator for CaseOps<'a, Op, Dist> where Dist: Distribution<Op> {}
 
 /// Entry point for deterministic mutation fuzzing.
 pub struct Fuzzer;
@@ -121,26 +116,21 @@ impl Fuzzer {
     /// [`reduce_with_cost`]. Operations are sampled by `distribution`; use
     /// `rand::distr::StandardUniform` when you have a `Distribution<Op>` impl on it for your op
     /// type.
-    pub fn sequences<Op, Dist>(distribution: Dist) -> SequencesBuilder<Op, Dist>
-    where
-        Dist: Distribution<Op>,
-    {
+    pub fn sequences<Dist>(distribution: Dist) -> SequencesBuilder<Dist> {
         SequencesBuilder {
             config: FuzzConfig::default(),
             distribution,
-            _op: PhantomData,
         }
     }
 }
 
 /// Builder for [`Fuzzer::sequences`].
-pub struct SequencesBuilder<Op, Dist> {
-    config: FuzzConfig,
-    distribution: Dist,
-    _op: PhantomData<fn() -> Op>,
+pub struct SequencesBuilder<Dist> {
+    pub(crate) config: FuzzConfig,
+    pub(crate) distribution: Dist,
 }
 
-impl<Op, Dist> SequencesBuilder<Op, Dist> {
+impl<Dist> SequencesBuilder<Dist> {
     /// Set the first seed used for generated runs. Seed `n` uses `base_seed + n`.
     pub fn base_seed(mut self, base_seed: u64) -> Self {
         self.config.base_seed = base_seed;
@@ -160,36 +150,28 @@ impl<Op, Dist> SequencesBuilder<Op, Dist> {
     }
 }
 
-impl<Op, Dist> IntoIterator for SequencesBuilder<Op, Dist>
-where
-    Dist: Distribution<Op> + Clone,
-{
-    type Item = GeneratedCase<Op, Dist>;
-    type IntoIter = Sequences<Op, Dist>;
+impl<Dist: Clone> IntoIterator for SequencesBuilder<Dist> {
+    type Item = GeneratedCase<Dist>;
+    type IntoIter = Sequences<Dist>;
 
     fn into_iter(self) -> Self::IntoIter {
         Sequences {
             config: self.config,
             distribution: self.distribution,
             next_offset: 0,
-            _op: PhantomData,
         }
     }
 }
 
 /// Iterator that yields one lazy [`GeneratedCase`] per seed.
-pub struct Sequences<Op, Dist> {
+pub struct Sequences<Dist> {
     config: FuzzConfig,
     distribution: Dist,
     next_offset: u64,
-    _op: PhantomData<fn() -> Op>,
 }
 
-impl<Op, Dist> Iterator for Sequences<Op, Dist>
-where
-    Dist: Distribution<Op> + Clone,
-{
-    type Item = GeneratedCase<Op, Dist>;
+impl<Dist: Clone> Iterator for Sequences<Dist> {
+    type Item = GeneratedCase<Dist>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_offset >= self.config.seeds {
@@ -201,7 +183,6 @@ where
             seed,
             steps: self.config.steps,
             distribution: self.distribution.clone(),
-            _op: PhantomData,
         })
     }
 
@@ -211,30 +192,36 @@ where
     }
 }
 
-impl<Op, Dist> ExactSizeIterator for Sequences<Op, Dist> where Dist: Distribution<Op> + Clone {}
+impl<Dist: Clone> ExactSizeIterator for Sequences<Dist> {}
 
 /// Outcome of replaying one [`GeneratedCase`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CheckedCase<Op, Dist> {
-    /// The generated case that was replayed. Still lazy — ops are not materialized.
-    pub case: GeneratedCase<Op, Dist>,
-    /// `Ok(())` if every step passed, `Err` with the failing step's message otherwise.
-    pub outcome: Result<(), String>,
+pub struct CheckedCase<Dist> {
+    pub(crate) case: GeneratedCase<Dist>,
+    pub(crate) outcome: Result<(), String>,
 }
 
-impl<Op, Dist> CheckedCase<Op, Dist> {
+impl<Dist> CheckedCase<Dist> {
+    /// The generated case that was replayed. Still lazy — ops are not materialized.
+    pub fn case(&self) -> &GeneratedCase<Dist> {
+        &self.case
+    }
+
+    /// `Ok(())` if every step passed, `Err` with the failing step's message otherwise.
+    pub fn outcome(&self) -> &Result<(), String> {
+        &self.outcome
+    }
+
     /// Returns `true` when `outcome` is `Err`.
     pub fn is_failure(&self) -> bool {
         self.outcome.is_err()
     }
-}
 
-impl<Op, Dist> CheckedCase<Op, Dist>
-where
-    Dist: Distribution<Op>,
-{
     /// Drop the case if it passed; otherwise materialize its ops and return a [`FailedCase`].
-    pub fn into_failure(self) -> Option<FailedCase<Op>> {
+    pub fn into_failure<Op>(self) -> Option<FailedCase<Op>>
+    where
+        Dist: Distribution<Op>,
+    {
         match self.outcome {
             Ok(()) => None,
             Err(error) => Some(FailedCase {
@@ -252,345 +239,226 @@ where
 /// directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedCase<Op> {
+    pub(crate) seed: u64,
+    pub(crate) ops: Vec<Op>,
+    pub(crate) error: String,
+}
+
+impl<Op> FailedCase<Op> {
     /// Seed that generated the failing ops.
-    pub seed: u64,
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
     /// Materialized op list (the same `Vec<Op>` `case.ops()` would have produced).
-    pub ops: Vec<Op>,
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
     /// Error from the first failing step.
-    pub error: String,
+    pub fn error(&self) -> &str {
+        &self.error
+    }
+
+    /// Consume this failure and return its `(seed, ops, error)` parts.
+    pub fn into_parts(self) -> (u64, Vec<Op>, String) {
+        (self.seed, self.ops, self.error)
+    }
 }
 
 /// A failing case plus its reduced reproduction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MinimizedFailure<Op> {
-    /// Seed that generated the original failing operation list.
-    pub seed: u64,
-    /// Full generated operation list for this seed.
-    pub ops: Vec<Op>,
-    /// Error from replaying `ops`.
-    pub error: String,
-    /// Smaller or cheaper operation list that still fails.
-    pub minimized_ops: Vec<Op>,
-    /// Error from replaying `minimized_ops`.
-    pub minimized_error: String,
+    pub(crate) seed: u64,
+    pub(crate) ops: Vec<Op>,
+    pub(crate) error: String,
+    pub(crate) minimized_ops: Vec<Op>,
+    pub(crate) minimized_error: String,
 }
 
-/// Iterator adapters on top of an `Iterator<Item = GeneratedCase<Op, Dist>>`.
+impl<Op> MinimizedFailure<Op> {
+    /// Seed that generated the original failing operation list.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Full generated operation list for this seed.
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
+    /// Error from replaying `ops`.
+    pub fn error(&self) -> &str {
+        &self.error
+    }
+
+    /// Smaller or cheaper operation list that still fails.
+    pub fn minimized_ops(&self) -> &[Op] {
+        &self.minimized_ops
+    }
+
+    /// Error from replaying `minimized_ops`.
+    pub fn minimized_error(&self) -> &str {
+        &self.minimized_error
+    }
+}
+
+/// Iterator adapters on top of an `Iterator<Item = GeneratedCase<Dist>>`.
 ///
-/// The chain is `sequences.check(init, step).failures().minimize(cost)`. Each stage is optional
-/// and the pipeline stays lazy, so `.take(N)`, `.inspect(..)`, `rayon::par_bridge`, etc. all
-/// compose with it.
-pub trait CaseIteratorExt<Op, Dist>: IntoIterator<Item = GeneratedCase<Op, Dist>> + Sized {
+/// Each stage is optional and the pipeline stays lazy, so `.take(N)`, `.inspect(..)`,
+/// `rayon::par_bridge`, etc. all compose with it.
+pub trait CaseIteratorExt<Dist>: IntoIterator<Item = GeneratedCase<Dist>> + Sized {
     /// Run replay for every case. Yields one [`CheckedCase`] per generated case (passes included).
-    fn check<State, Init, Step>(self, init: Init, step: Step) -> Check<Self::IntoIter, Init, Step>
+    fn check<Op, State, Init, Step>(
+        self,
+        mut init: Init,
+        mut step: Step,
+    ) -> impl Iterator<Item = CheckedCase<Dist>>
     where
+        Dist: Distribution<Op>,
         Init: FnMut() -> State,
         Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-        Dist: Distribution<Op>,
     {
-        Check {
-            inner: self.into_iter(),
-            init,
-            step,
-        }
+        self.into_iter().map(move |case| {
+            let outcome = case.replay::<Op, _, _, _>(&mut init, &mut step);
+            CheckedCase { case, outcome }
+        })
     }
 
     /// Run replay for every case and drop passing ones. Yields one [`FailedCase`] per failure.
-    fn failures<State, Init, Step>(
+    fn failures<Op, State, Init, Step>(
         self,
-        init: Init,
-        step: Step,
-    ) -> Failures<Self::IntoIter, Init, Step>
+        mut init: Init,
+        mut step: Step,
+    ) -> impl Iterator<Item = FailedCase<Op>>
     where
+        Dist: Distribution<Op>,
         Init: FnMut() -> State,
         Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-        Dist: Distribution<Op>,
     {
-        Failures {
-            inner: self.into_iter(),
-            init,
-            step,
-        }
+        self.into_iter().filter_map(move |case| {
+            match case.replay::<Op, _, _, _>(&mut init, &mut step) {
+                Ok(()) => None,
+                Err(error) => Some(FailedCase {
+                    seed: case.seed,
+                    ops: case.ops(),
+                    error,
+                }),
+            }
+        })
     }
 
-    /// Explore cases that add coverage to a corpus.
-    ///
-    /// The evaluator runs a materialized operation list and returns both the replay outcome and
-    /// the coverage or semantic features observed during that replay. The iterator yields only
-    /// accepted cases: failures, or passing cases that add at least one new coverage ID.
-    fn coverage_guided<Evaluate>(
+    /// For each failing case, reduce it to a minimal repro under `cost`.
+    fn minimized_failures<Op, State, Init, Step, Cost>(
         self,
-        evaluate: Evaluate,
-    ) -> CoverageGuided<
-        Op,
-        Self::IntoIter,
-        Evaluate,
-        UnitCost,
-        NoopSequenceMutator,
-        NoopSequenceMutator,
-        NoopFinalize,
-    >
+        mut init: Init,
+        mut step: Step,
+        cost: Cost,
+    ) -> impl Iterator<Item = MinimizedFailure<Op>>
     where
         Op: Clone,
         Dist: Distribution<Op>,
-        Evaluate: CaseEvaluator<Op>,
+        Init: FnMut() -> State,
+        Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
+        Cost: CostModel<Op>,
     {
-        CoverageGuided::new(self.into_iter(), evaluate)
-    }
-}
-
-impl<T, Op, Dist> CaseIteratorExt<Op, Dist> for T where
-    T: IntoIterator<Item = GeneratedCase<Op, Dist>>
-{
-}
-
-/// Iterator from [`CaseIteratorExt::check`], yielding one [`CheckedCase`] per inner case.
-pub struct Check<I, Init, Step> {
-    inner: I,
-    init: Init,
-    step: Step,
-}
-
-impl<I, Init, Step> Check<I, Init, Step> {
-    /// Drop passing cases; keep failures only. Reuses the held `init`/`step`.
-    pub fn failures(self) -> Failures<I, Init, Step> {
-        Failures {
-            inner: self.inner,
-            init: self.init,
-            step: self.step,
-        }
-    }
-}
-
-impl<I, Op, Dist, State, Init, Step> Iterator for Check<I, Init, Step>
-where
-    I: Iterator<Item = GeneratedCase<Op, Dist>>,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-{
-    type Item = CheckedCase<Op, Dist>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let case = self.inner.next()?;
-        let outcome = case.replay(&mut self.init, &mut self.step);
-        Some(CheckedCase { case, outcome })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl<I, Op, Dist, State, Init, Step> std::iter::FusedIterator for Check<I, Init, Step>
-where
-    I: Iterator<Item = GeneratedCase<Op, Dist>> + std::iter::FusedIterator,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-{
-}
-
-/// Iterator from [`CaseIteratorExt::failures`] or [`Check::failures`], yielding one
-/// [`FailedCase`] per failing inner case.
-pub struct Failures<I, Init, Step> {
-    inner: I,
-    init: Init,
-    step: Step,
-}
-
-impl<I, Init, Step> Failures<I, Init, Step> {
-    /// For each failing case, reduce it to a minimal repro under `cost`. Reuses the held
-    /// `init`/`step`.
-    pub fn minimize<Cost>(self, cost: Cost) -> Minimize<I, Init, Step, Cost> {
-        Minimize {
-            inner: self.inner,
-            init: self.init,
-            step: self.step,
-            cost,
-        }
+        self.into_iter().filter_map(move |case| {
+            match case.replay::<Op, _, _, _>(&mut init, &mut step) {
+                Ok(()) => None,
+                Err(error) => {
+                    let seed = case.seed;
+                    let ops: Vec<Op> = case.ops();
+                    let minimized_ops = reduce_with_cost(&ops, &cost, |c| {
+                        replay_ops(c, &mut init, &mut step).is_err()
+                    });
+                    let minimized_error = replay_ops(&minimized_ops, &mut init, &mut step)
+                        .expect_err("reducer must preserve the failing invariant");
+                    Some(MinimizedFailure {
+                        seed,
+                        ops,
+                        error,
+                        minimized_ops,
+                        minimized_error,
+                    })
+                }
+            }
+        })
     }
 
     /// For each failing case, reduce it under `cost` and caller-provided transforms.
     ///
     /// Transforms are tried only after the default deletion pass. They must emit valid candidate
     /// operation sequences for the caller's domain.
-    pub fn minimize_with_transforms<Cost, Transforms>(
+    fn minimized_failures_with_transforms<Op, State, Init, Step, Cost, Transforms>(
         self,
+        mut init: Init,
+        mut step: Step,
         cost: Cost,
-        transforms: Transforms,
-    ) -> MinimizeWithTransforms<I, Init, Step, Cost, Transforms> {
-        MinimizeWithTransforms {
-            inner: self.inner,
-            init: self.init,
-            step: self.step,
-            cost,
-            transforms,
-        }
-    }
-}
-
-impl<I, Op, Dist, State, Init, Step> Iterator for Failures<I, Init, Step>
-where
-    I: Iterator<Item = GeneratedCase<Op, Dist>>,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-{
-    type Item = FailedCase<Op>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let case = self.inner.next()?;
-            if let Err(error) = case.replay(&mut self.init, &mut self.step) {
-                return Some(FailedCase {
-                    seed: case.seed,
-                    ops: case.ops(),
-                    error,
-                });
+        mut transforms: Transforms,
+    ) -> impl Iterator<Item = MinimizedFailure<Op>>
+    where
+        Op: Clone,
+        Dist: Distribution<Op>,
+        Init: FnMut() -> State,
+        Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
+        Cost: CostModel<Op>,
+        Transforms: SequenceMutator<Op>,
+    {
+        self.into_iter().filter_map(move |case| {
+            match case.replay::<Op, _, _, _>(&mut init, &mut step) {
+                Ok(()) => None,
+                Err(error) => {
+                    let seed = case.seed;
+                    let ops: Vec<Op> = case.ops();
+                    let minimized_ops = reduce_with_cost_and_transforms(
+                        &ops,
+                        &cost,
+                        |c| replay_ops(c, &mut init, &mut step).is_err(),
+                        |c: &[Op], emit: &mut dyn FnMut(Vec<Op>)| transforms.mutate(c, emit),
+                    );
+                    let minimized_error = replay_ops(&minimized_ops, &mut init, &mut step)
+                        .expect_err("reducer must preserve the failing invariant");
+                    Some(MinimizedFailure {
+                        seed,
+                        ops,
+                        error,
+                        minimized_ops,
+                        minimized_error,
+                    })
+                }
             }
-        }
+        })
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, self.inner.size_hint().1)
-    }
-}
-
-impl<I, Op, Dist, State, Init, Step> std::iter::FusedIterator for Failures<I, Init, Step>
-where
-    I: Iterator<Item = GeneratedCase<Op, Dist>> + std::iter::FusedIterator,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-{
-}
-
-/// Iterator from [`Failures::minimize`], yielding a [`MinimizedFailure`] per failing inner case.
-pub struct Minimize<I, Init, Step, Cost> {
-    inner: I,
-    init: Init,
-    step: Step,
-    cost: Cost,
-}
-
-impl<I, Op, Dist, State, Init, Step, Cost> Iterator for Minimize<I, Init, Step, Cost>
-where
-    Op: Clone,
-    I: Iterator<Item = GeneratedCase<Op, Dist>>,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-    Cost: CostModel<Op>,
-{
-    type Item = MinimizedFailure<Op>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let case = self.inner.next()?;
-            if let Err(error) = case.replay(&mut self.init, &mut self.step) {
-                let ops = case.ops();
-                let seed = case.seed;
-                let minimized_ops = reduce_with_cost(&ops, &self.cost, |c| {
-                    replay_ops(c, &mut self.init, &mut self.step).is_err()
-                });
-                let minimized_error = replay_ops(&minimized_ops, &mut self.init, &mut self.step)
-                    .expect_err("reducer must preserve the failing invariant");
-                return Some(MinimizedFailure {
-                    seed,
-                    ops,
-                    error,
-                    minimized_ops,
-                    minimized_error,
-                });
-            }
-        }
+    /// Materialize generated cases into operation vectors with coverage metadata fields.
+    fn materialize<Op>(self) -> impl Iterator<Item = InputCase<Op>>
+    where
+        Dist: Distribution<Op>,
+    {
+        self.into_iter()
+            .map(|case| InputCase::root(Some(case.seed), case.ops::<Op>()))
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, self.inner.size_hint().1)
+    /// Backwards-compatible name for [`CaseIteratorExt::materialize`].
+    fn materialize_cases<Op>(self) -> impl Iterator<Item = InputCase<Op>>
+    where
+        Dist: Distribution<Op>,
+    {
+        self.materialize()
     }
 }
 
-impl<I, Op, Dist, State, Init, Step, Cost> std::iter::FusedIterator
-    for Minimize<I, Init, Step, Cost>
-where
-    Op: Clone,
-    I: Iterator<Item = GeneratedCase<Op, Dist>> + std::iter::FusedIterator,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-    Cost: CostModel<Op>,
-{
-}
+impl<T, Dist> CaseIteratorExt<Dist> for T where T: IntoIterator<Item = GeneratedCase<Dist>> {}
 
-/// Iterator from [`Failures::minimize_with_transforms`], yielding a [`MinimizedFailure`] per
-/// failing inner case.
-pub struct MinimizeWithTransforms<I, Init, Step, Cost, Transforms> {
-    inner: I,
-    init: Init,
-    step: Step,
-    cost: Cost,
-    transforms: Transforms,
-}
-
-impl<I, Op, Dist, State, Init, Step, Cost, Transforms> Iterator
-    for MinimizeWithTransforms<I, Init, Step, Cost, Transforms>
-where
-    Op: Clone,
-    I: Iterator<Item = GeneratedCase<Op, Dist>>,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-    Cost: CostModel<Op>,
-    Transforms: SequenceMutator<Op>,
-{
-    type Item = MinimizedFailure<Op>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let case = self.inner.next()?;
-            if let Err(error) = case.replay(&mut self.init, &mut self.step) {
-                let ops = case.ops();
-                let seed = case.seed;
-                // Wrap the transforms in a fresh FnMut closure with explicit
-                // higher-rank lifetimes so the compiler can satisfy the
-                // `SequenceMutator` blanket impl on the closure type.
-                let transforms = &mut self.transforms;
-                let minimized_ops = reduce_with_cost_and_transforms(
-                    &ops,
-                    &self.cost,
-                    |c| replay_ops(c, &mut self.init, &mut self.step).is_err(),
-                    |c: &[Op], emit: &mut dyn FnMut(Vec<Op>)| transforms.mutate(c, emit),
-                );
-                let minimized_error = replay_ops(&minimized_ops, &mut self.init, &mut self.step)
-                    .expect_err("reducer must preserve the failing invariant");
-                return Some(MinimizedFailure {
-                    seed,
-                    ops,
-                    error,
-                    minimized_ops,
-                    minimized_error,
-                });
-            }
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, self.inner.size_hint().1)
+/// Iterator adapters on top of an `Iterator<Item = CheckedCase<Dist>>`.
+pub trait CheckedCaseIteratorExt<Dist>: Iterator<Item = CheckedCase<Dist>> + Sized {
+    /// Drop passing cases; keep failures only.
+    fn failures<Op>(self) -> impl Iterator<Item = FailedCase<Op>>
+    where
+        Dist: Distribution<Op>,
+    {
+        self.filter_map(CheckedCase::into_failure)
     }
 }
 
-impl<I, Op, Dist, State, Init, Step, Cost, Transforms> std::iter::FusedIterator
-    for MinimizeWithTransforms<I, Init, Step, Cost, Transforms>
-where
-    Op: Clone,
-    I: Iterator<Item = GeneratedCase<Op, Dist>> + std::iter::FusedIterator,
-    Dist: Distribution<Op>,
-    Init: FnMut() -> State,
-    Step: for<'a> FnMut(&mut State, crate::Step<'a, Op>) -> Result<(), String>,
-    Cost: CostModel<Op>,
-    Transforms: SequenceMutator<Op>,
-{
-}
-
+impl<I, Dist> CheckedCaseIteratorExt<Dist> for I where I: Iterator<Item = CheckedCase<Dist>> {}

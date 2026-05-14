@@ -1,225 +1,47 @@
+use crate::{
+    AcceptedCase, CaseFinalizer, CaseMeta, CostModel, CoverageCapture, CoverageEvaluation,
+    CoverageId, CoverageSet, DEFAULT_SEED_INTERVAL, ExplorationStats, InputCase, MeasuredCase,
+    NoopFinalize, NoopSequenceMutator, PendingCoverageCase, SequenceMutator, UnitCost,
+    coverage_delta, is_coverage_interesting,
+};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, VecDeque},
+    rc::Rc,
+    thread,
+};
 
-/// Iterator that yields only cases that expand coverage or fail.
-pub struct CoverageGuided<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize> {
+/// Iterator that keeps measured cases that fail or add new coverage.
+pub struct CoverageMaximize<I, Cost = UnitCost> {
     inner: I,
-    evaluate: Evaluate,
     cost: Cost,
-    mutate: Mutate,
-    shrink: Shrink,
-    finalize: Finalize,
     global: CoverageSet,
-    coverage_frequency: BTreeMap<CoverageId, usize>,
-    corpus: Vec<CoveredCase<Op>>,
-    initial_cases: VecDeque<Vec<Op>>,
-    pending: VecDeque<PendingCoverageCase<Op>>,
     stats: ExplorationStats,
-    mutations_per_entry: usize,
-    mutation_rounds: usize,
-    max_shrink_steps: usize,
-    seed_interval: usize,
-    mutated_since_seed: usize,
-    seeds_exhausted: bool,
     next_id: u64,
-    next_pending_order: u64,
 }
 
-impl<Op, I, Evaluate>
-    CoverageGuided<
-        Op,
-        I,
-        Evaluate,
-        UnitCost,
-        NoopSequenceMutator,
-        NoopSequenceMutator,
-        NoopFinalize,
-    >
-{
-    /// Create a coverage-guided iterator from generated cases and an evaluator.
-    pub fn new(inner: I, evaluate: Evaluate) -> Self {
+impl<I> CoverageMaximize<I, UnitCost> {
+    fn new(inner: I) -> Self {
         Self {
             inner,
-            evaluate,
             cost: UnitCost,
-            mutate: NoopSequenceMutator,
-            shrink: NoopSequenceMutator,
-            finalize: NoopFinalize,
             global: CoverageSet::new(),
-            coverage_frequency: BTreeMap::new(),
-            corpus: Vec::new(),
-            initial_cases: VecDeque::new(),
-            pending: VecDeque::new(),
             stats: ExplorationStats::default(),
-            mutations_per_entry: 0,
-            mutation_rounds: 0,
-            max_shrink_steps: 64,
-            seed_interval: DEFAULT_SEED_INTERVAL,
-            mutated_since_seed: 0,
-            seeds_exhausted: false,
             next_id: 0,
-            next_pending_order: 0,
         }
     }
 }
 
-impl<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
-    CoverageGuided<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
-{
-    /// Replace the cost model used for shrinking and accepted-case metadata.
-    pub fn cost<NewCost>(
-        self,
-        cost: NewCost,
-    ) -> CoverageGuided<Op, I, Evaluate, NewCost, Mutate, Shrink, Finalize> {
-        CoverageGuided {
+impl<I, Cost> CoverageMaximize<I, Cost> {
+    /// Replace the cost model used for accepted-case metadata.
+    pub fn cost<NewCost>(self, cost: NewCost) -> CoverageMaximize<I, NewCost> {
+        CoverageMaximize {
             inner: self.inner,
-            evaluate: self.evaluate,
             cost,
-            mutate: self.mutate,
-            shrink: self.shrink,
-            finalize: self.finalize,
             global: self.global,
-            coverage_frequency: self.coverage_frequency,
-            corpus: self.corpus,
-            initial_cases: self.initial_cases,
-            pending: self.pending,
             stats: self.stats,
-            mutations_per_entry: self.mutations_per_entry,
-            mutation_rounds: self.mutation_rounds,
-            max_shrink_steps: self.max_shrink_steps,
-            seed_interval: self.seed_interval,
-            mutated_since_seed: self.mutated_since_seed,
-            seeds_exhausted: self.seeds_exhausted,
             next_id: self.next_id,
-            next_pending_order: self.next_pending_order,
         }
-    }
-
-    /// Add a mutator used to create follow-up candidates from accepted corpus entries.
-    pub fn mutate<NewMutate>(
-        self,
-        mutate: NewMutate,
-    ) -> CoverageGuided<Op, I, Evaluate, Cost, NewMutate, Shrink, Finalize> {
-        CoverageGuided {
-            inner: self.inner,
-            evaluate: self.evaluate,
-            cost: self.cost,
-            mutate,
-            shrink: self.shrink,
-            finalize: self.finalize,
-            global: self.global,
-            coverage_frequency: self.coverage_frequency,
-            corpus: self.corpus,
-            initial_cases: self.initial_cases,
-            pending: self.pending,
-            stats: self.stats,
-            mutations_per_entry: self.mutations_per_entry,
-            mutation_rounds: self.mutation_rounds,
-            max_shrink_steps: self.max_shrink_steps,
-            seed_interval: self.seed_interval,
-            mutated_since_seed: self.mutated_since_seed,
-            seeds_exhausted: self.seeds_exhausted,
-            next_id: self.next_id,
-            next_pending_order: self.next_pending_order,
-        }
-    }
-
-    /// Add a domain-aware shrinker tried after the built-in deletion pass.
-    pub fn shrink<NewShrink>(
-        self,
-        shrink: NewShrink,
-    ) -> CoverageGuided<Op, I, Evaluate, Cost, Mutate, NewShrink, Finalize> {
-        CoverageGuided {
-            inner: self.inner,
-            evaluate: self.evaluate,
-            cost: self.cost,
-            mutate: self.mutate,
-            shrink,
-            finalize: self.finalize,
-            global: self.global,
-            coverage_frequency: self.coverage_frequency,
-            corpus: self.corpus,
-            initial_cases: self.initial_cases,
-            pending: self.pending,
-            stats: self.stats,
-            mutations_per_entry: self.mutations_per_entry,
-            mutation_rounds: self.mutation_rounds,
-            max_shrink_steps: self.max_shrink_steps,
-            seed_interval: self.seed_interval,
-            mutated_since_seed: self.mutated_since_seed,
-            seeds_exhausted: self.seeds_exhausted,
-            next_id: self.next_id,
-            next_pending_order: self.next_pending_order,
-        }
-    }
-
-    /// Add a finalizer that normalizes each candidate before evaluation.
-    pub fn finalize<NewFinalize>(
-        self,
-        finalize: NewFinalize,
-    ) -> CoverageGuided<Op, I, Evaluate, Cost, Mutate, Shrink, NewFinalize> {
-        CoverageGuided {
-            inner: self.inner,
-            evaluate: self.evaluate,
-            cost: self.cost,
-            mutate: self.mutate,
-            shrink: self.shrink,
-            finalize,
-            global: self.global,
-            coverage_frequency: self.coverage_frequency,
-            corpus: self.corpus,
-            initial_cases: self.initial_cases,
-            pending: self.pending,
-            stats: self.stats,
-            mutations_per_entry: self.mutations_per_entry,
-            mutation_rounds: self.mutation_rounds,
-            max_shrink_steps: self.max_shrink_steps,
-            seed_interval: self.seed_interval,
-            mutated_since_seed: self.mutated_since_seed,
-            seeds_exhausted: self.seeds_exhausted,
-            next_id: self.next_id,
-            next_pending_order: self.next_pending_order,
-        }
-    }
-
-    /// Set the maximum number of mutation candidates enqueued per accepted entry.
-    pub fn mutations_per_entry(mut self, mutations_per_entry: usize) -> Self {
-        self.mutations_per_entry = mutations_per_entry;
-        self
-    }
-
-    /// Set how many mutation generations to explore from each generated seed case.
-    pub fn rounds(mut self, rounds: usize) -> Self {
-        self.mutation_rounds = rounds;
-        self
-    }
-
-    /// Set the maximum accepted shrink steps per interesting case.
-    pub fn max_shrink_steps(mut self, max_shrink_steps: usize) -> Self {
-        self.max_shrink_steps = max_shrink_steps;
-        self
-    }
-
-    /// Add exact root cases to evaluate before generated seed cases.
-    ///
-    /// These cases are useful for domain-specific coverage targets that random generation is
-    /// unlikely to assemble in a small number of steps. They are finalized, evaluated, shrunk, and
-    /// accepted or rejected with the same rules as generated root cases. Accepted entries have no
-    /// random seed and no parent.
-    pub fn initial_cases<Cases>(mut self, cases: Cases) -> Self
-    where
-        Cases: IntoIterator<Item = Vec<Op>>,
-    {
-        self.initial_cases.extend(cases);
-        self
-    }
-
-    /// Set how many queued mutation candidates may run before trying another fresh seed.
-    ///
-    /// The default is `1`, which alternates fresh seed exploration with corpus mutation when both
-    /// are available. Set this to `0` to drain scheduled mutation candidates before asking the
-    /// seed iterator for more cases.
-    pub fn seed_interval(mut self, seed_interval: usize) -> Self {
-        self.seed_interval = seed_interval;
-        self
     }
 
     /// Current aggregate exploration counters.
@@ -231,80 +53,345 @@ impl<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
     pub fn global_coverage(&self) -> &CoverageSet {
         &self.global
     }
+}
 
-    /// Accepted corpus entries yielded so far.
-    pub fn corpus(&self) -> &[CoveredCase<Op>] {
-        &self.corpus
+impl<I, Op, Cost> Iterator for CoverageMaximize<I, Cost>
+where
+    Op: Clone,
+    I: Iterator<Item = Result<MeasuredCase<Op>, String>>,
+    Cost: CostModel<Op>,
+{
+    type Item = Result<AcceptedCase<Op>, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let measured = match self.inner.next()? {
+                Ok(measured) => measured,
+                Err(error) => {
+                    self.stats.executed += 1;
+                    self.stats.errors += 1;
+                    return Some(Err(error));
+                }
+            };
+            self.stats.executed += 1;
+            if !is_coverage_interesting(
+                &self.global,
+                &measured.evaluation.coverage,
+                measured.evaluation.is_failure(),
+            ) {
+                continue;
+            }
+
+            let unique_coverage = coverage_delta(&self.global, &measured.evaluation.coverage);
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            self.global.extend(measured.evaluation.coverage.iter());
+            self.stats.accepted += 1;
+            if measured.evaluation.is_failure() {
+                self.stats.failures += 1;
+            }
+            self.stats.coverage_ids = self.global.len() as u64;
+
+            let cost = self.cost.total_cost(&measured.case.ops);
+            let len = measured.case.ops.len();
+            let accepted = AcceptedCase {
+                id,
+                seed: measured.case.seed,
+                parent: measured.case.parent,
+                depth: measured.case.depth,
+                ops: measured.case.ops,
+                coverage: measured.evaluation.coverage,
+                unique_coverage,
+                outcome: measured.evaluation.outcome,
+                cost,
+                len,
+            };
+            return Some(Ok(accepted));
+        }
     }
 }
 
-impl<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
-    CoverageGuided<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
-where
-    Op: Clone,
-    Evaluate: CaseEvaluator<Op>,
-    Cost: CostModel<Op>,
-    Mutate: SequenceMutator<Op>,
-    Shrink: SequenceMutator<Op>,
-    Finalize: CaseFinalizer<Op>,
+/// Iterator adapters for fallible measured coverage cases.
+pub trait MeasuredCaseIteratorExt<Op>:
+    Iterator<Item = Result<MeasuredCase<Op>, String>> + Sized
 {
-    fn shrink_interesting(
-        &mut self,
-        mut ops: Vec<Op>,
-        mut evaluation: CoverageEvaluation,
-        required_coverage: &CoverageSet,
-    ) -> (Vec<Op>, CoverageEvaluation) {
-        let must_fail = evaluation.is_failure();
-        let mut best_score = score(&ops, &self.cost);
-        let mut accepted_steps = 0usize;
+    /// Keep only cases that fail or add coverage not yet seen by this iterator.
+    fn maximize_coverage(self) -> CoverageMaximize<Self> {
+        CoverageMaximize::new(self)
+    }
+}
 
-        while accepted_steps < self.max_shrink_steps {
-            let mut candidates = Vec::new();
-            emit_deletion_candidates(&ops, &mut |candidate| candidates.push(candidate));
-            self.shrink
-                .mutate(&ops, &mut |candidate| candidates.push(candidate));
+impl<I, Op> MeasuredCaseIteratorExt<Op> for I where
+    I: Iterator<Item = Result<MeasuredCase<Op>, String>>
+{
+}
 
-            let mut accepted = None;
-            for mut candidate in candidates {
-                self.finalize.finalize(&mut candidate);
-                let candidate_score = score(&candidate, &self.cost);
-                if candidate_score >= best_score {
-                    continue;
-                }
+/// Guard-based coverage explorer. It yields runnable cases; finishing or dropping each case
+/// records coverage and schedules mutations from accepted corpus entries.
+pub struct CoverageExplorer<
+    Op,
+    I,
+    Capture,
+    Cost = UnitCost,
+    Mutate = NoopSequenceMutator,
+    Finalize = NoopFinalize,
+> {
+    inner: I,
+    shared: Rc<RefCell<CoverageExplorerState<Op, Capture, Cost, Mutate, Finalize>>>,
+}
 
-                let candidate_evaluation = self.evaluate.evaluate(&candidate);
-                self.stats.executed += 1;
-                if must_fail && !candidate_evaluation.is_failure() {
-                    continue;
-                }
-                if !candidate_evaluation.coverage.is_superset(required_coverage) {
-                    continue;
-                }
+struct CoverageExplorerState<Op, Capture, Cost, Mutate, Finalize> {
+    capture: Capture,
+    cost: Cost,
+    mutate: Mutate,
+    finalize: Finalize,
+    global: CoverageSet,
+    coverage_frequency: BTreeMap<CoverageId, usize>,
+    corpus: Vec<AcceptedCase<Op>>,
+    pending: VecDeque<PendingCoverageCase<Op>>,
+    errors: VecDeque<String>,
+    stats: ExplorationStats,
+    mutations_per_entry: usize,
+    mutation_rounds: usize,
+    seed_interval: usize,
+    mutated_since_seed: usize,
+    roots_exhausted: bool,
+    active: bool,
+    accepted_limit: Option<usize>,
+    next_id: u64,
+    next_pending_order: u64,
+}
 
-                accepted = Some((candidate, candidate_evaluation, candidate_score));
-                break;
-            }
-
-            let Some((candidate, candidate_evaluation, candidate_score)) = accepted else {
-                break;
-            };
-            ops = candidate;
-            evaluation = candidate_evaluation;
-            best_score = candidate_score;
-            accepted_steps += 1;
+impl<Op, I, Capture> CoverageExplorer<Op, I, Capture>
+where
+    Capture: CoverageCapture,
+{
+    pub(crate) fn new(inner: I, capture: Capture) -> Self {
+        Self {
+            inner,
+            shared: Rc::new(RefCell::new(CoverageExplorerState {
+                capture,
+                cost: UnitCost,
+                mutate: NoopSequenceMutator,
+                finalize: NoopFinalize,
+                global: CoverageSet::new(),
+                coverage_frequency: BTreeMap::new(),
+                corpus: Vec::new(),
+                pending: VecDeque::new(),
+                errors: VecDeque::new(),
+                stats: ExplorationStats::default(),
+                mutations_per_entry: 0,
+                mutation_rounds: 0,
+                seed_interval: DEFAULT_SEED_INTERVAL,
+                mutated_since_seed: 0,
+                roots_exhausted: false,
+                active: false,
+                accepted_limit: None,
+                next_id: 0,
+                next_pending_order: 0,
+            })),
         }
+    }
+}
 
-        (ops, evaluation)
+impl<Op, I, Capture, Cost, Mutate, Finalize>
+    CoverageExplorer<Op, I, Capture, Cost, Mutate, Finalize>
+{
+    /// Replace the cost model used for accepted-case metadata and mutation priority.
+    pub fn cost<NewCost>(self, cost: NewCost) -> CoverageExplorer<Op, I, Capture, NewCost, Mutate, Finalize> {
+        let state = match Rc::try_unwrap(self.shared) {
+            Ok(state) => state.into_inner(),
+            Err(_) => panic!("cannot change explorer cost while cases are alive"),
+        };
+        CoverageExplorer {
+            inner: self.inner,
+            shared: Rc::new(RefCell::new(CoverageExplorerState {
+                capture: state.capture,
+                cost,
+                mutate: state.mutate,
+                finalize: state.finalize,
+                global: state.global,
+                coverage_frequency: state.coverage_frequency,
+                corpus: state.corpus,
+                pending: state.pending,
+                errors: state.errors,
+                stats: state.stats,
+                mutations_per_entry: state.mutations_per_entry,
+                mutation_rounds: state.mutation_rounds,
+                seed_interval: state.seed_interval,
+                mutated_since_seed: state.mutated_since_seed,
+                roots_exhausted: state.roots_exhausted,
+                active: state.active,
+                accepted_limit: state.accepted_limit,
+                next_id: state.next_id,
+                next_pending_order: state.next_pending_order,
+            })),
+        }
     }
 
-    fn rare_coverage_count(&self, case: &CoveredCase<Op>) -> usize {
+    /// Add a mutator used to create follow-up candidates from accepted corpus entries.
+    pub fn mutate<NewMutate>(
+        self,
+        mutate: NewMutate,
+    ) -> CoverageExplorer<Op, I, Capture, Cost, NewMutate, Finalize> {
+        let state = match Rc::try_unwrap(self.shared) {
+            Ok(state) => state.into_inner(),
+            Err(_) => panic!("cannot change explorer mutator while cases are alive"),
+        };
+        CoverageExplorer {
+            inner: self.inner,
+            shared: Rc::new(RefCell::new(CoverageExplorerState {
+                capture: state.capture,
+                cost: state.cost,
+                mutate,
+                finalize: state.finalize,
+                global: state.global,
+                coverage_frequency: state.coverage_frequency,
+                corpus: state.corpus,
+                pending: state.pending,
+                errors: state.errors,
+                stats: state.stats,
+                mutations_per_entry: state.mutations_per_entry,
+                mutation_rounds: state.mutation_rounds,
+                seed_interval: state.seed_interval,
+                mutated_since_seed: state.mutated_since_seed,
+                roots_exhausted: state.roots_exhausted,
+                active: state.active,
+                accepted_limit: state.accepted_limit,
+                next_id: state.next_id,
+                next_pending_order: state.next_pending_order,
+            })),
+        }
+    }
+
+    /// Add a finalizer that normalizes each candidate before it is yielded.
+    pub fn finalize<NewFinalize>(
+        self,
+        finalize: NewFinalize,
+    ) -> CoverageExplorer<Op, I, Capture, Cost, Mutate, NewFinalize> {
+        let state = match Rc::try_unwrap(self.shared) {
+            Ok(state) => state.into_inner(),
+            Err(_) => panic!("cannot change explorer finalizer while cases are alive"),
+        };
+        CoverageExplorer {
+            inner: self.inner,
+            shared: Rc::new(RefCell::new(CoverageExplorerState {
+                capture: state.capture,
+                cost: state.cost,
+                mutate: state.mutate,
+                finalize,
+                global: state.global,
+                coverage_frequency: state.coverage_frequency,
+                corpus: state.corpus,
+                pending: state.pending,
+                errors: state.errors,
+                stats: state.stats,
+                mutations_per_entry: state.mutations_per_entry,
+                mutation_rounds: state.mutation_rounds,
+                seed_interval: state.seed_interval,
+                mutated_since_seed: state.mutated_since_seed,
+                roots_exhausted: state.roots_exhausted,
+                active: state.active,
+                accepted_limit: state.accepted_limit,
+                next_id: state.next_id,
+                next_pending_order: state.next_pending_order,
+            })),
+        }
+    }
+
+    /// Set the maximum number of mutation candidates enqueued per accepted entry.
+    pub fn mutations_per_entry(self, mutations_per_entry: usize) -> Self {
+        self.shared.borrow_mut().mutations_per_entry = mutations_per_entry;
+        self
+    }
+
+    /// Set how many mutation generations to explore from each generated root case.
+    pub fn rounds(self, rounds: usize) -> Self {
+        self.shared.borrow_mut().mutation_rounds = rounds;
+        self
+    }
+
+    /// Stop after this many accepted corpus entries.
+    pub fn accepted_limit(self, accepted_limit: usize) -> Self {
+        self.shared.borrow_mut().accepted_limit = Some(accepted_limit);
+        self
+    }
+
+    /// Set how many queued mutation candidates may run before trying another root case.
+    pub fn seed_interval(self, seed_interval: usize) -> Self {
+        self.shared.borrow_mut().seed_interval = seed_interval;
+        self
+    }
+
+    /// Current aggregate exploration counters.
+    pub fn stats(&self) -> ExplorationStats {
+        self.shared.borrow().stats
+    }
+
+    /// Coverage accumulated by accepted entries.
+    pub fn global_coverage(&self) -> CoverageSet {
+        self.shared.borrow().global.clone()
+    }
+
+    /// Accepted corpus entries yielded so far.
+    pub fn corpus(&self) -> Vec<AcceptedCase<Op>>
+    where
+        Op: Clone,
+    {
+        self.shared.borrow().corpus.clone()
+    }
+}
+
+impl<Op, Capture, Cost, Mutate, Finalize>
+    CoverageExplorerState<Op, Capture, Cost, Mutate, Finalize>
+where
+    Op: Clone,
+    Cost: CostModel<Op>,
+    Mutate: SequenceMutator<Op>,
+    Finalize: CaseFinalizer<Op>,
+{
+    fn should_try_root(&self) -> bool {
+        !self.roots_exhausted
+            && (self.pending.is_empty()
+                || (self.seed_interval > 0 && self.mutated_since_seed >= self.seed_interval))
+    }
+
+    fn pop_scheduled_pending(&mut self) -> Option<PendingCoverageCase<Op>> {
+        let index = self
+            .pending
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| right.order.cmp(&left.order))
+            })
+            .map(|(index, _)| index)?;
+        let pending = self.pending.remove(index)?;
+        self.mutated_since_seed = self.mutated_since_seed.saturating_add(1);
+        Some(pending)
+    }
+
+    fn next_pending_order(&mut self) -> u64 {
+        let order = self.next_pending_order;
+        self.next_pending_order = self.next_pending_order.wrapping_add(1);
+        order
+    }
+
+    fn record_coverage_frequency(&mut self, coverage: &CoverageSet) {
+        for id in coverage.iter() {
+            *self.coverage_frequency.entry(id).or_insert(0) += 1;
+        }
+    }
+
+    fn rare_coverage_count(&self, case: &AcceptedCase<Op>) -> usize {
         case.coverage
             .iter()
             .filter(|id| self.coverage_frequency.get(id).copied().unwrap_or(0) <= 1)
             .count()
     }
 
-    fn mutation_energy(&self, case: &CoveredCase<Op>) -> usize {
+    fn mutation_energy(&self, case: &AcceptedCase<Op>) -> usize {
         if self.mutations_per_entry == 0 || case.depth >= self.mutation_rounds {
             return 0;
         }
@@ -321,7 +408,7 @@ where
         energy
     }
 
-    fn mutation_priority(&self, case: &CoveredCase<Op>) -> u64 {
+    fn mutation_priority(&self, case: &AcceptedCase<Op>) -> u64 {
         let rarity_score = case
             .coverage
             .iter()
@@ -347,13 +434,7 @@ where
             + rarity_score.saturating_sub(size_penalty.saturating_add(depth_penalty))
     }
 
-    fn next_pending_order(&mut self) -> u64 {
-        let order = self.next_pending_order;
-        self.next_pending_order = self.next_pending_order.wrapping_add(1);
-        order
-    }
-
-    fn enqueue_mutations(&mut self, case: &CoveredCase<Op>) {
+    fn enqueue_mutations(&mut self, case: &AcceptedCase<Op>) {
         let energy = self.mutation_energy(case);
         if energy == 0 {
             return;
@@ -371,10 +452,12 @@ where
             self.finalize.finalize(&mut ops);
             let order = self.next_pending_order();
             self.pending.push_back(PendingCoverageCase {
-                ops,
-                seed: None,
-                parent: Some(case.id),
-                depth: case.depth + 1,
+                case: InputCase {
+                    seed: None,
+                    parent: Some(case.id),
+                    depth: case.depth + 1,
+                    ops,
+                },
                 priority,
                 order,
             });
@@ -382,172 +465,264 @@ where
         }
     }
 
-    fn pop_initial_case(&mut self) -> Option<PendingCoverageCase<Op>> {
-        let mut ops = self.initial_cases.pop_front()?;
-        self.finalize.finalize(&mut ops);
-        self.stats.generated += 1;
-        self.mutated_since_seed = 0;
-        Some(PendingCoverageCase {
-            ops,
-            seed: None,
-            parent: None,
-            depth: 0,
-            priority: u64::MAX,
-            order: 0,
-        })
-    }
-
-    fn pop_scheduled_pending(&mut self) -> Option<PendingCoverageCase<Op>> {
-        let index = self
-            .pending
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| {
-                left.priority
-                    .cmp(&right.priority)
-                    .then_with(|| right.order.cmp(&left.order))
-            })
-            .map(|(index, _)| index)?;
-        let pending = self.pending.remove(index)?;
-        self.mutated_since_seed = self.mutated_since_seed.saturating_add(1);
-        Some(pending)
-    }
-
-    fn should_try_seed(&self) -> bool {
-        !self.seeds_exhausted
-            && (self.pending.is_empty()
-                || (self.seed_interval > 0 && self.mutated_since_seed >= self.seed_interval))
-    }
-
-    fn record_coverage_frequency(&mut self, coverage: &CoverageSet) {
-        for id in coverage.iter() {
-            *self.coverage_frequency.entry(id).or_insert(0) += 1;
+    fn accept_case(&mut self, case: InputCase<Op>, evaluation: CoverageEvaluation) {
+        if !is_coverage_interesting(&self.global, &evaluation.coverage, evaluation.is_failure()) {
+            return;
         }
+
+        let unique_coverage = coverage_delta(&self.global, &evaluation.coverage);
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.global.extend(evaluation.coverage.iter());
+        self.stats.accepted += 1;
+        if evaluation.is_failure() {
+            self.stats.failures += 1;
+        }
+        self.stats.coverage_ids = self.global.len() as u64;
+        self.record_coverage_frequency(&evaluation.coverage);
+
+        let cost = self.cost.total_cost(&case.ops);
+        let len = case.ops.len();
+        let accepted = AcceptedCase {
+            id,
+            seed: case.seed,
+            parent: case.parent,
+            depth: case.depth,
+            ops: case.ops,
+            coverage: evaluation.coverage,
+            unique_coverage,
+            outcome: evaluation.outcome,
+            cost,
+            len,
+        };
+        self.enqueue_mutations(&accepted);
+        self.corpus.push(accepted);
     }
 }
 
-impl<Op, Dist, I, Evaluate, Cost, Mutate, Shrink, Finalize> Iterator
-    for CoverageGuided<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
+impl<Op, I, Capture, Cost, Mutate, Finalize> Iterator
+    for CoverageExplorer<Op, I, Capture, Cost, Mutate, Finalize>
 where
     Op: Clone,
-    I: Iterator<Item = GeneratedCase<Op, Dist>>,
-    Dist: Distribution<Op>,
-    Evaluate: CaseEvaluator<Op>,
+    I: Iterator<Item = InputCase<Op>>,
+    Capture: CoverageCapture,
     Cost: CostModel<Op>,
     Mutate: SequenceMutator<Op>,
-    Shrink: SequenceMutator<Op>,
     Finalize: CaseFinalizer<Op>,
 {
-    type Item = CoveredCase<Op>;
+    type Item = Result<Case<Op, Capture, Cost, Mutate, Finalize>, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let pending = if let Some(pending) = self.pop_initial_case() {
-                pending
-            } else if self.should_try_seed() {
-                match self.inner.next() {
-                    Some(case) => {
-                        let mut ops = case.ops();
-                        self.finalize.finalize(&mut ops);
-                        self.stats.generated += 1;
-                        self.mutated_since_seed = 0;
-                        PendingCoverageCase {
-                            ops,
-                            seed: Some(case.seed),
-                            parent: None,
-                            depth: 0,
-                            priority: u64::MAX,
-                            order: 0,
-                        }
-                    }
-                    None => {
-                        self.seeds_exhausted = true;
-                        self.pop_scheduled_pending()?
-                    }
+        let mut state = self.shared.borrow_mut();
+        if let Some(error) = state.errors.pop_front() {
+            return Some(Err(error));
+        }
+        if state.active {
+            state.stats.errors += 1;
+            return Some(Err(
+                "cannot start another coverage case while the previous case is alive".to_string(),
+            ));
+        }
+        if state
+            .accepted_limit
+            .is_some_and(|limit| state.stats.accepted as usize >= limit)
+        {
+            return None;
+        }
+
+        let pending = if state.should_try_root() {
+            match self.inner.next() {
+                Some(mut case) => {
+                    state.finalize.finalize(&mut case.ops);
+                    state.stats.generated += 1;
+                    state.mutated_since_seed = 0;
+                    Some(PendingCoverageCase {
+                        case,
+                        priority: u64::MAX,
+                        order: 0,
+                    })
                 }
-            } else {
-                match self.pop_scheduled_pending() {
-                    Some(pending) => pending,
-                    None => {
-                        let case = self.inner.next()?;
-                        let mut ops = case.ops();
-                        self.finalize.finalize(&mut ops);
-                        self.stats.generated += 1;
-                        self.mutated_since_seed = 0;
-                        PendingCoverageCase {
-                            ops,
-                            seed: Some(case.seed),
-                            parent: None,
-                            depth: 0,
-                            priority: u64::MAX,
-                            order: 0,
-                        }
-                    }
+                None => {
+                    state.roots_exhausted = true;
+                    state.pop_scheduled_pending()
                 }
-            };
-
-            let evaluation = self.evaluate.evaluate(&pending.ops);
-            self.stats.executed += 1;
-            if !is_coverage_interesting(&self.global, &evaluation.coverage, evaluation.is_failure())
-            {
-                continue;
             }
-
-            let required_coverage = coverage_delta(&self.global, &evaluation.coverage);
-            let (ops, evaluation) =
-                self.shrink_interesting(pending.ops, evaluation, &required_coverage);
-            if !is_coverage_interesting(&self.global, &evaluation.coverage, evaluation.is_failure())
-            {
-                continue;
+        } else {
+            match state.pop_scheduled_pending() {
+                Some(pending) => Some(pending),
+                None => {
+                    let mut case = self.inner.next()?;
+                    state.finalize.finalize(&mut case.ops);
+                    state.stats.generated += 1;
+                    state.mutated_since_seed = 0;
+                    Some(PendingCoverageCase {
+                        case,
+                        priority: u64::MAX,
+                        order: 0,
+                    })
+                }
             }
+        }?;
 
-            let unique_coverage = coverage_delta(&self.global, &evaluation.coverage);
-            let id = self.next_id;
-            self.next_id = self.next_id.wrapping_add(1);
-            self.global.extend(evaluation.coverage.iter());
-            self.stats.accepted += 1;
-            if evaluation.is_failure() {
-                self.stats.failures += 1;
+        let token = match state.capture.start_capture() {
+            Ok(token) => token,
+            Err(error) => {
+                state.stats.errors += 1;
+                return Some(Err(error));
             }
-            self.stats.coverage_ids = self.global.len() as u64;
-            self.record_coverage_frequency(&evaluation.coverage);
+        };
+        state.active = true;
+        drop(state);
 
-            let cost = self.cost.total_cost(&ops);
-            let len = ops.len();
-            let case = CoveredCase {
-                id,
-                seed: pending.seed,
-                parent: pending.parent,
-                depth: pending.depth,
-                ops,
-                coverage: evaluation.coverage,
-                unique_coverage,
-                outcome: evaluation.outcome,
-                cost,
-                len,
-            };
-            self.enqueue_mutations(&case);
-            self.corpus.push(case.clone());
-            return Some(case);
+        Some(Ok(Case {
+            shared: Rc::clone(&self.shared),
+            case: Some(pending.case),
+            token: Some(token),
+            outcome: None,
+            finished: false,
+        }))
+    }
+}
+
+/// Active runnable coverage case. Dropping it records coverage; use [`Case::finish`] to receive
+/// capture errors immediately.
+pub struct Case<Op, Capture, Cost = UnitCost, Mutate = NoopSequenceMutator, Finalize = NoopFinalize>
+where
+    Op: Clone,
+    Capture: CoverageCapture,
+    Cost: CostModel<Op>,
+    Mutate: SequenceMutator<Op>,
+    Finalize: CaseFinalizer<Op>,
+{
+    shared: Rc<RefCell<CoverageExplorerState<Op, Capture, Cost, Mutate, Finalize>>>,
+    case: Option<InputCase<Op>>,
+    token: Option<Capture::Token>,
+    outcome: Option<Result<(), String>>,
+    finished: bool,
+}
+
+impl<Op, Capture, Cost, Mutate, Finalize> Case<Op, Capture, Cost, Mutate, Finalize>
+where
+    Op: Clone,
+    Capture: CoverageCapture,
+    Cost: CostModel<Op>,
+    Mutate: SequenceMutator<Op>,
+    Finalize: CaseFinalizer<Op>,
+{
+    /// Operation list to replay.
+    pub fn ops(&self) -> &[Op] {
+        &self
+            .case
+            .as_ref()
+            .expect("case already finished")
+            .ops
+    }
+
+    /// Source metadata for this case.
+    pub fn meta(&self) -> CaseMeta {
+        let case = self.case.as_ref().expect("case already finished");
+        CaseMeta {
+            seed: case.seed,
+            parent: case.parent,
+            depth: case.depth,
         }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, None)
+    /// Record an explicit pass/fail outcome.
+    pub fn set_outcome(&mut self, outcome: Result<(), String>) {
+        self.outcome = Some(outcome);
+    }
+
+    /// Mark this case as failing.
+    pub fn fail(&mut self, error: impl Into<String>) {
+        self.outcome = Some(Err(error.into()));
+    }
+
+    /// Run a replay closure against this case and record its outcome.
+    pub fn run<F>(&mut self, run: F) -> Result<(), String>
+    where
+        F: FnOnce(&[Op]) -> Result<(), String>,
+    {
+        let outcome = run(self.ops());
+        self.outcome = Some(outcome.clone());
+        outcome
+    }
+
+    /// Finish capture now and return any capture/export error.
+    pub fn finish(mut self) -> Result<(), String> {
+        self.finish_inner()
+    }
+
+    fn finish_inner(&mut self) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let case = self.case.take().expect("case already finished");
+        let token = self.token.take().expect("case already finished");
+        let outcome = self.outcome.take().unwrap_or_else(|| {
+            if thread::panicking() {
+                Err("panic while running coverage case".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        let mut state = self.shared.borrow_mut();
+        state.active = false;
+        state.stats.executed += 1;
+        match state.capture.finish_capture(token, outcome) {
+            Ok(evaluation) => {
+                state.accept_case(case, evaluation);
+                Ok(())
+            }
+            Err(error) => {
+                state.stats.errors += 1;
+                Err(error)
+            }
+        }
     }
 }
 
-impl<Op, Dist, I, Evaluate, Cost, Mutate, Shrink, Finalize> std::iter::FusedIterator
-    for CoverageGuided<Op, I, Evaluate, Cost, Mutate, Shrink, Finalize>
+impl<Op, Capture, Cost, Mutate, Finalize> Drop for Case<Op, Capture, Cost, Mutate, Finalize>
 where
     Op: Clone,
-    I: Iterator<Item = GeneratedCase<Op, Dist>> + std::iter::FusedIterator,
-    Dist: Distribution<Op>,
-    Evaluate: CaseEvaluator<Op>,
+    Capture: CoverageCapture,
     Cost: CostModel<Op>,
     Mutate: SequenceMutator<Op>,
-    Shrink: SequenceMutator<Op>,
     Finalize: CaseFinalizer<Op>,
 {
-}
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let case = match self.case.take() {
+            Some(case) => case,
+            None => return,
+        };
+        let token = match self.token.take() {
+            Some(token) => token,
+            None => return,
+        };
+        let outcome = self.outcome.take().unwrap_or_else(|| {
+            if thread::panicking() {
+                Err("panic while running coverage case".to_string())
+            } else {
+                Ok(())
+            }
+        });
 
+        let mut state = self.shared.borrow_mut();
+        state.active = false;
+        state.stats.executed += 1;
+        match state.capture.finish_capture(token, outcome) {
+            Ok(evaluation) => {
+                state.accept_case(case, evaluation);
+            }
+            Err(error) => {
+                state.stats.errors += 1;
+                state.errors.push_back(error);
+            }
+        }
+    }
+}

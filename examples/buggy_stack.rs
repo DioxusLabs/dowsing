@@ -77,7 +77,7 @@ struct Harness {
 }
 
 fn apply(h: &mut Harness, step: Step<'_, Op>) -> Result<(), String> {
-    match *step.op {
+    match *step.op() {
         Op::Push(v) => {
             h.model.push(v);
             h.buggy.push(v);
@@ -88,7 +88,7 @@ fn apply(h: &mut Harness, step: Step<'_, Op>) -> Result<(), String> {
             if expected != actual {
                 return Err(format!(
                     "step {}: pop returned {actual:?}, expected {expected:?}",
-                    step.index
+                    step.index()
                 ));
             }
         }
@@ -115,24 +115,23 @@ fn main() {
         .base_seed(0)
         .seeds(256)
         .steps(64)
-        .failures(Harness::default, apply)
-        .minimize(cost)
+        .minimized_failures(Harness::default, apply, cost)
         .next();
 
     match bug {
         None => println!("no bug found in 256 seeds × 64 ops"),
         Some(bug) => {
-            println!("seed {} failed:", bug.seed);
+            println!("seed {} failed:", bug.seed());
             println!(
                 "  original {} ops -> minimized to {} ops",
-                bug.ops.len(),
-                bug.minimized_ops.len()
+                bug.ops().len(),
+                bug.minimized_ops().len()
             );
             println!("  minimized repro:");
-            for (i, op) in bug.minimized_ops.iter().enumerate() {
+            for (i, op) in bug.minimized_ops().iter().enumerate() {
                 println!("    {i}: {op:?}");
             }
-            println!("  minimized error: {}", bug.minimized_error);
+            println!("  minimized error: {}", bug.minimized_error());
         }
     }
 }

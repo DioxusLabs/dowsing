@@ -1,3 +1,5 @@
+use crate::{CostModel, CoverageSet, SequenceMutator, UnitCost};
+
 /// Return coverage in `candidate` that is absent from `global`.
 pub fn coverage_delta(global: &CoverageSet, candidate: &CoverageSet) -> CoverageSet {
     candidate.difference(global)
