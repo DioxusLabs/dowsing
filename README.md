@@ -1,11 +1,23 @@
-# iterator-fuzz
+# dowsing
 
-Minimal coverage-guided randomness.
+Coverage-guided randomness for Rust tests.
 
-The API has two entry points:
+`dowsing` gives a test harness an iterator of RNGs. Each RNG records the bytes it consumes and the
+coverage it reaches. Successful paths feed the next round of exploration; failing paths can be
+forked, replayed, and minimized.
+
+The public API starts with two iterators:
+
+- `curious()` searches for new coverage.
+- `cautious()` starts from an interesting case and tries to make it smaller.
+
+## Quick Start
+
+The examples below use `NoCoverage` so they can run as plain doctests. In an instrumented harness,
+omit `.with_coverage(NoCoverage)` to use the default SanitizerCoverage feedback.
 
 ```rust
-use iterator_fuzz::{cautious, curious};
+use dowsing::{NoCoverage, cautious, curious};
 use rand::Rng;
 
 fn sample(mut rng: impl Rng) -> u8 {
@@ -20,23 +32,25 @@ fn check(sample: u8) -> Result<(), String> {
     }
 }
 
-for mut rng in curious().take(128) {
+for mut rng in curious().with_coverage(NoCoverage).take(128) {
     let input = sample(&mut rng);
+
     if check(input).is_err() {
         let case = rng.fork_case();
-        let _coverage = rng.coverage().expect("finish discovery coverage");
-        let mut cautious = cautious().with_case(case);
+        let _ = rng.coverage().expect("finish discovery coverage");
+
+        let mut variants = cautious().with_coverage(NoCoverage).with_case(case);
         let mut best = None;
 
-        for mut variant in cautious.by_ref().take(128) {
+        for mut variant in variants.by_ref().take(128) {
             let input = sample(&mut variant);
+
             if check(input).is_err() {
                 let coverage = variant.coverage().expect("finish minimization coverage");
                 if best.as_ref().is_none_or(|best_coverage| coverage < *best_coverage) {
                     best = Some(coverage);
                 }
             } else {
-                // Exclude this path; it does not reproduce what the harness wants.
                 variant.discard();
             }
         }
@@ -44,28 +58,92 @@ for mut rng in curious().take(128) {
 }
 ```
 
-Valid failing variants can also report a domain-specific cost:
+## How It Works
+
+`curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution
+finds useful coverage, `dowsing` stores the consumed RNG byte prefix and later mutates accepted
+prefixes to explore nearby inputs.
+
+`cautious()` starts from one or more forked cases. It does not generate unrelated fresh roots.
+Non-discarded variants are treated as still valid, so call `discard()` for cases that do not
+reproduce the behavior your harness is trying to keep.
+
+The minimizer ranks valid variants by:
+
+1. Lower domain-specific `CaseCost`, when reported.
+2. Fewer coverage features.
+3. Lower hit-count weight.
+4. Fewer consumed RNG bytes.
+
+This usually means `cautious()` keeps simplifying the failing path while still spending energy on
+candidates that remove hard-to-remove code.
+
+## Domain Costs
+
+Failing variants can report a harness-level cost:
 
 ```rust
+# use dowsing::{NoCoverage, cautious, curious};
+# use rand::Rng;
+# fn sample(mut rng: impl Rng) -> Vec<u8> {
+#     vec![rng.random()]
+# }
+# let mut rng = curious().with_coverage(NoCoverage).next().expect("seed case");
+# let _ = sample(&mut rng);
+# let case = rng.fork_case();
+# let _ = rng.coverage().expect("finish seed coverage");
+# let mut variants = cautious().with_coverage(NoCoverage).with_case(case);
+# let mut variant = variants.next().expect("variant");
+# let input = sample(&mut variant);
 let coverage = variant
     .coverage_with_cost(input.len())
     .expect("finish minimization coverage");
+# assert_eq!(coverage.case_cost().get(), input.len());
 ```
 
-`cautious()` minimizes this [`CaseCost`](crate::CaseCost) before coverage features and consumed RNG
-bytes. Use it for stable value-level preferences like operation count; keep using `discard()` for
-cases that do not reproduce the target failure.
+Use `coverage_with_cost` for stable value-level preferences such as operation count, input length,
+or AST node count. Use `discard()` for variants that do not reproduce the target behavior at all.
 
-`curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution is
-accepted, it stores the consumed RNG byte prefix and later mutates accepted prefixes to explore
-nearby inputs.
+## Structured Generation
 
-The iterator can also feed Rayon directly:
+Generators can annotate the structure they draw from a `CaseRng`:
 
 ```rust
+use rand::Rng;
+
+fn sample_items<C: dowsing::CoverageCapture>(rng: &mut dowsing::CaseRng<C>) -> Vec<u8> {
+    rng.take_range(0..64)
+        .map(|element| element.generate(|rng| rng.random()))
+        .collect()
+}
+```
+
+`cautious()` uses these spans to try length, item, variant, field, and value reductions before
+falling back to generic byte shrinking. Larger harnesses can tune this with
+`CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget, candidate
+caps, draw/span limits, semantic reductions, and havoc fallback.
+
+## Parallel Search
+
+The iterators can feed Rayon directly:
+
+```rust
+use dowsing::{NoCoverage, curious};
+use rand::Rng;
 use rayon::prelude::*;
 
+# fn sample(mut rng: impl Rng) -> u8 {
+#     rng.random()
+# }
+# fn check(sample: u8) -> Result<(), String> {
+#     if sample == 13 {
+#         Err("unlucky".to_string())
+#     } else {
+#         Ok(())
+#     }
+# }
 let found = curious()
+    .with_coverage(NoCoverage)
     .take(128)
     .into_par_iter()
     .find_map_any(|mut rng| {
@@ -78,36 +156,13 @@ let found = curious()
     });
 ```
 
-`cautious()` starts from forked cases. It does not generate unrelated fresh roots. It generates byte
-variants with stacked havoc mutations: deletion, truncation, zeroing, interesting values, bit and
-arithmetic flips, random byte edits, and cmp/dictionary replacement or insertion. Passing variants
-should be consumed with `discard()`, which keeps them out of the minimization corpus. Every
-non-discarded variant is retained as a failing variant. Parent selection is not the coverage-rarity
-entropy used by `curious()`; it is the inverse signal for minimization. `cautious()` records the coverage
-features from the initial failing path, then gives more energy to valid failing candidates that
-remove features that most other valid candidates still execute. The public coverage score orders
-fewer features, lower hit-count weight, then fewer consumed RNG bytes, so the minimizer prefers
-smaller failing inputs while still sampling candidates that discovered hard-to-remove code.
+Parallel coverage requires trace-pc-guard feedback. Inline counters are process-global and are only
+supported by serial search.
 
-Generators can annotate the structure they draw from a [`CaseRng`](crate::CaseRng):
-
-```rust
-fn sample_items<C: iterator_fuzz::CoverageCapture>(
-    rng: &mut iterator_fuzz::CaseRng<C>,
-) -> Vec<u8> {
-    rng.take_range(0..64)
-        .map(|element| element.generate(|rng| rng.random()))
-        .collect()
-}
-```
-
-`cautious()` uses those spans to try length, item, variant, field, and value reductions before
-generic byte shrinking. Large harnesses can tune minimization with
-`CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget,
-candidate caps, draw/span limits, and whether to keep havoc fallback enabled.
+## Coverage
 
 By default, feedback comes from LLVM SanitizerCoverage: inline 8-bit edge counters plus comparison
-callbacks. Build the clean demo with instrumentation:
+callbacks. Build the demo harness with instrumentation:
 
 ```sh
 cargo rustc --example buggy_stack -- -Cpasses=sancov-module \
@@ -118,11 +173,7 @@ cargo rustc --example buggy_stack -- -Cpasses=sancov-module \
 ./target/debug/examples/buggy_stack
 ```
 
-The benchmark uses native Rayon iteration over `curious().take(n)`. Parallel coverage requires
-trace-pc-guard feedback; inline counters are process-global and are only supported by the serial
-loop.
-
-For timing breakdowns, use the parallel benchmark variant:
+For a parallel timing breakdown:
 
 ```sh
 cargo rustc --release --example buggy_stack_bench -- -Cpasses=sancov-module \
@@ -132,4 +183,4 @@ cargo rustc --release --example buggy_stack_bench -- -Cpasses=sancov-module \
 ITERATOR_FUZZ_BENCH=1 ./target/release/examples/buggy_stack_bench
 ```
 
-Custom coverage is available by implementing `CoverageCapture` and passing it to `.with_coverage(...)`.
+Custom feedback is available by implementing `CoverageCapture` and passing it to `.with_coverage(...)`.
