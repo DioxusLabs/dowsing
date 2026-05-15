@@ -18,8 +18,9 @@ use crate::{
 };
 use rand::{RngCore, rngs::SmallRng};
 use std::{
-    marker::PhantomData,
+    cell::RefCell,
     ops::{Bound, RangeBounds},
+    rc::Rc,
     sync::{Arc, Mutex},
 };
 
@@ -61,11 +62,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         }
     }
 
-    /// Mark the RNG bytes consumed inside `f` with semantic structure.
-    ///
-    /// The marked span is used by `cautious()` to prioritize reductions; it does not change the
-    /// random values produced by the RNG.
-    pub fn semantic<T>(&mut self, kind: SemanticKind, f: impl FnOnce(&mut Self) -> T) -> T {
+    fn mark_semantic<T>(&mut self, kind: SemanticKind, f: impl FnOnce(&mut Self) -> T) -> T {
         let start = self.cursor;
         let output = f(self);
         let len = self.cursor.saturating_sub(start);
@@ -79,56 +76,39 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         output
     }
 
-    /// Generate a length in `0..upper` and mark it as [`SemanticKind::Length`].
-    pub fn length(&mut self, upper: usize) -> usize {
+    fn length_below(&mut self, upper: usize) -> usize {
         let upper = upper.max(1).min(u16::MAX as usize) as u16;
-        self.semantic(SemanticKind::Length, |rng| {
+        self.mark_semantic(SemanticKind::Length, |rng| {
             (rng.next_u32() as u16 % upper) as usize
         })
     }
 
-    /// Generate a choice in `0..upper` and mark it as [`SemanticKind::Variant`].
-    pub fn choice(&mut self, upper: usize) -> usize {
-        let upper = upper.max(1).min(u16::MAX as usize) as u16;
-        self.semantic(SemanticKind::Variant, |rng| {
-            (rng.next_u32() as u16 % upper) as usize
-        })
-    }
-
-    /// Generate a length in `range` and return a semantic sequence builder.
-    pub fn take_range<R>(&mut self, range: R) -> TakeRange<'_, Capture>
+    fn draw_length_in<R>(&mut self, range: R) -> usize
     where
         R: RangeBounds<usize>,
     {
         let (start, width) = normalize_range(range);
-        let length_start = self.cursor;
-        let len = if width == 1 {
+        if width == 1 {
             start
         } else {
-            start + self.length(width)
-        };
-        let length_len = self.cursor.saturating_sub(length_start);
-
-        TakeRange {
-            rng: self,
-            len,
-            length_start,
-            length_len,
+            start + self.length_below(width)
         }
     }
 
-    /// Generate a sequence with a marked length and marked item spans.
-    pub fn sequence<T>(
-        &mut self,
-        upper: usize,
-        mut item: impl FnMut(&mut Self, usize) -> T,
-    ) -> Vec<T> {
-        self.take_range(0..upper)
-            .map(|element| {
-                let index = element.index();
-                element.generate(|rng| item(rng, index))
-            })
-            .collect()
+    /// Generate a variant index in `0..upper`.
+    pub fn variant(&mut self, upper: usize) -> usize {
+        let upper = upper.max(1).min(u16::MAX as usize) as u16;
+        self.mark_semantic(SemanticKind::Variant, |rng| {
+            (rng.next_u32() as u16 % upper) as usize
+        })
+    }
+
+    /// Generate a length in `range` and return a semantic range iterator.
+    pub fn range<R>(&mut self, range: R) -> RangeIter<'_, Capture>
+    where
+        R: RangeBounds<usize>,
+    {
+        RangeIter::new(Rc::new(RefCell::new(self)), range)
     }
 
     /// Finish this execution immediately and return its coverage stats.
@@ -154,130 +134,90 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     }
 }
 
-/// Semantic sequence builder returned by [`CaseRng::take_range`].
-pub struct TakeRange<'a, Capture: CoverageCapture = SancovCoverage> {
-    rng: &'a mut CaseRng<Capture>,
+/// Structured range iterator returned by [`CaseRng::range`].
+pub struct RangeIter<'a, Capture: CoverageCapture = SancovCoverage> {
+    shared: Rc<RangeState<'a, Capture>>,
     len: usize,
-    length_start: usize,
-    length_len: usize,
+    index: usize,
+    order: Vec<usize>,
 }
 
-impl<'a, Capture: CoverageCapture> TakeRange<'a, Capture> {
-    /// Generate each element in the selected range.
-    pub fn map<T, F>(self, f: F) -> SequenceMap<'a, Capture, F, T>
+impl<'a, Capture: CoverageCapture> RangeIter<'a, Capture> {
+    fn new<R>(rng: Rc<RefCell<&'a mut CaseRng<Capture>>>, range: R) -> Self
     where
-        F: for<'b> FnMut(SequenceElement<'b, Capture>) -> T,
+        R: RangeBounds<usize>,
     {
-        SequenceMap {
-            rng: self.rng,
-            len: self.len,
+        let (len, length_start, length_len) = {
+            let mut rng = rng.borrow_mut();
+            let length_start = rng.cursor;
+            let len = rng.draw_length_in(range);
+            let length_len = rng.cursor.saturating_sub(length_start);
+            (len, length_start, length_len)
+        };
+
+        Self {
+            shared: Rc::new(RangeState {
+                rng,
+                length_start,
+                length_len,
+                item_spans: RefCell::new(Vec::with_capacity(len)),
+            }),
+            len,
             index: 0,
-            length_start: self.length_start,
-            length_len: self.length_len,
-            item_spans: Vec::with_capacity(self.len),
-            f,
-            finished: false,
-            output: PhantomData,
+            order: Vec::new(),
         }
     }
 
-    /// Number of elements selected by the range draw.
-    pub fn len(&self) -> usize {
-        self.len
-    }
+    /// Yield this range's children in `order`.
+    ///
+    /// The order must be a permutation of `0..self.len()` and must be selected before iteration
+    /// starts. [`ChildRng::index`] returns the child index selected for the current yield.
+    pub fn reorder<I>(mut self, order: I) -> Self
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        assert_eq!(
+            self.index, 0,
+            "range children must be reordered before iteration starts"
+        );
 
-    /// Returns `true` if the selected range is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
+        let order: Vec<_> = order.into_iter().collect();
+        assert_eq!(
+            order.len(),
+            self.len,
+            "range child order must include every generated child"
+        );
 
-/// One generated element in a [`CaseRng::take_range`] sequence.
-pub struct SequenceElement<'a, Capture: CoverageCapture = SancovCoverage> {
-    rng: &'a mut CaseRng<Capture>,
-    index: usize,
-}
-
-impl<Capture: CoverageCapture> SequenceElement<'_, Capture> {
-    /// Zero-based index of this generated element.
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Generate the element value.
-    pub fn generate<T>(self, f: impl FnOnce(&mut CaseRng<Capture>) -> T) -> T {
-        f(self.rng)
-    }
-}
-
-/// Iterator returned by [`TakeRange::map`].
-pub struct SequenceMap<'a, Capture, F, T>
-where
-    Capture: CoverageCapture,
-{
-    rng: &'a mut CaseRng<Capture>,
-    len: usize,
-    index: usize,
-    length_start: usize,
-    length_len: usize,
-    item_spans: Vec<SequenceItemSpan>,
-    f: F,
-    finished: bool,
-    output: PhantomData<fn() -> T>,
-}
-
-impl<Capture, F, T> SequenceMap<'_, Capture, F, T>
-where
-    Capture: CoverageCapture,
-{
-    fn finish_sequence(&mut self) {
-        if self.finished {
-            return;
+        let mut seen = vec![false; self.len];
+        for index in order.iter().copied() {
+            assert!(index < self.len, "range child order index out of bounds");
+            assert!(!seen[index], "range child order contains a duplicate index");
+            seen[index] = true;
         }
-        self.finished = true;
-        if self.length_len > 0 && self.length_start < MAX_PREFIX_LEN && !self.item_spans.is_empty()
-        {
-            self.rng.sequences.push(SequenceSpan {
-                length_start: self.length_start,
-                length_len: self.length_len.min(MAX_PREFIX_LEN - self.length_start),
-                items: std::mem::take(&mut self.item_spans),
-            });
-        }
+
+        self.order = order;
+        self
     }
 }
 
-impl<Capture, F, T> Iterator for SequenceMap<'_, Capture, F, T>
-where
-    Capture: CoverageCapture,
-    F: for<'b> FnMut(SequenceElement<'b, Capture>) -> T,
-{
-    type Item = T;
+impl<'a, Capture: CoverageCapture> Iterator for RangeIter<'a, Capture> {
+    type Item = ChildRng<'a, Capture>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.len {
-            self.finish_sequence();
             return None;
         }
 
-        let index = self.index;
+        let position = self.index;
+        let index = self.order.get(position).copied().unwrap_or(position);
         self.index += 1;
-        let item_start = self.rng.cursor;
-        let value = (self.f)(SequenceElement {
-            rng: self.rng,
+        let item_start = self.shared.rng.borrow().cursor;
+        Some(ChildRng {
+            shared: Rc::clone(&self.shared),
             index,
-        });
-        let item_len = self.rng.cursor.saturating_sub(item_start);
-        if item_len > 0 && item_start < MAX_PREFIX_LEN {
-            let len = item_len.min(MAX_PREFIX_LEN - item_start);
-            self.item_spans.push(SequenceItemSpan {
-                start: item_start,
-                len,
-            });
-            self.rng
-                .semantics
-                .push(SemanticSpan::new(item_start, len, SemanticKind::Item));
-        }
-        Some(value)
+            position,
+            item_start,
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -286,19 +226,83 @@ where
     }
 }
 
-impl<Capture, F, T> ExactSizeIterator for SequenceMap<'_, Capture, F, T>
-where
-    Capture: CoverageCapture,
-    F: for<'b> FnMut(SequenceElement<'b, Capture>) -> T,
-{
+impl<Capture: CoverageCapture> ExactSizeIterator for RangeIter<'_, Capture> {}
+
+struct RangeState<'a, Capture: CoverageCapture = SancovCoverage> {
+    rng: Rc<RefCell<&'a mut CaseRng<Capture>>>,
+    length_start: usize,
+    length_len: usize,
+    item_spans: RefCell<Vec<(usize, SequenceItemSpan)>>,
 }
 
-impl<Capture, F, T> Drop for SequenceMap<'_, Capture, F, T>
-where
-    Capture: CoverageCapture,
-{
+impl<Capture: CoverageCapture> Drop for RangeState<'_, Capture> {
     fn drop(&mut self) {
-        self.finish_sequence();
+        let item_spans = self.item_spans.get_mut();
+        if self.length_len > 0 && self.length_start < MAX_PREFIX_LEN && !item_spans.is_empty() {
+            item_spans.sort_by_key(|(position, _)| *position);
+            let items = item_spans.iter().map(|(_, span)| *span).collect();
+            let mut rng = self.rng.borrow_mut();
+            rng.sequences.push(SequenceSpan {
+                length_start: self.length_start,
+                length_len: self.length_len.min(MAX_PREFIX_LEN - self.length_start),
+                items,
+            });
+        }
+    }
+}
+
+/// Child RNG for one generated element in a [`CaseRng::range`] sequence.
+pub struct ChildRng<'a, Capture: CoverageCapture = SancovCoverage> {
+    shared: Rc<RangeState<'a, Capture>>,
+    index: usize,
+    position: usize,
+    item_start: usize,
+}
+
+impl<Capture: CoverageCapture> ChildRng<'_, Capture> {
+    /// Zero-based logical index of this generated child.
+    ///
+    /// This reflects any order selected with [`RangeIter::reorder`].
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Generate a variant index in `0..upper`.
+    pub fn variant(&mut self, upper: usize) -> usize {
+        self.shared.rng.borrow_mut().variant(upper)
+    }
+}
+
+impl<Capture: CoverageCapture> RngCore for ChildRng<'_, Capture> {
+    fn next_u32(&mut self) -> u32 {
+        self.shared.rng.borrow_mut().next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.shared.rng.borrow_mut().next_u64()
+    }
+
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        self.shared.rng.borrow_mut().fill_bytes(dst);
+    }
+}
+
+impl<Capture: CoverageCapture> Drop for ChildRng<'_, Capture> {
+    fn drop(&mut self) {
+        let mut rng = self.shared.rng.borrow_mut();
+        let item_len = rng.cursor.saturating_sub(self.item_start);
+        if item_len > 0 && self.item_start < MAX_PREFIX_LEN {
+            let len = item_len.min(MAX_PREFIX_LEN - self.item_start);
+            self.shared.item_spans.borrow_mut().push((
+                self.position,
+                SequenceItemSpan {
+                    start: self.item_start,
+                    len,
+                },
+            ));
+            rng.semantics
+                .push(SemanticSpan::new(self.item_start, len, SemanticKind::Item));
+        }
     }
 }
 
@@ -311,9 +315,9 @@ fn normalize_range(range: impl RangeBounds<usize>) -> (usize, usize) {
     let end = match range.end_bound() {
         Bound::Included(value) => value.saturating_add(1),
         Bound::Excluded(value) => *value,
-        Bound::Unbounded => panic!("take_range requires a bounded upper limit"),
+        Bound::Unbounded => panic!("range requires a bounded upper limit"),
     };
-    assert!(start < end, "take_range requires a non-empty range");
+    assert!(start < end, "range requires a non-empty range");
     (start, end - start)
 }
 

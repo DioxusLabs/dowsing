@@ -1,4 +1,4 @@
-use crate::*;
+use crate::{backends::SancovCoverage, coverage::CoverageCapture};
 
 #[test]
 fn counter_feedback_records_edge_buckets() {

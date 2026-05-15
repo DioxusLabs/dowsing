@@ -111,6 +111,7 @@ impl<Capture: CoverageCapture> Engine<Capture> {
         self
     }
 
+    #[cfg(test)]
     pub(super) fn with_mutate_depth(self, depth: usize) -> Self {
         self.shared
             .lock()
@@ -119,6 +120,7 @@ impl<Capture: CoverageCapture> Engine<Capture> {
         self
     }
 
+    #[cfg(test)]
     pub(super) fn with_seed_ratio(self, ratio: u64) -> Self {
         self.shared
             .lock()
@@ -146,14 +148,6 @@ impl<Capture: CoverageCapture> Engine<Capture> {
 
     pub(super) fn stats(&self) -> SearchStats {
         self.shared.lock().expect("search state poisoned").stats
-    }
-
-    pub(super) fn coverage_seen(&self) -> CoverageSet {
-        self.shared
-            .lock()
-            .expect("search state poisoned")
-            .global
-            .clone()
     }
 
     #[cfg(test)]
@@ -313,14 +307,16 @@ impl<Capture: CoverageCapture> Curious<Capture> {
     }
 
     /// Set how many byte-prefix mutations are stacked in havoc-style candidate generation.
-    pub fn with_mutate_depth(self, depth: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_mutate_depth(self, depth: usize) -> Self {
         Self {
             engine: self.engine.with_mutate_depth(depth),
         }
     }
 
     /// Set how often `curious()` explores a fresh random root while a corpus exists.
-    pub fn with_seed_ratio(self, ratio: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_seed_ratio(self, ratio: u64) -> Self {
         Self {
             engine: self.engine.with_seed_ratio(ratio),
         }
@@ -347,11 +343,6 @@ impl<Capture: CoverageCapture> Curious<Capture> {
     /// Current counters.
     pub fn stats(&self) -> SearchStats {
         self.engine.stats()
-    }
-
-    /// Coverage accumulated by accepted executions.
-    pub fn coverage_seen(&self) -> CoverageSet {
-        self.engine.coverage_seen()
     }
 
     #[cfg(test)]
@@ -390,40 +381,11 @@ impl<Capture: CoverageCapture> Cautious<Capture> {
         }
     }
 
-    /// Set how many byte-prefix mutations are stacked in havoc-style candidate generation.
-    pub fn with_mutate_depth(self, depth: usize) -> Self {
-        Self {
-            engine: self.engine.with_mutate_depth(depth),
-        }
-    }
-
     /// Set minimization reducer options.
     pub fn with_options(self, options: CautiousOptions) -> Self {
         Self {
             engine: self.engine.with_cautious_options(options),
         }
-    }
-
-    /// Set the maximum internal reducer attempts spent to produce one yielded candidate.
-    pub fn with_reducer_budget(self, budget: usize) -> Self {
-        let options = self
-            .engine
-            .shared
-            .lock()
-            .expect("search state poisoned")
-            .cautious_options;
-        self.with_options(options.with_reducer_budget(budget))
-    }
-
-    /// Enable or disable havoc fallback after deterministic reductions are exhausted.
-    pub fn with_havoc(self, enabled: bool) -> Self {
-        let options = self
-            .engine
-            .shared
-            .lock()
-            .expect("search state poisoned")
-            .cautious_options;
-        self.with_options(options.with_havoc(enabled))
     }
 
     /// Set the first seed.
@@ -447,11 +409,6 @@ impl<Capture: CoverageCapture> Cautious<Capture> {
     /// Current counters.
     pub fn stats(&self) -> SearchStats {
         self.engine.stats()
-    }
-
-    /// Coverage accumulated by accepted executions.
-    pub fn coverage_seen(&self) -> CoverageSet {
-        self.engine.coverage_seen()
     }
 
     #[cfg(test)]

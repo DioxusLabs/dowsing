@@ -4,7 +4,7 @@
 //! [`CaseRng::fork_case`] and feed it to [`cautious`] to minimize the code path that still matters to
 //! the harness.
 
-mod coverage;
+pub mod coverage;
 mod iter;
 mod llvm;
 mod sancov;
@@ -12,13 +12,20 @@ mod sancov;
 #[cfg(test)]
 mod tests;
 
-pub use coverage::{
-    CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, ParallelCoverageCapture,
-};
+pub mod backends {
+    pub use crate::{
+        iter::NoCoverage,
+        llvm::{LlvmCoverage, reset_llvm_counters},
+        sancov::SancovCoverage,
+    };
+}
+
+pub mod tuning {
+    pub use crate::iter::{CautiousOptions, SearchStats};
+}
+
+pub use backends::NoCoverage;
 pub use iter::{
-    Case, CaseCost, CaseCoverage, CaseRng, Cases, Cautious, CautiousOptions, Curious, NoCoverage,
-    ParallelCases, SearchStats, SemanticKind, SequenceElement, SequenceMap, TakeRange, cautious,
-    curious,
+    Case, CaseCost, CaseCoverage, CaseRng, Cases, Cautious, ChildRng, Curious, ParallelCases,
+    RangeIter, cautious, curious,
 };
-pub use llvm::{LlvmCoverage, reset_llvm_counters};
-pub use sancov::SancovCoverage;

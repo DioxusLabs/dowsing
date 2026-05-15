@@ -1,4 +1,4 @@
-use crate::{CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, coverage::CAPTURE_BUSY};
+use crate::coverage::{CAPTURE_BUSY, CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback};
 use std::{
     ffi::{CStr, c_char, c_void},
     mem,

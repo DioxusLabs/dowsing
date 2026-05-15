@@ -1,6 +1,6 @@
-use crate::{
-    CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, ParallelCoverageCapture,
-    coverage::CAPTURE_BUSY,
+use crate::coverage::{
+    CAPTURE_BUSY, CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback,
+    ParallelCoverageCapture,
 };
 use std::{
     cell::{Cell, RefCell},

@@ -106,22 +106,38 @@ or AST node count. Use `discard()` for variants that do not reproduce the target
 
 ## Structured Generation
 
-Generators can annotate the structure they draw from a `CaseRng`:
+Generators can use typed structure builders around the bytes they draw from a `CaseRng`:
 
 ```rust
 use rand::Rng;
 
-fn sample_items<C: dowsing::CoverageCapture>(rng: &mut dowsing::CaseRng<C>) -> Vec<u8> {
-    rng.take_range(0..64)
-        .map(|element| element.generate(|rng| rng.random()))
+fn sample_items<C: dowsing::coverage::CoverageCapture>(
+    rng: &mut dowsing::CaseRng<C>,
+) -> Vec<u8> {
+    rng.range(0..64)
+        .map(|mut item| item.random())
         .collect()
 }
 ```
 
-`cautious()` uses these spans to try length, item, variant, field, and value reductions before
+`range` draws a length in the requested bounds and maps each element through a child RNG. The child
+records item spans while still behaving like an RNG, so generation can use `random` and `variant`.
+
+Ranges can also choose a child order before generation:
+
+```rust
+let items = rng.range(0..64);
+let len = items.len();
+let reversed: Vec<u8> = items
+    .reorder((0..len).rev())
+    .map(|mut item| item.random())
+    .collect();
+```
+
+`cautious()` uses this structure to try length, item, and variant reductions before
 falling back to generic byte shrinking. Larger harnesses can tune this with
-`CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget, candidate
-caps, draw/span limits, semantic reductions, and havoc fallback.
+`tuning::CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget,
+candidate caps, draw/span limits, semantic reductions, and havoc fallback.
 
 ## Parallel Search
 
@@ -183,4 +199,5 @@ cargo rustc --release --example buggy_stack_bench -- -Cpasses=sancov-module \
 ITERATOR_FUZZ_BENCH=1 ./target/release/examples/buggy_stack_bench
 ```
 
-Custom feedback is available by implementing `CoverageCapture` and passing it to `.with_coverage(...)`.
+Custom feedback is available by implementing `coverage::CoverageCapture` and passing it to
+`.with_coverage(...)`.

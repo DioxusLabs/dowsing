@@ -1,4 +1,9 @@
 use crate::*;
+use crate::{
+    backends::SancovCoverage,
+    coverage::{CoverageCapture, CoverageId, ExecutionFeedback, ParallelCoverageCapture},
+    tuning::CautiousOptions,
+};
 use rand::{Rng, RngCore};
 use std::{
     cell::RefCell,
@@ -939,25 +944,65 @@ fn sample_modulo_len_payload(rng: &mut impl Rng) -> usize {
 }
 
 fn sample_semantic_len_payload<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) -> usize {
-    let len = rng.length(64);
-    for _ in 0..len {
-        rng.semantic(SemanticKind::Item, |rng| {
-            let _ = rng.random::<u8>();
-        });
-    }
-    len
+    rng.range(0..64)
+        .map(|mut item| {
+            let _ = item.random::<u8>();
+        })
+        .count()
 }
 
 fn sample_byte_sequence<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) -> Vec<u8> {
-    rng.take_range(0..8)
-        .map(|element| {
-            element.generate(|rng| {
-                let mut byte = [0];
-                rng.fill_bytes(&mut byte);
-                byte[0]
-            })
+    rng.range(0..8)
+        .map(|mut item| {
+            let mut byte = [0];
+            item.fill_bytes(&mut byte);
+            byte[0]
         })
         .collect()
+}
+
+#[test]
+fn structured_range_yields_rng_like_children() {
+    let mut cases = curious().with_coverage(NoCoverage);
+    let mut rng = cases.next().expect("case rng");
+    let values = {
+        let mut items = rng.range(1..=3);
+        let mut values = Vec::new();
+        while let Some(mut item) = items.next() {
+            let index = item.index();
+            values.push((index, item.variant(4), item.random::<u8>()));
+        }
+        values
+    };
+
+    assert!((1..=3).contains(&values.len()));
+    assert!(
+        values
+            .iter()
+            .enumerate()
+            .all(|(index, (item_index, _, _))| *item_index == index)
+    );
+    rng.discard();
+}
+
+#[test]
+fn structured_range_can_reorder_children() {
+    let mut cases = curious().with_coverage(NoCoverage);
+    let mut rng = cases.next().expect("case rng");
+    let items = rng.range(1..=4);
+    let len = items.len();
+    let observed: Vec<_> = items
+        .reorder((0..len).rev())
+        .map(|mut item| {
+            let child = item.index();
+            let _ = item.random::<u8>();
+            child
+        })
+        .collect();
+
+    let expected: Vec<_> = (0..len).rev().collect();
+    assert_eq!(observed, expected);
+    rng.discard();
 }
 
 #[test]

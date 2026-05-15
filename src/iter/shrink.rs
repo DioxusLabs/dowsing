@@ -689,10 +689,7 @@ fn semantic_delete_specs(
         if !valid_semantic_span(prefix, span) || span.len >= prefix.len() {
             continue;
         }
-        if !matches!(
-            span.kind,
-            SemanticKind::Item | SemanticKind::Field | SemanticKind::Value
-        ) {
+        if span.kind != SemanticKind::Item {
             continue;
         }
         specs.push(ReductionSpec {
@@ -1259,8 +1256,6 @@ fn semantic_weight(kind: SemanticKind) -> u64 {
         SemanticKind::Length => 0,
         SemanticKind::Item => 8,
         SemanticKind::Variant => 16,
-        SemanticKind::Field => 24,
-        SemanticKind::Value => 32,
     }
 }
 
