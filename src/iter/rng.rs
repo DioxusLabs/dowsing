@@ -1,11 +1,15 @@
 use super::{
     api::coverage_delta,
     mutate::{corpus_energy, refresh_corpus_energies},
-    prelude::{Active, Case, CaseCoverage, CorpusSeed, MAX_PREFIX_LEN, MinPathScore, Mode, State},
+    prelude::{
+        Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
+        MAX_PREFIX_LEN, MinPathScore, Mode, SemanticKind, SemanticSpan, SequenceItemSpan,
+        SequenceSpan, State,
+    },
     run::min_path_schedule_energy,
     shrink::{
-        energy_refresh_interval, enqueue_cautious_best_neighbors, merge_dictionary_values,
-        prune_corpus,
+        energy_refresh_interval, merge_dictionary_values, prune_corpus, record_cautious_discard,
+        record_cautious_preserved, reset_cautious_reducer_to_best,
     },
 };
 use crate::{
@@ -13,7 +17,11 @@ use crate::{
     sancov::SancovCoverage,
 };
 use rand::{RngCore, rngs::SmallRng};
-use std::sync::{Arc, Mutex};
+use std::{
+    marker::PhantomData,
+    ops::{Bound, RangeBounds},
+    sync::{Arc, Mutex},
+};
 
 /// RNG yielded by [`crate::Curious`] and [`crate::Cautious`].
 pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
@@ -22,9 +30,13 @@ pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
     pub(super) seed: u64,
     pub(super) prefix: Vec<u8>,
     pub(super) zero_tail: bool,
+    pub(super) origin: CandidateOrigin,
     pub(super) cursor: usize,
     pub(super) bytes_consumed: usize,
     pub(super) trace: Vec<u8>,
+    pub(super) draws: Vec<DrawSpan>,
+    pub(super) semantics: Vec<SemanticSpan>,
+    pub(super) sequences: Vec<SequenceSpan>,
     pub(super) token: Option<Capture::Token>,
     pub(super) local_capture: Option<Capture>,
     pub(super) start_error: Option<String>,
@@ -43,7 +55,80 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             seed: self.seed,
             prefix: self.trace.clone(),
             zero_tail: self.zero_tail,
+            draws: self.draws.clone(),
+            semantics: self.semantics.clone(),
+            sequences: self.sequences.clone(),
         }
+    }
+
+    /// Mark the RNG bytes consumed inside `f` with semantic structure.
+    ///
+    /// The marked span is used by `cautious()` to prioritize reductions; it does not change the
+    /// random values produced by the RNG.
+    pub fn semantic<T>(&mut self, kind: SemanticKind, f: impl FnOnce(&mut Self) -> T) -> T {
+        let start = self.cursor;
+        let output = f(self);
+        let len = self.cursor.saturating_sub(start);
+        if len > 0 && start < MAX_PREFIX_LEN {
+            self.semantics.push(SemanticSpan::new(
+                start,
+                len.min(MAX_PREFIX_LEN - start),
+                kind,
+            ));
+        }
+        output
+    }
+
+    /// Generate a length in `0..upper` and mark it as [`SemanticKind::Length`].
+    pub fn length(&mut self, upper: usize) -> usize {
+        let upper = upper.max(1).min(u16::MAX as usize) as u16;
+        self.semantic(SemanticKind::Length, |rng| {
+            (rng.next_u32() as u16 % upper) as usize
+        })
+    }
+
+    /// Generate a choice in `0..upper` and mark it as [`SemanticKind::Variant`].
+    pub fn choice(&mut self, upper: usize) -> usize {
+        let upper = upper.max(1).min(u16::MAX as usize) as u16;
+        self.semantic(SemanticKind::Variant, |rng| {
+            (rng.next_u32() as u16 % upper) as usize
+        })
+    }
+
+    /// Generate a length in `range` and return a semantic sequence builder.
+    pub fn take_range<R>(&mut self, range: R) -> TakeRange<'_, Capture>
+    where
+        R: RangeBounds<usize>,
+    {
+        let (start, width) = normalize_range(range);
+        let length_start = self.cursor;
+        let len = if width == 1 {
+            start
+        } else {
+            start + self.length(width)
+        };
+        let length_len = self.cursor.saturating_sub(length_start);
+
+        TakeRange {
+            rng: self,
+            len,
+            length_start,
+            length_len,
+        }
+    }
+
+    /// Generate a sequence with a marked length and marked item spans.
+    pub fn sequence<T>(
+        &mut self,
+        upper: usize,
+        mut item: impl FnMut(&mut Self, usize) -> T,
+    ) -> Vec<T> {
+        self.take_range(0..upper)
+            .map(|element| {
+                let index = element.index();
+                element.generate(|rng| item(rng, index))
+            })
+            .collect()
     }
 
     /// Finish this execution immediately and return its coverage stats.
@@ -51,28 +136,209 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     /// This consumes the RNG because coverage is only meaningful after the caller has finished
     /// executing the path being measured.
     pub fn coverage(mut self) -> Result<CaseCoverage, String> {
-        self.finish(true)
+        self.finish(true, CaseCost::zero())
+    }
+
+    /// Finish this execution with a domain-specific value cost.
+    ///
+    /// Lower costs are better. In `cautious()` mode the minimizer uses this cost before coverage
+    /// and RNG-path length, so a harness can prefer shorter or simpler reproducing values while
+    /// still rejecting non-reproducing values with [`Self::discard`].
+    pub fn coverage_with_cost(mut self, cost: impl Into<CaseCost>) -> Result<CaseCoverage, String> {
+        self.finish(true, cost.into())
     }
 
     /// Exclude this execution from coverage feedback when the RNG is dropped.
     pub fn discard(mut self) {
-        let _ = self.finish(false);
+        let _ = self.finish(false, CaseCost::zero());
     }
+}
+
+/// Semantic sequence builder returned by [`CaseRng::take_range`].
+pub struct TakeRange<'a, Capture: CoverageCapture = SancovCoverage> {
+    rng: &'a mut CaseRng<Capture>,
+    len: usize,
+    length_start: usize,
+    length_len: usize,
+}
+
+impl<'a, Capture: CoverageCapture> TakeRange<'a, Capture> {
+    /// Generate each element in the selected range.
+    pub fn map<T, F>(self, f: F) -> SequenceMap<'a, Capture, F, T>
+    where
+        F: for<'b> FnMut(SequenceElement<'b, Capture>) -> T,
+    {
+        SequenceMap {
+            rng: self.rng,
+            len: self.len,
+            index: 0,
+            length_start: self.length_start,
+            length_len: self.length_len,
+            item_spans: Vec::with_capacity(self.len),
+            f,
+            finished: false,
+            output: PhantomData,
+        }
+    }
+
+    /// Number of elements selected by the range draw.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the selected range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// One generated element in a [`CaseRng::take_range`] sequence.
+pub struct SequenceElement<'a, Capture: CoverageCapture = SancovCoverage> {
+    rng: &'a mut CaseRng<Capture>,
+    index: usize,
+}
+
+impl<Capture: CoverageCapture> SequenceElement<'_, Capture> {
+    /// Zero-based index of this generated element.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Generate the element value.
+    pub fn generate<T>(self, f: impl FnOnce(&mut CaseRng<Capture>) -> T) -> T {
+        f(self.rng)
+    }
+}
+
+/// Iterator returned by [`TakeRange::map`].
+pub struct SequenceMap<'a, Capture, F, T>
+where
+    Capture: CoverageCapture,
+{
+    rng: &'a mut CaseRng<Capture>,
+    len: usize,
+    index: usize,
+    length_start: usize,
+    length_len: usize,
+    item_spans: Vec<SequenceItemSpan>,
+    f: F,
+    finished: bool,
+    output: PhantomData<fn() -> T>,
+}
+
+impl<Capture, F, T> SequenceMap<'_, Capture, F, T>
+where
+    Capture: CoverageCapture,
+{
+    fn finish_sequence(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if self.length_len > 0 && self.length_start < MAX_PREFIX_LEN && !self.item_spans.is_empty()
+        {
+            self.rng.sequences.push(SequenceSpan {
+                length_start: self.length_start,
+                length_len: self.length_len.min(MAX_PREFIX_LEN - self.length_start),
+                items: std::mem::take(&mut self.item_spans),
+            });
+        }
+    }
+}
+
+impl<Capture, F, T> Iterator for SequenceMap<'_, Capture, F, T>
+where
+    Capture: CoverageCapture,
+    F: for<'b> FnMut(SequenceElement<'b, Capture>) -> T,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            self.finish_sequence();
+            return None;
+        }
+
+        let index = self.index;
+        self.index += 1;
+        let item_start = self.rng.cursor;
+        let value = (self.f)(SequenceElement {
+            rng: self.rng,
+            index,
+        });
+        let item_len = self.rng.cursor.saturating_sub(item_start);
+        if item_len > 0 && item_start < MAX_PREFIX_LEN {
+            let len = item_len.min(MAX_PREFIX_LEN - item_start);
+            self.item_spans.push(SequenceItemSpan {
+                start: item_start,
+                len,
+            });
+            self.rng
+                .semantics
+                .push(SemanticSpan::new(item_start, len, SemanticKind::Item));
+        }
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<Capture, F, T> ExactSizeIterator for SequenceMap<'_, Capture, F, T>
+where
+    Capture: CoverageCapture,
+    F: for<'b> FnMut(SequenceElement<'b, Capture>) -> T,
+{
+}
+
+impl<Capture, F, T> Drop for SequenceMap<'_, Capture, F, T>
+where
+    Capture: CoverageCapture,
+{
+    fn drop(&mut self) {
+        self.finish_sequence();
+    }
+}
+
+fn normalize_range(range: impl RangeBounds<usize>) -> (usize, usize) {
+    let start = match range.start_bound() {
+        Bound::Included(value) => *value,
+        Bound::Excluded(value) => value.saturating_add(1),
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(value) => value.saturating_add(1),
+        Bound::Excluded(value) => *value,
+        Bound::Unbounded => panic!("take_range requires a bounded upper limit"),
+    };
+    assert!(start < end, "take_range requires a non-empty range");
+    (start, end - start)
 }
 
 impl<Capture: CoverageCapture> RngCore for CaseRng<Capture> {
     fn next_u32(&mut self) -> u32 {
-        u32::from_le_bytes(self.traced_word_bytes())
+        let start = self.cursor;
+        let bytes = self.traced_word_bytes();
+        self.record_draw(start, 4, DrawKind::Word);
+        u32::from_le_bytes(bytes)
     }
 
     fn next_u64(&mut self) -> u64 {
-        u64::from_le_bytes(self.traced_word_bytes())
+        let start = self.cursor;
+        let bytes = self.traced_word_bytes();
+        self.record_draw(start, 8, DrawKind::Word);
+        u64::from_le_bytes(bytes)
     }
 
     fn fill_bytes(&mut self, dst: &mut [u8]) {
+        let start = self.cursor;
+        let len = dst.len();
         for byte in dst {
             *byte = self.next_byte();
         }
+        self.record_draw(start, len, DrawKind::Bytes);
     }
 }
 
@@ -83,6 +349,14 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             *byte = self.next_byte();
         }
         bytes
+    }
+
+    fn record_draw(&mut self, start: usize, len: usize, kind: DrawKind) {
+        if len == 0 || start >= MAX_PREFIX_LEN {
+            return;
+        }
+        let len = len.min(MAX_PREFIX_LEN - start);
+        self.draws.push(DrawSpan::new(start, len, kind));
     }
 
     fn next_byte(&mut self) -> u8 {
@@ -132,7 +406,11 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         }
     }
 
-    fn finish(&mut self, record_coverage: bool) -> Result<CaseCoverage, String> {
+    fn finish(
+        &mut self,
+        record_coverage: bool,
+        case_cost: CaseCost,
+    ) -> Result<CaseCoverage, String> {
         if self.finished {
             return Err("coverage already finished".to_string());
         }
@@ -142,7 +420,11 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         let active = Active {
             seed: self.seed,
             trace: std::mem::take(&mut self.trace),
+            draws: std::mem::take(&mut self.draws),
+            semantics: std::mem::take(&mut self.semantics),
+            sequences: std::mem::take(&mut self.sequences),
             bytes_consumed: self.bytes_consumed,
+            origin: self.origin.clone(),
         };
         let token = self.token.take();
         if let Some(mut capture) = self.local_capture.take() {
@@ -155,7 +437,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             match outcome {
                 Ok(outcome) => {
                     let mut state = self.shared.lock().expect("search state poisoned");
-                    merge_finished_execution(&mut state, active, outcome)
+                    merge_finished_execution(&mut state, active, outcome, case_cost)
                 }
                 Err(error) => {
                     let mut state = self.shared.lock().expect("search state poisoned");
@@ -173,7 +455,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
                 record_coverage,
             );
             match outcome {
-                Ok(outcome) => merge_finished_execution(&mut state, active, outcome),
+                Ok(outcome) => merge_finished_execution(&mut state, active, outcome, case_cost),
                 Err(error) => {
                     state.stats.executed += 1;
                     state.active_cases = state.active_cases.saturating_sub(1);
@@ -190,7 +472,7 @@ where
 {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.finish(true);
+            let _ = self.finish(true, CaseCost::zero());
         }
     }
 }
@@ -228,6 +510,7 @@ fn merge_finished_execution<Capture>(
     state: &mut State<Capture>,
     active: Active,
     finished: FinishedCapture,
+    case_cost: CaseCost,
 ) -> Result<CaseCoverage, String>
 where
     Capture: CoverageCapture,
@@ -236,23 +519,29 @@ where
     state.active_cases = state.active_cases.saturating_sub(1);
 
     let Some(feedback) = finished.feedback else {
-        return Ok(CaseCoverage {
-            feature_count: 0,
-            hit_count_weight: 0,
-            bytes_consumed: active.bytes_consumed,
-        });
+        if state.mode == Mode::Cautious {
+            record_cautious_discard(state, &active.origin);
+        }
+        return Ok(CaseCoverage::with_cost(
+            CaseCost::zero(),
+            0,
+            0,
+            active.bytes_consumed,
+        ));
     };
     merge_dictionary_values(state, feedback.dictionary);
 
     let coverage = feedback.features;
-    let run_coverage = CaseCoverage {
-        feature_count: coverage.len(),
-        hit_count_weight: feedback.hit_count_weight,
-        bytes_consumed: active.bytes_consumed,
-    };
+    let run_coverage = CaseCoverage::with_cost(
+        case_cost,
+        coverage.len(),
+        feedback.hit_count_weight,
+        active.bytes_consumed,
+    );
     let score = run_coverage.feature_count;
     let hit_count_weight = run_coverage.hit_count_weight;
     let path_len = run_coverage.bytes_consumed;
+    let nonzero_bytes = active.trace.iter().filter(|byte| **byte != 0).count();
     let removed_ids: Vec<_> = if state.mode == Mode::Cautious {
         if !state.min_path_target_initialized {
             state.min_path_target = coverage.clone();
@@ -272,8 +561,10 @@ where
     let best_cautious_score = (state.mode == Mode::Cautious)
         .then_some(state.min_path_best)
         .flatten();
-    let candidate_score = MinPathScore::new(score, hit_count_weight, path_len);
-    let improves_best_cautious = best_cautious_score.is_none_or(|best| candidate_score < best);
+    let candidate_score =
+        MinPathScore::with_case_cost(case_cost, score, hit_count_weight, path_len, nonzero_bytes);
+    let improves_best_cautious =
+        best_cautious_score.is_none_or(|_| improves_min_path(state, candidate_score, &active));
 
     if state.mode == Mode::Curious {
         for id in coverage.iter() {
@@ -305,9 +596,7 @@ where
                     state.stats.accepted,
                     best,
                     &removed_ids,
-                    score,
-                    hit_count_weight,
-                    path_len,
+                    candidate_score,
                 )
             }
         };
@@ -329,11 +618,16 @@ where
         state.corpus.push(CorpusSeed {
             seed: active.seed,
             prefix: corpus_prefix,
+            draws: active.draws,
+            semantics: active.semantics,
+            sequences: active.sequences,
             coverage: coverage_ids,
             removed: removed_ids,
+            case_cost,
             score,
             hit_count_weight,
             path_len,
+            nonzero_bytes,
             energy,
         });
         let inserted_index = state.corpus.len() - 1;
@@ -342,10 +636,38 @@ where
             state.min_path_best = Some(candidate_score);
             state.min_path_best_index = Some(inserted_index);
             refresh_corpus_energies(state);
-            enqueue_cautious_best_neighbors(state, inserted_index);
+            reset_cautious_reducer_to_best(state);
+        } else if state.mode == Mode::Cautious {
+            record_cautious_preserved(state, &active.origin);
         }
         prune_corpus(state);
     }
 
     Ok(run_coverage)
+}
+
+fn improves_min_path<Capture: CoverageCapture>(
+    state: &State<Capture>,
+    candidate_score: MinPathScore,
+    active: &Active,
+) -> bool {
+    let Some(best_score) = state.min_path_best else {
+        return true;
+    };
+
+    match candidate_score.cmp(&best_score) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => {
+            let Some(best_index) = state.min_path_best_index else {
+                return true;
+            };
+            let Some(best) = state.corpus.get(best_index) else {
+                return true;
+            };
+
+            (active.draws.len(), active.trace.as_slice())
+                < (best.draws.len(), best.prefix.as_slice())
+        }
+    }
 }

@@ -1,12 +1,32 @@
 use super::{
     prelude::{
-        CAUTIOUS_ENERGY_REFRESH_INTERVAL, CURIOUS_ENERGY_REFRESH_INTERVAL,
-        MAX_CAUTIOUS_BEST_NEIGHBORS, MAX_CORPUS_LEN, MAX_DICTIONARY_VALUES, MAX_PENDING_CANDIDATES,
-        MAX_PREFIX_LEN, MinPathScore, Mode, State,
+        CAUTIOUS_ENERGY_REFRESH_INTERVAL, CURIOUS_ENERGY_REFRESH_INTERVAL, CandidateOrigin,
+        CautiousOptions, CautiousReducer, CorpusSeed, DrawSpan, MAX_CORPUS_LEN,
+        MAX_DICTIONARY_VALUES, MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore, Mode,
+        PrefixFingerprint, ReducerPass, ReductionId, ReductionOp, ReductionSpec, SemanticKind,
+        SemanticSpan, SequenceItemSpan, SequenceSpan, State,
     },
     run::Candidate,
 };
 use crate::coverage::CoverageCapture;
+
+const REDUCER_PASSES: [ReducerPass; 15] = [
+    ReducerPass::SequenceDelete,
+    ReducerPass::SemanticLength,
+    ReducerPass::SemanticDelete,
+    ReducerPass::SemanticSimplify,
+    ReducerPass::DrawLength,
+    ReducerPass::TailTrim,
+    ReducerPass::DrawDelete,
+    ReducerPass::SequenceProject,
+    ReducerPass::SequenceReplace,
+    ReducerPass::WeightedBlockDelete,
+    ReducerPass::BlockZero,
+    ReducerPass::WordLower,
+    ReducerPass::ByteLower,
+    ReducerPass::RepeatedValue,
+    ReducerPass::DictionaryRepair,
+];
 
 pub(super) fn merge_dictionary_values<Capture: CoverageCapture>(
     state: &mut State<Capture>,
@@ -23,136 +43,1295 @@ pub(super) fn merge_dictionary_values<Capture: CoverageCapture>(
     }
 }
 
-pub(super) fn enqueue_cautious_best_neighbors<Capture: CoverageCapture>(
+pub(super) fn next_cautious_reduction<Capture: CoverageCapture>(
     state: &mut State<Capture>,
-    index: usize,
-) {
-    let Some(entry) = state.corpus.get(index) else {
+) -> Option<Candidate> {
+    if state.cautious_reducer.best_index != state.min_path_best_index {
+        reset_cautious_reducer_to_best(state);
+    }
+
+    state
+        .cautious_reducer
+        .next_candidate(&state.dictionary, state.cautious_options)
+}
+
+pub(super) fn reset_cautious_reducer_to_best<Capture: CoverageCapture>(state: &mut State<Capture>) {
+    let Some(index) = state.min_path_best_index else {
+        state.cautious_reducer = CautiousReducer::default();
         return;
     };
-    let seed = entry.seed;
-    let prefix = entry.prefix.clone();
+    let Some(entry) = state.corpus.get(index) else {
+        state.cautious_reducer = CautiousReducer::default();
+        return;
+    };
+    state.cautious_reducer.reset(index, entry);
+}
 
-    let mut variants = Vec::new();
-    enqueue_structural_shrink_neighbors(&prefix, &mut variants);
-    enqueue_word_shrink_neighbors(&prefix, &mut variants);
-    enqueue_byte_shrink_neighbors(&prefix, &mut variants);
+pub(super) fn record_cautious_discard<Capture: CoverageCapture>(
+    state: &mut State<Capture>,
+    origin: &CandidateOrigin,
+) {
+    state.cautious_reducer.record_discard(origin);
+}
 
-    for mut candidate in variants.into_iter().rev() {
-        if candidate.len() > MAX_PREFIX_LEN {
-            candidate.truncate(MAX_PREFIX_LEN);
-        }
-        state.pending_candidates.push_front(Candidate {
-            seed,
-            prefix: candidate,
-            mutated: true,
-            zero_tail: true,
-        });
+pub(super) fn record_cautious_preserved<Capture: CoverageCapture>(
+    state: &mut State<Capture>,
+    origin: &CandidateOrigin,
+) {
+    state.cautious_reducer.record_preserved(origin);
+}
+
+impl CautiousReducer {
+    fn reset(&mut self, index: usize, entry: &CorpusSeed) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.best_index = Some(index);
+        self.best_seed = entry.seed;
+        self.best_prefix = entry.prefix.clone();
+        self.best_draws = entry.draws.clone();
+        self.best_semantics = entry.semantics.clone();
+        self.best_sequences = entry.sequences.clone();
+        self.pass_index = 0;
+        self.cursor = 0;
+        self.cached_pass = None;
+        self.cached_specs.clear();
+        self.tried_prefixes.clear();
+        self.tried_prefixes
+            .insert(prefix_fingerprint(&self.best_prefix));
+        self.range_pressure.clear();
+        self.range_pressure.resize(self.best_prefix.len(), 1);
+        self.rejects = 0;
+        self.preserves = 0;
+        self.exhausted = false;
     }
-    while state.pending_candidates.len() > MAX_PENDING_CANDIDATES {
-        state.pending_candidates.pop_back();
+
+    fn next_candidate(
+        &mut self,
+        dictionary: &[Vec<u8>],
+        options: CautiousOptions,
+    ) -> Option<Candidate> {
+        if self.exhausted {
+            return None;
+        }
+
+        for _ in 0..options.reducer_budget() {
+            if self.pass_index >= REDUCER_PASSES.len() {
+                self.exhausted = true;
+                return None;
+            }
+
+            let pass = REDUCER_PASSES[self.pass_index];
+            if self.cached_pass != Some(pass) {
+                self.cached_specs = reduction_specs(
+                    pass,
+                    ReductionContext {
+                        prefix: &self.best_prefix,
+                        draws: &self.best_draws,
+                        semantics: &self.best_semantics,
+                        sequences: &self.best_sequences,
+                        dictionary,
+                        pressure: &self.range_pressure,
+                        options,
+                    },
+                );
+                self.cached_pass = Some(pass);
+            }
+            if self.cursor >= self.cached_specs.len() {
+                self.pass_index += 1;
+                self.cursor = 0;
+                self.cached_pass = None;
+                self.cached_specs.clear();
+                continue;
+            }
+
+            let cursor = self.cursor;
+            self.cursor += 1;
+            let spec = &self.cached_specs[cursor];
+            let Some(mut prefix) = materialize_reduction(&self.best_prefix, dictionary, spec)
+            else {
+                continue;
+            };
+            if prefix.len() > MAX_PREFIX_LEN {
+                prefix.truncate(MAX_PREFIX_LEN);
+            }
+            if prefix == self.best_prefix {
+                continue;
+            }
+
+            let fingerprint = prefix_fingerprint(&prefix);
+            if self.tried_prefixes.contains(&fingerprint) {
+                continue;
+            }
+            if self.tried_prefixes.len() >= MAX_REDUCER_TRIED_PREFIXES {
+                self.tried_prefixes.clear();
+                self.tried_prefixes
+                    .insert(prefix_fingerprint(&self.best_prefix));
+            }
+            self.tried_prefixes.insert(fingerprint);
+
+            let id = ReductionId {
+                epoch: self.epoch,
+                pass,
+                cursor,
+                start: spec.start(),
+                len: spec.len(),
+                target: spec.target(),
+                fingerprint,
+            };
+            return Some(Candidate {
+                seed: self.best_seed,
+                prefix,
+                mutated: true,
+                zero_tail: true,
+                origin: CandidateOrigin::CautiousReduction(id),
+            });
+        }
+
+        None
+    }
+
+    fn record_discard(&mut self, origin: &CandidateOrigin) {
+        let CandidateOrigin::CautiousReduction(id) = origin else {
+            return;
+        };
+        if id.epoch != self.epoch {
+            return;
+        }
+
+        self.rejects = self.rejects.saturating_add(1);
+        self.apply_range_feedback(id.start, id.len, Feedback::Rejected);
+    }
+
+    fn record_preserved(&mut self, origin: &CandidateOrigin) {
+        let CandidateOrigin::CautiousReduction(id) = origin else {
+            return;
+        };
+        if id.epoch != self.epoch {
+            return;
+        }
+
+        self.preserves = self.preserves.saturating_add(1);
+        self.apply_range_feedback(id.start, id.len, Feedback::Preserved);
+    }
+
+    fn apply_range_feedback(&mut self, start: usize, len: usize, feedback: Feedback) {
+        if len == 0 || start >= self.range_pressure.len() {
+            return;
+        }
+        let end = start.saturating_add(len).min(self.range_pressure.len());
+        for pressure in &mut self.range_pressure[start..end] {
+            match feedback {
+                Feedback::Rejected => {
+                    *pressure = pressure.saturating_add(8);
+                }
+                Feedback::Preserved => {
+                    *pressure = pressure.saturating_sub(1).max(1);
+                }
+            }
+        }
     }
 }
 
-fn enqueue_structural_shrink_neighbors(prefix: &[u8], variants: &mut Vec<Vec<u8>>) {
-    let structural_limit = MAX_CAUTIOUS_BEST_NEIGHBORS / 2;
-    if prefix.len() <= 1 {
+#[derive(Debug, Clone, Copy)]
+enum Feedback {
+    Rejected,
+    Preserved,
+}
+
+struct ReductionContext<'a> {
+    prefix: &'a [u8],
+    draws: &'a [DrawSpan],
+    semantics: &'a [SemanticSpan],
+    sequences: &'a [SequenceSpan],
+    dictionary: &'a [Vec<u8>],
+    pressure: &'a [u16],
+    options: CautiousOptions,
+}
+
+fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<ReductionSpec> {
+    let mut specs = match pass {
+        ReducerPass::SequenceDelete if context.options.semantic_reductions() => {
+            sequence_delete_specs(
+                context.prefix,
+                context.sequences,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReducerPass::SequenceDelete => Vec::new(),
+        ReducerPass::SequenceProject if context.options.semantic_reductions() => {
+            sequence_project_specs(
+                context.prefix,
+                context.sequences,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReducerPass::SequenceReplace if context.options.semantic_reductions() => {
+            sequence_replace_specs(
+                context.prefix,
+                context.sequences,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReducerPass::SequenceProject | ReducerPass::SequenceReplace => Vec::new(),
+        ReducerPass::SemanticLength if context.options.semantic_reductions() => {
+            semantic_length_specs(
+                context.prefix,
+                context.semantics,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReducerPass::SemanticDelete if context.options.semantic_reductions() => {
+            semantic_delete_specs(
+                context.prefix,
+                context.semantics,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReducerPass::SemanticSimplify if context.options.semantic_reductions() => {
+            semantic_simplify_specs(
+                context.prefix,
+                context.semantics,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReducerPass::SemanticLength
+        | ReducerPass::SemanticDelete
+        | ReducerPass::SemanticSimplify => Vec::new(),
+        ReducerPass::DrawLength => draw_length_specs(
+            context.prefix,
+            context.draws,
+            context.pressure,
+            context.options,
+        ),
+        ReducerPass::TailTrim => tail_trim_specs(context.prefix, context.pressure),
+        ReducerPass::DrawDelete => draw_delete_specs(
+            context.prefix,
+            context.draws,
+            context.pressure,
+            context.options,
+        ),
+        ReducerPass::WeightedBlockDelete => {
+            weighted_block_delete_specs(context.prefix, context.pressure)
+        }
+        ReducerPass::BlockZero => block_zero_specs(context.prefix, context.pressure),
+        ReducerPass::WordLower => word_lower_specs(
+            context.prefix,
+            context.draws,
+            context.pressure,
+            context.options,
+        ),
+        ReducerPass::ByteLower => byte_lower_specs(context.prefix, context.pressure),
+        ReducerPass::RepeatedValue => repeated_value_specs(context.prefix),
+        ReducerPass::DictionaryRepair => {
+            dictionary_repair_specs(context.prefix, context.dictionary, context.pressure)
+        }
+    };
+    truncate_specs(&mut specs, context.options.pass_candidate_limit());
+    specs
+}
+
+fn sequence_delete_specs(
+    prefix: &[u8],
+    sequences: &[SequenceSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for sequence in sequences.iter().take(options.semantic_span_limit()) {
+        if sequence.length_len == 0
+            || sequence.length_start >= prefix.len()
+            || sequence.length_start.saturating_add(sequence.length_len) > prefix.len()
+            || sequence.items.is_empty()
+        {
+            continue;
+        }
+
+        for count in shrink_sizes_including_full(sequence.items.len()) {
+            if count == 0 || count > sequence.items.len() {
+                continue;
+            }
+            for item_start in block_starts(sequence.items.len(), count) {
+                let item_end = (item_start + count).min(sequence.items.len());
+                if item_start >= item_end {
+                    continue;
+                }
+                let first = sequence.items[item_start];
+                let last = sequence.items[item_end - 1];
+                if first.len == 0
+                    || last.len == 0
+                    || first.end() > prefix.len()
+                    || last.end() > prefix.len()
+                    || first.start >= last.end()
+                {
+                    continue;
+                }
+                let target_len = sequence.items.len() - (item_end - item_start);
+                specs.push(ReductionSpec {
+                    op: ReductionOp::DeleteSequenceItems {
+                        length_start: sequence.length_start,
+                        length_width: sequence.length_len,
+                        target_len,
+                        start: first.start,
+                        len: last.end() - first.start,
+                    },
+                    weight: range_weight(pressure, first.start, last.end() - first.start),
+                });
+            }
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs
+}
+
+fn sequence_project_specs(
+    prefix: &[u8],
+    sequences: &[SequenceSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for sequence in sequences.iter().take(options.semantic_span_limit()) {
+        let Some(region) = sequence_region(prefix, sequence) else {
+            continue;
+        };
+
+        push_sequence_projection(
+            prefix,
+            pressure,
+            sequence,
+            region,
+            Vec::new(),
+            0,
+            &mut specs,
+        );
+
+        for keep in sequence_keep_sizes(sequence.items.len()) {
+            for item_start in block_starts(sequence.items.len(), keep) {
+                let item_end = (item_start + keep).min(sequence.items.len());
+                let indices: Vec<_> = (item_start..item_end).collect();
+                push_sequence_projection(
+                    prefix,
+                    pressure,
+                    sequence,
+                    region,
+                    indices,
+                    keep as u64,
+                    &mut specs,
+                );
+            }
+        }
+
+        if sequence.items.len() > 2 {
+            let even: Vec<_> = (0..sequence.items.len()).step_by(2).collect();
+            push_sequence_projection(prefix, pressure, sequence, region, even, 64, &mut specs);
+            let odd: Vec<_> = (1..sequence.items.len()).step_by(2).collect();
+            push_sequence_projection(prefix, pressure, sequence, region, odd, 65, &mut specs);
+        }
+    }
+    specs.sort_by_key(|spec| {
+        (
+            spec.target(),
+            spec.weight,
+            std::cmp::Reverse(spec.len()),
+            spec.start(),
+        )
+    });
+    specs
+}
+
+fn sequence_replace_specs(
+    prefix: &[u8],
+    sequences: &[SequenceSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for sequence in sequences.iter().take(options.semantic_span_limit()) {
+        let Some(region) = sequence_region(prefix, sequence) else {
+            continue;
+        };
+        if sequence.items.len() < 2 {
+            continue;
+        }
+
+        for target in 1..sequence.items.len() {
+            for source in replacement_sources(prefix, sequence, target) {
+                let mut indices: Vec<_> = (0..sequence.items.len()).collect();
+                indices[target] = source;
+                push_sequence_projection(
+                    prefix,
+                    pressure,
+                    sequence,
+                    region,
+                    indices,
+                    128 + target as u64,
+                    &mut specs,
+                );
+            }
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.target()));
+    specs
+}
+
+#[derive(Clone, Copy)]
+struct SequenceRegion {
+    start: usize,
+    len: usize,
+}
+
+fn sequence_region(prefix: &[u8], sequence: &SequenceSpan) -> Option<SequenceRegion> {
+    if sequence.length_len == 0
+        || sequence.length_start >= prefix.len()
+        || sequence.length_start.saturating_add(sequence.length_len) > prefix.len()
+        || sequence.items.is_empty()
+    {
+        return None;
+    }
+
+    let first = *sequence.items.first()?;
+    let last = *sequence.items.last()?;
+    if first.len == 0
+        || last.len == 0
+        || first.end() > prefix.len()
+        || last.end() > prefix.len()
+        || first.start >= last.end()
+    {
+        return None;
+    }
+
+    Some(SequenceRegion {
+        start: first.start,
+        len: last.end() - first.start,
+    })
+}
+
+fn push_sequence_projection(
+    prefix: &[u8],
+    pressure: &[u16],
+    sequence: &SequenceSpan,
+    region: SequenceRegion,
+    indices: Vec<usize>,
+    weight_bias: u64,
+    specs: &mut Vec<ReductionSpec>,
+) {
+    if indices.len() == sequence.items.len() && indices.iter().copied().eq(0..sequence.items.len())
+    {
         return;
     }
 
-    for trim in [64, 32, 16, 8, 4, 3, 2, 1] {
-        if trim >= prefix.len() {
-            continue;
+    let mut items = Vec::with_capacity(indices.len());
+    for index in indices {
+        let Some(item) = sequence.items.get(index).copied() else {
+            return;
+        };
+        if item.len == 0 || item.end() > prefix.len() {
+            return;
         }
-        let mut candidate = prefix[..prefix.len() - trim].to_vec();
-        shrink_first_by(&mut candidate, trim);
-        push_neighbor(variants, candidate, structural_limit);
+        items.push((item.start, item.len));
     }
 
-    for width in structural_widths(prefix.len()) {
-        let chunk_starts = [
-            1,
-            prefix.len().saturating_sub(width),
-            prefix.len() / 2,
-            prefix.len() / 4,
-            prefix.len().saturating_mul(3) / 4,
-        ];
-        for start in chunk_starts {
-            if variants.len() >= structural_limit {
-                break;
-            }
-            if start == 0 || start >= prefix.len() {
-                continue;
-            }
-            let end = (start + width).min(prefix.len());
-            if end <= start {
-                continue;
-            }
-            let mut candidate = prefix.to_vec();
-            candidate.drain(start..end);
-            shrink_first_by(&mut candidate, end - start);
-            push_neighbor(variants, candidate, structural_limit);
-        }
-    }
-
-    for index in 1..prefix.len() {
-        if variants.len() >= structural_limit {
-            break;
-        }
-        let mut candidate = prefix.to_vec();
-        candidate.remove(index);
-        shrink_first_by(&mut candidate, 1);
-        push_neighbor(variants, candidate, structural_limit);
-    }
+    specs.push(ReductionSpec {
+        op: ReductionOp::ProjectSequenceItems {
+            length_start: sequence.length_start,
+            length_width: sequence.length_len,
+            target_len: items.len(),
+            replace_start: region.start,
+            replace_len: region.len,
+            items,
+        },
+        weight: weight_bias + range_weight(pressure, region.start, region.len),
+    });
 }
 
-fn enqueue_word_shrink_neighbors(prefix: &[u8], variants: &mut Vec<Vec<u8>>) {
-    let word_limit = MAX_CAUTIOUS_BEST_NEIGHBORS * 3 / 4;
-    for width in [2, 4, 8] {
+fn sequence_keep_sizes(len: usize) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    for size in [1, 2, 3, 4, 8, 16, len / 4, len / 2, len.saturating_sub(1)] {
+        if size > 0 && size < len && !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    sizes
+}
+
+fn replacement_sources(prefix: &[u8], sequence: &SequenceSpan, target: usize) -> Vec<usize> {
+    let mut sources = Vec::new();
+    push_replacement_source(prefix, sequence, target, 0, &mut sources);
+    push_replacement_source(
+        prefix,
+        sequence,
+        target,
+        target.saturating_sub(1),
+        &mut sources,
+    );
+    if let Some(source) = simplest_prior_item(prefix, sequence, target) {
+        push_replacement_source(prefix, sequence, target, source, &mut sources);
+    }
+    sources
+}
+
+fn push_replacement_source(
+    prefix: &[u8],
+    sequence: &SequenceSpan,
+    target: usize,
+    source: usize,
+    sources: &mut Vec<usize>,
+) {
+    if source >= target || sources.contains(&source) {
+        return;
+    }
+    let Some(source_item) = sequence.items.get(source).copied() else {
+        return;
+    };
+    let Some(target_item) = sequence.items.get(target).copied() else {
+        return;
+    };
+    if !item_replacement_simplifies(prefix, source_item, target_item) {
+        return;
+    }
+    sources.push(source);
+}
+
+fn simplest_prior_item(prefix: &[u8], sequence: &SequenceSpan, target: usize) -> Option<usize> {
+    let target_item = *sequence.items.get(target)?;
+    (0..target)
+        .filter(|index| {
+            sequence
+                .items
+                .get(*index)
+                .copied()
+                .is_some_and(|source| item_replacement_simplifies(prefix, source, target_item))
+        })
+        .min_by_key(|index| {
+            let item = sequence.items[*index];
+            item_simplicity_key(&prefix[item.start..item.end()])
+        })
+}
+
+fn item_replacement_simplifies(
+    prefix: &[u8],
+    source: SequenceItemSpan,
+    target: SequenceItemSpan,
+) -> bool {
+    if source.len == 0
+        || target.len == 0
+        || source.end() > prefix.len()
+        || target.end() > prefix.len()
+    {
+        return false;
+    }
+    let source_bytes = &prefix[source.start..source.end()];
+    let target_bytes = &prefix[target.start..target.end()];
+    item_simplicity_key(source_bytes) < item_simplicity_key(target_bytes)
+}
+
+fn item_simplicity_key(bytes: &[u8]) -> (usize, usize, &[u8]) {
+    let nonzero = bytes.iter().filter(|byte| **byte != 0).count();
+    (bytes.len(), nonzero, bytes)
+}
+
+fn semantic_length_specs(
+    prefix: &[u8],
+    semantics: &[SemanticSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for span in semantics
+        .iter()
+        .copied()
+        .filter(|span| span.kind == SemanticKind::Length)
+        .take(options.semantic_span_limit())
+    {
+        if !valid_semantic_span(prefix, span) {
+            continue;
+        }
+        for width in semantic_widths(span) {
+            if span.start + width > prefix.len() {
+                continue;
+            }
+            let current = read_le_word(&prefix[span.start..span.start + width]);
+            for target in small_length_targets(current, width) {
+                specs.push(ReductionSpec {
+                    op: ReductionOp::SetWord {
+                        start: span.start,
+                        width,
+                        target,
+                        zero_until: Some(span.end()),
+                    },
+                    weight: range_weight(pressure, span.start, width),
+                });
+            }
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
+    specs
+}
+
+fn semantic_delete_specs(
+    prefix: &[u8],
+    semantics: &[SemanticSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for span in semantics
+        .iter()
+        .rev()
+        .copied()
+        .take(options.semantic_span_limit())
+    {
+        if !valid_semantic_span(prefix, span) || span.len >= prefix.len() {
+            continue;
+        }
+        if !matches!(
+            span.kind,
+            SemanticKind::Item | SemanticKind::Field | SemanticKind::Value
+        ) {
+            continue;
+        }
+        specs.push(ReductionSpec {
+            op: ReductionOp::DeleteRange {
+                start: span.start,
+                len: span.len,
+                adjust_first: false,
+            },
+            weight: semantic_weight(span.kind) + range_weight(pressure, span.start, span.len),
+        });
+    }
+    specs.sort_by_key(|spec| {
+        (
+            spec.weight,
+            std::cmp::Reverse(spec.len()),
+            std::cmp::Reverse(spec.start()),
+        )
+    });
+    specs
+}
+
+fn semantic_simplify_specs(
+    prefix: &[u8],
+    semantics: &[SemanticSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for span in semantics
+        .iter()
+        .copied()
+        .filter(|span| span.kind != SemanticKind::Item)
+        .take(options.semantic_span_limit())
+    {
+        if !valid_semantic_span(prefix, span) {
+            continue;
+        }
+
+        if prefix[span.start..span.end()].iter().any(|byte| *byte != 0) {
+            specs.push(ReductionSpec {
+                op: ReductionOp::ZeroRange {
+                    start: span.start,
+                    len: span.len,
+                },
+                weight: semantic_weight(span.kind) + range_weight(pressure, span.start, span.len),
+            });
+        }
+
+        for width in semantic_widths(span) {
+            if span.start + width > prefix.len() {
+                continue;
+            }
+            let current = read_le_word(&prefix[span.start..span.start + width]);
+            for target in smaller_word_targets(current, width) {
+                specs.push(ReductionSpec {
+                    op: ReductionOp::SetWord {
+                        start: span.start,
+                        width,
+                        target,
+                        zero_until: None,
+                    },
+                    weight: semantic_weight(span.kind) + range_weight(pressure, span.start, width),
+                });
+            }
+        }
+
+        for start in semantic_byte_starts(span) {
+            let Some(byte) = prefix.get(start).copied() else {
+                continue;
+            };
+            for value in smaller_byte_targets(byte) {
+                specs.push(ReductionSpec {
+                    op: ReductionOp::SetByte { start, value },
+                    weight: semantic_weight(span.kind) + range_weight(pressure, start, 1),
+                });
+            }
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
+    specs
+}
+
+fn draw_length_specs(
+    prefix: &[u8],
+    draws: &[DrawSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for draw in draws.iter().take(options.draw_limit()).copied() {
+        if !valid_draw(prefix, draw) {
+            continue;
+        }
+        for width in draw_widths(draw) {
+            if draw.start + width > prefix.len() {
+                continue;
+            }
+            let current = read_le_word(&prefix[draw.start..draw.start + width]);
+            for target in small_length_targets(current, width) {
+                specs.push(ReductionSpec {
+                    op: ReductionOp::SetWord {
+                        start: draw.start,
+                        width,
+                        target,
+                        zero_until: Some(draw.end()),
+                    },
+                    weight: range_weight(pressure, draw.start, width),
+                });
+            }
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
+    specs
+}
+
+fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    for trim in shrink_sizes_including_full(prefix.len()) {
+        let start = prefix.len().saturating_sub(trim);
+        specs.push(ReductionSpec {
+            op: ReductionOp::DeleteRange {
+                start,
+                len: trim,
+                adjust_first: true,
+            },
+            weight: range_weight(pressure, start, trim),
+        });
+    }
+    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs
+}
+
+fn draw_delete_specs(
+    prefix: &[u8],
+    draws: &[DrawSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    if prefix.len() <= 1 || draws.is_empty() {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    for draw in draws.iter().rev().take(options.draw_limit()).copied() {
+        if draw.start == 0 || !valid_draw(prefix, draw) {
+            continue;
+        }
+        specs.push(ReductionSpec {
+            op: ReductionOp::DeleteRange {
+                start: draw.start,
+                len: draw.len,
+                adjust_first: true,
+            },
+            weight: range_weight(pressure, draw.start, draw.len),
+        });
+    }
+
+    for window in [32, 16, 8, 4, 3, 2] {
+        if draws.len() < window {
+            continue;
+        }
+        for chunk in draws.windows(window).rev() {
+            let Some(first) = chunk.first().copied() else {
+                continue;
+            };
+            let Some(last) = chunk.last().copied() else {
+                continue;
+            };
+            if first.start == 0 || !valid_draw(prefix, first) || !valid_draw(prefix, last) {
+                continue;
+            }
+            let end = last.end();
+            if first.start >= end || end > prefix.len() {
+                continue;
+            }
+            specs.push(ReductionSpec {
+                op: ReductionOp::DeleteRange {
+                    start: first.start,
+                    len: end - first.start,
+                    adjust_first: true,
+                },
+                weight: range_weight(pressure, first.start, end - first.start),
+            });
+        }
+    }
+
+    specs.sort_by_key(|spec| {
+        (
+            spec.weight,
+            std::cmp::Reverse(spec.len()),
+            std::cmp::Reverse(spec.start()),
+        )
+    });
+    specs
+}
+
+fn weighted_block_delete_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
+    if prefix.len() <= 1 {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    for width in shrink_sizes(prefix.len()) {
+        for start in block_starts(prefix.len(), width) {
+            let len = width.min(prefix.len() - start);
+            if len == 0 || len >= prefix.len() {
+                continue;
+            }
+            specs.push(ReductionSpec {
+                op: ReductionOp::DeleteRange {
+                    start,
+                    len,
+                    adjust_first: true,
+                },
+                weight: range_weight(pressure, start, len),
+            });
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs
+}
+
+fn block_zero_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    for width in shrink_sizes_including_full(prefix.len()) {
+        for start in block_starts(prefix.len(), width) {
+            let len = width.min(prefix.len() - start);
+            if len == 0 || prefix[start..start + len].iter().all(|byte| *byte == 0) {
+                continue;
+            }
+            specs.push(ReductionSpec {
+                op: ReductionOp::ZeroRange { start, len },
+                weight: range_weight(pressure, start, len),
+            });
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs
+}
+
+fn word_lower_specs(
+    prefix: &[u8],
+    draws: &[DrawSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for width in [8, 4, 2] {
         if prefix.len() < width {
             continue;
         }
-        let max_start = (prefix.len() - width).min(16);
-        for start in 0..=max_start {
+
+        let mut starts = Vec::new();
+        for draw in draws.iter().take(options.draw_limit()).copied() {
+            if valid_draw(prefix, draw) && draw.len >= width && !starts.contains(&draw.start) {
+                starts.push(draw.start);
+            }
+        }
+        for start in (0..=prefix.len() - width).step_by(width) {
+            if !starts.contains(&start) {
+                starts.push(start);
+            }
+        }
+
+        for start in starts {
+            if start + width > prefix.len() {
+                continue;
+            }
             let current = read_le_word(&prefix[start..start + width]);
             for target in smaller_word_targets(current, width) {
-                if variants.len() >= word_limit {
-                    return;
-                }
-                let mut candidate = prefix.to_vec();
-                write_le_word(&mut candidate[start..start + width], target);
-                push_neighbor(variants, candidate, word_limit);
+                specs.push(ReductionSpec {
+                    op: ReductionOp::SetWord {
+                        start,
+                        width,
+                        target,
+                        zero_until: None,
+                    },
+                    weight: range_weight(pressure, start, width),
+                });
             }
         }
     }
+    specs.sort_by_key(|spec| (spec.weight, spec.len(), spec.start(), spec.target()));
+    specs
 }
 
-fn enqueue_byte_shrink_neighbors(prefix: &[u8], variants: &mut Vec<Vec<u8>>) {
-    let priority_len = prefix.len().min(16);
-    for index in 0..priority_len {
-        let byte = prefix[index];
+fn byte_lower_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for (start, byte) in prefix.iter().copied().enumerate() {
         for value in smaller_byte_targets(byte) {
-            if variants.len() >= MAX_CAUTIOUS_BEST_NEIGHBORS {
-                return;
-            }
-            let mut candidate = prefix.to_vec();
-            candidate[index] = value;
-            push_neighbor(variants, candidate, MAX_CAUTIOUS_BEST_NEIGHBORS);
+            specs.push(ReductionSpec {
+                op: ReductionOp::SetByte { start, value },
+                weight: range_weight(pressure, start, 1),
+            });
         }
+    }
+    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.target()));
+    specs
+}
+
+fn repeated_value_specs(prefix: &[u8]) -> Vec<ReductionSpec> {
+    let mut values = Vec::new();
+    for byte in prefix {
+        if *byte != 0 && !values.contains(byte) {
+            values.push(*byte);
+        }
+    }
+    values.sort_unstable_by_key(|value| {
+        std::cmp::Reverse(prefix.iter().filter(|byte| *byte == value).count())
+    });
+
+    values
+        .into_iter()
+        .map(|value| ReductionSpec {
+            op: ReductionOp::ZeroRepeated { value },
+            weight: 0,
+        })
+        .collect()
+}
+
+fn dictionary_repair_specs(
+    prefix: &[u8],
+    dictionary: &[Vec<u8>],
+    pressure: &[u16],
+) -> Vec<ReductionSpec> {
+    if prefix.is_empty() || dictionary.is_empty() {
+        return Vec::new();
+    }
+
+    let mut specs = Vec::new();
+    for (dictionary_index, value) in dictionary.iter().enumerate() {
+        if value.is_empty() || value.len() > prefix.len() {
+            continue;
+        }
+        for start in 0..=prefix.len() - value.len() {
+            let current = &prefix[start..start + value.len()];
+            if current == value || !replacement_simplifies(current, value) {
+                continue;
+            }
+            specs.push(ReductionSpec {
+                op: ReductionOp::ReplaceDictionary {
+                    start,
+                    len: value.len(),
+                    dictionary_index,
+                },
+                weight: range_weight(pressure, start, value.len()),
+            });
+        }
+    }
+    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
+    specs
+}
+
+fn materialize_reduction(
+    prefix: &[u8],
+    dictionary: &[Vec<u8>],
+    spec: &ReductionSpec,
+) -> Option<Vec<u8>> {
+    let mut candidate = prefix.to_vec();
+    match &spec.op {
+        ReductionOp::SetWord {
+            start,
+            width,
+            target,
+            zero_until,
+        } => {
+            if start.saturating_add(*width) > candidate.len() {
+                return None;
+            }
+            write_le_word(&mut candidate[*start..*start + *width], *target);
+            if let Some(end) = zero_until {
+                let tail_start = start.saturating_add(*width);
+                if tail_start < *end && *end <= candidate.len() {
+                    candidate[tail_start..*end].fill(0);
+                }
+            }
+        }
+        ReductionOp::DeleteRange {
+            start,
+            len,
+            adjust_first,
+        } => {
+            if *len == 0 || start.saturating_add(*len) > candidate.len() {
+                return None;
+            }
+            candidate.drain(*start..*start + *len);
+            if *adjust_first {
+                shrink_first_by(&mut candidate, *len);
+            }
+        }
+        ReductionOp::DeleteSequenceItems {
+            length_start,
+            length_width,
+            target_len,
+            start,
+            len,
+        } => {
+            if *length_width == 0
+                || length_start.saturating_add(*length_width) > candidate.len()
+                || *len == 0
+                || start.saturating_add(*len) > candidate.len()
+            {
+                return None;
+            }
+            write_le_word(
+                &mut candidate[*length_start..*length_start + *length_width],
+                *target_len as u64,
+            );
+            candidate.drain(*start..*start + *len);
+        }
+        ReductionOp::ProjectSequenceItems {
+            length_start,
+            length_width,
+            target_len,
+            replace_start,
+            replace_len,
+            items,
+        } => {
+            if *length_width == 0
+                || length_start.saturating_add(*length_width) > candidate.len()
+                || replace_start.saturating_add(*replace_len) > candidate.len()
+            {
+                return None;
+            }
+            let mut replacement = Vec::new();
+            for (start, len) in items {
+                if *len == 0 || start.saturating_add(*len) > prefix.len() {
+                    return None;
+                }
+                replacement.extend_from_slice(&prefix[*start..*start + *len]);
+            }
+            write_le_word(
+                &mut candidate[*length_start..*length_start + *length_width],
+                *target_len as u64,
+            );
+            candidate.splice(*replace_start..*replace_start + *replace_len, replacement);
+        }
+        ReductionOp::ZeroRange { start, len } => {
+            if *len == 0 || start.saturating_add(*len) > candidate.len() {
+                return None;
+            }
+            candidate[*start..*start + *len].fill(0);
+        }
+        ReductionOp::SetByte { start, value } => {
+            let byte = candidate.get_mut(*start)?;
+            *byte = *value;
+        }
+        ReductionOp::ZeroRepeated { value } => {
+            for byte in &mut candidate {
+                if *byte == *value {
+                    *byte = 0;
+                }
+            }
+        }
+        ReductionOp::ReplaceDictionary {
+            start,
+            len,
+            dictionary_index,
+        } => {
+            let value = dictionary.get(*dictionary_index)?;
+            if value.len() != *len || start.saturating_add(*len) > candidate.len() {
+                return None;
+            }
+            candidate[*start..*start + *len].copy_from_slice(value);
+        }
+    }
+    Some(candidate)
+}
+
+fn prefix_fingerprint(prefix: &[u8]) -> PrefixFingerprint {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in prefix {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    PrefixFingerprint {
+        len: prefix.len(),
+        hash,
     }
 }
 
-fn structural_widths(len: usize) -> impl Iterator<Item = usize> {
-    [len / 2, 64, 32, 16, 8, 4, 3, 2, 1]
-        .into_iter()
-        .filter(move |width| *width > 0 && *width < len)
+fn range_weight(pressure: &[u16], start: usize, len: usize) -> u64 {
+    if len == 0 || start >= pressure.len() {
+        return 0;
+    }
+    let end = start.saturating_add(len).min(pressure.len());
+    let sum = pressure[start..end]
+        .iter()
+        .fold(0_u64, |sum, value| sum + u64::from(*value));
+    sum / (end - start) as u64
 }
 
-fn push_neighbor(variants: &mut Vec<Vec<u8>>, candidate: Vec<u8>, limit: usize) {
-    if variants.len() >= limit || variants.iter().any(|existing| existing == &candidate) {
+fn block_starts(len: usize, width: usize) -> Vec<usize> {
+    let mut starts = Vec::new();
+    if len == 0 || width == 0 {
+        return starts;
+    }
+
+    let mut start = 0;
+    while start < len {
+        push_start(&mut starts, len, start);
+        start = start.saturating_add(width);
+    }
+
+    if width > 1 {
+        let mut start = width / 2;
+        while start < len {
+            push_start(&mut starts, len, start);
+            start = start.saturating_add(width);
+        }
+    }
+
+    push_start(&mut starts, len, 1);
+    push_start(&mut starts, len, len / 2);
+    push_start(&mut starts, len, len.saturating_sub(width));
+    starts
+}
+
+fn push_start(starts: &mut Vec<usize>, len: usize, start: usize) {
+    if start >= len || starts.contains(&start) {
         return;
     }
-    variants.push(candidate);
+    starts.push(start);
+}
+
+fn valid_draw(prefix: &[u8], draw: DrawSpan) -> bool {
+    draw.len > 0 && draw.end() <= prefix.len()
+}
+
+fn valid_semantic_span(prefix: &[u8], span: SemanticSpan) -> bool {
+    span.len > 0 && span.end() <= prefix.len()
+}
+
+fn semantic_widths(span: SemanticSpan) -> Vec<usize> {
+    let mut widths = Vec::new();
+    for width in [span.len.min(8), 4, 2, 1] {
+        if width > 0 && width <= span.len && !widths.contains(&width) {
+            widths.push(width);
+        }
+    }
+    widths
+}
+
+fn semantic_byte_starts(span: SemanticSpan) -> Vec<usize> {
+    let mut starts = vec![span.start];
+    if span.len <= 8 {
+        for start in span.start + 1..span.end() {
+            starts.push(start);
+        }
+    }
+    starts
+}
+
+fn semantic_weight(kind: SemanticKind) -> u64 {
+    match kind {
+        SemanticKind::Length => 0,
+        SemanticKind::Item => 8,
+        SemanticKind::Variant => 16,
+        SemanticKind::Field => 24,
+        SemanticKind::Value => 32,
+    }
+}
+
+fn draw_widths(draw: DrawSpan) -> Vec<usize> {
+    let mut widths = Vec::new();
+    for width in [draw.len.min(8), 4, 2, 1] {
+        if width > 0 && width <= draw.len && !widths.contains(&width) {
+            widths.push(width);
+        }
+    }
+    widths
+}
+
+fn shrink_sizes_including_full(len: usize) -> Vec<usize> {
+    let mut sizes = shrink_sizes(len);
+    if len > 0 && !sizes.contains(&len) {
+        sizes.insert(0, len);
+    }
+    sizes
+}
+
+fn shrink_sizes(len: usize) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    for size in [
+        len / 2,
+        len / 4,
+        len / 8,
+        1024,
+        512,
+        256,
+        128,
+        64,
+        32,
+        16,
+        8,
+        4,
+        3,
+        2,
+        1,
+    ] {
+        if size > 0 && size < len && !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    sizes
+}
+
+fn small_length_targets(word: u64, width: usize) -> Vec<u64> {
+    let max = max_word_value(width);
+    let mut targets = Vec::new();
+    for target in (0..=16).chain([31, 32, 63, 64, 127, 128, 255]) {
+        if target <= max && target <= word && !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    for target in [word / 2, word / 4, word.saturating_sub(1)] {
+        if target < word && target <= max && !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn max_word_value(width: usize) -> u64 {
+    match width {
+        0 => 0,
+        1 => u8::MAX as u64,
+        2 => u16::MAX as u64,
+        3 | 4 => u32::MAX as u64,
+        _ => u64::MAX,
+    }
 }
 
 fn read_le_word(bytes: &[u8]) -> u64 {
@@ -175,17 +1354,13 @@ fn smaller_word_targets(word: u64, width: usize) -> Vec<u64> {
         return Vec::new();
     }
 
-    let max = match width {
-        2 => u16::MAX as u64,
-        4 => u32::MAX as u64,
-        _ => u64::MAX,
-    };
-
+    let max = max_word_value(width);
     let mut targets = Vec::new();
     for value in (0..=32)
         .chain([63, 64, 127, 128, 255, 256, 511, 512, 1023, 1024])
         .chain([
             word / 2,
+            word / 4,
             word.saturating_sub(1),
             word.saturating_sub(2),
             word.saturating_sub(4),
@@ -233,11 +1408,23 @@ fn smaller_byte_targets(byte: u8) -> Vec<u8> {
     targets
 }
 
+fn replacement_simplifies(current: &[u8], value: &[u8]) -> bool {
+    let current_nonzero = current.iter().filter(|byte| **byte != 0).count();
+    let value_nonzero = value.iter().filter(|byte| **byte != 0).count();
+    (value_nonzero, value) < (current_nonzero, current)
+}
+
 fn shrink_first_by(prefix: &mut [u8], amount: usize) {
     let Some(first) = prefix.first_mut() else {
         return;
     };
     *first = first.saturating_sub(amount.min(u8::MAX as usize) as u8);
+}
+
+fn truncate_specs(specs: &mut Vec<ReductionSpec>, limit: usize) {
+    if specs.len() > limit {
+        specs.truncate(limit);
+    }
 }
 
 pub(super) fn energy_refresh_interval(mode: Mode) -> u64 {
@@ -258,7 +1445,13 @@ pub(super) fn prune_corpus<Capture: CoverageCapture>(state: &mut State<Capture>)
             .iter()
             .enumerate()
             .max_by_key(|(_, entry)| {
-                MinPathScore::new(entry.score, entry.hit_count_weight, entry.path_len)
+                MinPathScore::with_case_cost(
+                    entry.case_cost,
+                    entry.score,
+                    entry.hit_count_weight,
+                    entry.path_len,
+                    entry.nonzero_bytes,
+                )
             })
             .map(|(index, _)| index)
     } else {
@@ -283,6 +1476,7 @@ pub(super) fn prune_corpus<Capture: CoverageCapture>(state: &mut State<Capture>)
         state.energy_index.swap_remove(index);
         if state.mode == Mode::Cautious {
             refresh_min_path_best(state);
+            reset_cautious_reducer_to_best(state);
         }
     }
 }
@@ -295,10 +1489,23 @@ fn refresh_min_path_best<Capture: CoverageCapture>(state: &mut State<Capture>) {
         .map(|(index, entry)| {
             (
                 index,
-                MinPathScore::new(entry.score, entry.hit_count_weight, entry.path_len),
+                MinPathScore::with_case_cost(
+                    entry.case_cost,
+                    entry.score,
+                    entry.hit_count_weight,
+                    entry.path_len,
+                    entry.nonzero_bytes,
+                ),
             )
         })
-        .min_by_key(|(_, score)| *score);
+        .min_by(|(left_index, left_score), (right_index, right_score)| {
+            left_score.cmp(right_score).then_with(|| {
+                let left = &state.corpus[*left_index];
+                let right = &state.corpus[*right_index];
+                (left.draws.len(), left.prefix.as_slice())
+                    .cmp(&(right.draws.len(), right.prefix.as_slice()))
+            })
+        });
     state.min_path_best = best.map(|(_, score)| score);
     state.min_path_best_index = best.map(|(index, _)| index);
 }

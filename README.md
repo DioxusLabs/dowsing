@@ -5,7 +5,7 @@ Minimal coverage-guided randomness.
 The API has two entry points:
 
 ```rust
-use iterator_fuzz::{curious, cautious};
+use iterator_fuzz::{cautious, curious};
 use rand::Rng;
 
 fn sample(mut rng: impl Rng) -> u8 {
@@ -44,6 +44,18 @@ for mut rng in curious().take(128) {
 }
 ```
 
+Valid failing variants can also report a domain-specific cost:
+
+```rust
+let coverage = variant
+    .coverage_with_cost(input.len())
+    .expect("finish minimization coverage");
+```
+
+`cautious()` minimizes this [`CaseCost`](crate::CaseCost) before coverage features and consumed RNG
+bytes. Use it for stable value-level preferences like operation count; keep using `discard()` for
+cases that do not reproduce the target failure.
+
 `curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution is
 accepted, it stores the consumed RNG byte prefix and later mutates accepted prefixes to explore
 nearby inputs.
@@ -76,6 +88,23 @@ features from the initial failing path, then gives more energy to valid failing 
 remove features that most other valid candidates still execute. The public coverage score orders
 fewer features, lower hit-count weight, then fewer consumed RNG bytes, so the minimizer prefers
 smaller failing inputs while still sampling candidates that discovered hard-to-remove code.
+
+Generators can annotate the structure they draw from a [`CaseRng`](crate::CaseRng):
+
+```rust
+fn sample_items<C: iterator_fuzz::CoverageCapture>(
+    rng: &mut iterator_fuzz::CaseRng<C>,
+) -> Vec<u8> {
+    rng.take_range(0..64)
+        .map(|element| element.generate(|rng| rng.random()))
+        .collect()
+}
+```
+
+`cautious()` uses those spans to try length, item, variant, field, and value reductions before
+generic byte shrinking. Large harnesses can tune minimization with
+`CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget,
+candidate caps, draw/span limits, and whether to keep havoc fallback enabled.
 
 By default, feedback comes from LLVM SanitizerCoverage: inline 8-bit edge counters plus comparison
 callbacks. Build the clean demo with instrumentation:
