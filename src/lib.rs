@@ -16,8 +16,9 @@ pub use coverage::{
     CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, ParallelCoverageCapture,
 };
 pub use iter::{
-    Case, CaseCoverage, CaseRng, Cases, Cautious, Curious, NoCoverage, ParallelCases, SearchStats,
-    cautious, curious,
+    Case, CaseCoverage, CaseRng, Cases, Cautious, CautiousOptions, Curious, NoCoverage,
+    ParallelCases, SearchStats, SemanticKind, SequenceElement, SequenceMap, TakeRange, cautious,
+    curious,
 };
 pub use llvm::{LlvmCoverage, reset_llvm_counters};
 pub use sancov::SancovCoverage;

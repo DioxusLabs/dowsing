@@ -3,8 +3,8 @@ use super::prelude::MinPathScore;
 use super::{
     no_coverage::NoCoverage,
     prelude::{
-        Case, Cautious, Curious, DEFAULT_CAUTIOUS_MUTATE_DEPTH, DEFAULT_MUTATE_DEPTH,
-        DEFAULT_SEED_RATIO, EnergyIndex, Engine, Mode, SearchStats, State,
+        Case, Cautious, CautiousOptions, CautiousReducer, Curious, DEFAULT_CAUTIOUS_MUTATE_DEPTH,
+        DEFAULT_MUTATE_DEPTH, DEFAULT_SEED_RATIO, EnergyIndex, Engine, Mode, SearchStats, State,
     },
     rng::CaseRng,
     run::next_parallel_rng,
@@ -42,8 +42,9 @@ impl<Capture: CoverageCapture> Engine<Capture> {
                 corpus: Vec::new(),
                 energy_index: EnergyIndex::default(),
                 pending_cases: VecDeque::new(),
-                pending_candidates: VecDeque::new(),
+                cautious_reducer: CautiousReducer::default(),
                 dictionary: Vec::new(),
+                cautious_options: CautiousOptions::default(),
                 executions_since_refresh: 0,
                 mutate_depth: match mode {
                     Mode::Curious => DEFAULT_MUTATE_DEPTH,
@@ -79,8 +80,9 @@ impl<Capture: CoverageCapture> Engine<Capture> {
                 corpus: state.corpus.clone(),
                 energy_index: state.energy_index.clone(),
                 pending_cases: state.pending_cases.clone(),
-                pending_candidates: state.pending_candidates.clone(),
+                cautious_reducer: state.cautious_reducer.clone(),
                 dictionary: state.dictionary.clone(),
+                cautious_options: state.cautious_options,
                 executions_since_refresh: state.executions_since_refresh,
                 mutate_depth: state.mutate_depth,
                 seed_ratio: state.seed_ratio,
@@ -131,6 +133,14 @@ impl<Capture: CoverageCapture> Engine<Capture> {
         state.next = 0;
         state.scheduler = SmallRng::seed_from_u64(seed ^ 0xD3A0_51C0_FFEE);
         drop(state);
+        self
+    }
+
+    pub(super) fn with_cautious_options(self, options: CautiousOptions) -> Self {
+        self.shared
+            .lock()
+            .expect("search state poisoned")
+            .cautious_options = options;
         self
     }
 
@@ -187,9 +197,30 @@ impl<Capture: CoverageCapture> Engine<Capture> {
             .corpus
             .iter()
             .min_by_key(|entry| {
-                MinPathScore::new(entry.score, entry.hit_count_weight, entry.path_len)
+                MinPathScore::with_nonzero_bytes(
+                    entry.score,
+                    entry.hit_count_weight,
+                    entry.path_len,
+                    entry.nonzero_bytes,
+                )
             })
             .map(|entry| (entry.score, entry.hit_count_weight, entry.path_len))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_best_nonzero_bytes(&self) -> Option<usize> {
+        self.shared
+            .lock()
+            .expect("search state poisoned")
+            .min_path_best
+            .map(|score| score.nonzero_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_best_prefix(&self) -> Option<Vec<u8>> {
+        let state = self.shared.lock().expect("search state poisoned");
+        let index = state.min_path_best_index?;
+        Some(state.corpus.get(index)?.prefix.clone())
     }
 
     #[cfg(test)]
@@ -199,6 +230,17 @@ impl<Capture: CoverageCapture> Engine<Capture> {
             .expect("search state poisoned")
             .dictionary
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reducer_feedback(&self) -> (u64, u64, Vec<u16>, bool) {
+        let state = self.shared.lock().expect("search state poisoned");
+        (
+            state.cautious_reducer.rejects,
+            state.cautious_reducer.preserves,
+            state.cautious_reducer.range_pressure.clone(),
+            state.cautious_reducer.exhausted,
+        )
     }
 }
 
@@ -312,6 +354,35 @@ impl<Capture: CoverageCapture> Cautious<Capture> {
         }
     }
 
+    /// Set minimization reducer options.
+    pub fn with_options(self, options: CautiousOptions) -> Self {
+        Self {
+            engine: self.engine.with_cautious_options(options),
+        }
+    }
+
+    /// Set the maximum internal reducer attempts spent to produce one yielded candidate.
+    pub fn with_reducer_budget(self, budget: usize) -> Self {
+        let options = self
+            .engine
+            .shared
+            .lock()
+            .expect("search state poisoned")
+            .cautious_options;
+        self.with_options(options.with_reducer_budget(budget))
+    }
+
+    /// Enable or disable havoc fallback after deterministic reductions are exhausted.
+    pub fn with_havoc(self, enabled: bool) -> Self {
+        let options = self
+            .engine
+            .shared
+            .lock()
+            .expect("search state poisoned")
+            .cautious_options;
+        self.with_options(options.with_havoc(enabled))
+    }
+
     /// Set the first seed.
     pub fn with_seed(self, seed: u64) -> Self {
         Self {
@@ -356,8 +427,23 @@ impl<Capture: CoverageCapture> Cautious<Capture> {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_best_nonzero_bytes(&self) -> Option<usize> {
+        self.engine.test_best_nonzero_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_best_prefix(&self) -> Option<Vec<u8>> {
+        self.engine.test_best_prefix()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_dictionary_values(&self) -> Vec<Vec<u8>> {
         self.engine.test_dictionary_values()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reducer_feedback(&self) -> (u64, u64, Vec<u16>, bool) {
+        self.engine.test_reducer_feedback()
     }
 }
 

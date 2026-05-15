@@ -721,11 +721,208 @@ fn cautious_uses_rng_bytes_as_feature_count_tie_breaker() {
     assert_eq!(cautious.test_corpus_path_lens(), [4, 2]);
 }
 
+#[test]
+fn cautious_promotes_equal_length_simpler_rng_traces() {
+    let case = Case::from_raw_parts(0, vec![255; 32], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1], vec![1]]))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("initial failing rng");
+        let mut bytes = [0; 32];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish initial case");
+    }
+    {
+        let mut rng = cautious.next().expect("same-length simpler rng");
+        let mut bytes = [0; 32];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish simpler case");
+    }
+
+    assert_eq!(cautious.test_best_path_score(), Some((1, 1, 32)));
+    assert!(
+        cautious
+            .test_best_nonzero_bytes()
+            .is_some_and(|count| count < 32),
+        "equal public score variants with simpler traces should become the cautious shrink frontier"
+    );
+}
+
+#[test]
+fn cautious_draw_spans_prioritize_length_like_first_draw() {
+    let mut prefix = 200_u32.to_le_bytes().to_vec();
+    prefix.extend(std::iter::repeat_n(255, 32));
+    let draws = (0..9).map(|index| (index * 4, 4, true));
+    let case = Case::from_raw_parts_with_draws(0, prefix, true, draws);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..8).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        assert_eq!(rng.next_u32(), 200);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut observed = Vec::new();
+    for mut rng in cautious.by_ref().take(4) {
+        observed.push(rng.next_u32());
+        rng.discard();
+    }
+
+    assert_eq!(
+        observed,
+        [0, 1, 2, 3],
+        "draw-aware cautious shrinking should try small length-like values before generic byte havoc"
+    );
+}
+
+#[test]
+fn cautious_discard_updates_reducer_feedback_and_keeps_shrinking() {
+    let case = Case::from_raw_parts(0, vec![10, 11, 12, 13], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..16).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let first_reduction = {
+        let mut rng = cautious.next().expect("first reduction");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        rng.discard();
+        bytes
+    };
+    let (rejects, _, pressure, _) = cautious.test_reducer_feedback();
+    assert_eq!(rejects, 1);
+    assert!(pressure.iter().any(|value| *value > 1));
+
+    let second_reduction = {
+        let mut rng = cautious.next().expect("second reduction");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        rng.discard();
+        bytes
+    };
+
+    assert_eq!(first_reduction, [0, 0, 0, 0]);
+    assert_ne!(second_reduction, first_reduction);
+}
+
+#[test]
+fn cautious_shortlex_promotes_equal_score_lexicographically_smaller_trace() {
+    let larger = Case::from_raw_parts(0, vec![2], true);
+    let smaller = Case::from_raw_parts(0, vec![1], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1], vec![1]]))
+        .with_cases([larger, smaller]);
+
+    for _ in 0..2 {
+        let mut rng = cautious.next().expect("seeded rng");
+        let mut byte = [0];
+        rng.fill_bytes(&mut byte);
+        rng.coverage().expect("finish seeded coverage");
+    }
+
+    assert_eq!(cautious.test_best_path_score(), Some((1, 1, 1)));
+    assert_eq!(cautious.test_best_nonzero_bytes(), Some(1));
+    assert_eq!(cautious.test_best_prefix(), Some(vec![1]));
+}
+
+#[test]
+fn cautious_block_zero_pass_can_zero_whole_trace() {
+    let case = Case::from_raw_parts(0, vec![5, 6, 7, 8], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..128).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut found_zero_block = false;
+    for mut rng in cautious.by_ref().take(128) {
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        if bytes == [0, 0, 0, 0] {
+            rng.coverage().expect("finish zero block candidate");
+            found_zero_block = true;
+            break;
+        }
+        rng.discard();
+    }
+
+    assert!(found_zero_block);
+}
+
+#[test]
+fn cautious_dictionary_repair_pass_uses_feedback_dictionary() {
+    let case = Case::from_raw_parts(0, vec![9, 9, 9], true);
+    let mut cautious = cautious()
+        .with_coverage(
+            ScriptedCapture::new((0..512).map(|_| vec![1])).with_dictionary([vec![7, 0, 7]]),
+        )
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        let mut bytes = [0; 3];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut found_dictionary_repair = false;
+    for mut rng in cautious.by_ref().take(512) {
+        let mut bytes = [0; 3];
+        rng.fill_bytes(&mut bytes);
+        if bytes == [7, 0, 7] {
+            rng.coverage().expect("finish dictionary repair candidate");
+            found_dictionary_repair = true;
+            break;
+        }
+        rng.discard();
+    }
+
+    assert!(found_dictionary_repair);
+}
+
 fn sample_modulo_len_payload(rng: &mut impl Rng) -> usize {
     let len = (rng.random::<u16>() % 64) as usize;
     let mut payload = vec![0; len];
     rng.fill_bytes(&mut payload);
     len
+}
+
+fn sample_semantic_len_payload<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) -> usize {
+    let len = rng.length(64);
+    for _ in 0..len {
+        rng.semantic(SemanticKind::Item, |rng| {
+            let _ = rng.random::<u8>();
+        });
+    }
+    len
+}
+
+fn sample_byte_sequence<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) -> Vec<u8> {
+    rng.take_range(0..8)
+        .map(|element| {
+            element.generate(|rng| {
+                let mut byte = [0];
+                rng.fill_bytes(&mut byte);
+                byte[0]
+            })
+        })
+        .collect()
 }
 
 #[test]
@@ -753,6 +950,159 @@ fn cautious_minimizes_word_modulo_length_prefix() {
     }
 
     assert_eq!(best_len, 1);
+}
+
+#[test]
+fn cautious_uses_semantic_length_before_generic_byte_shrinks() {
+    let mut prefix = 20_u32.to_le_bytes().to_vec();
+    prefix.extend(std::iter::repeat_n(255, 20));
+    let case = Case::from_raw_parts(0, prefix, true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..4).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        assert_eq!(sample_semantic_len_payload(&mut rng), 20);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut rng = cautious.next().expect("semantic length reduction");
+    assert_eq!(sample_semantic_len_payload(&mut rng), 0);
+    rng.discard();
+}
+
+#[test]
+fn cautious_sequence_delete_lowers_length_and_removes_item_bytes() {
+    let mut prefix = 3_u32.to_le_bytes().to_vec();
+    prefix.extend([10, 20, 30]);
+    let case = Case::from_raw_parts(0, prefix, true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..4).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        assert_eq!(sample_byte_sequence(&mut rng), [10, 20, 30]);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut rng = cautious.next().expect("sequence delete");
+    assert_eq!(sample_byte_sequence(&mut rng), []);
+    rng.discard();
+}
+
+#[test]
+fn cautious_sequence_projection_can_keep_non_contiguous_items() {
+    let mut prefix = 4_u32.to_le_bytes().to_vec();
+    prefix.extend([10, 20, 30, 40]);
+    let case = Case::from_raw_parts(0, prefix, true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
+        .with_options(CautiousOptions::builder().with_pass_candidate_limit(16))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        assert_eq!(sample_byte_sequence(&mut rng), [10, 20, 30, 40]);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut found = false;
+    for mut rng in cautious.by_ref().take(512) {
+        let items = sample_byte_sequence(&mut rng);
+        if items == [10, 30] || items == [20, 40] {
+            found = true;
+            rng.discard();
+            break;
+        }
+        rng.discard();
+    }
+
+    assert!(
+        found,
+        "sequence projection should try non-contiguous item subsets"
+    );
+}
+
+#[test]
+fn cautious_sequence_projection_can_move_later_item_to_front() {
+    let mut prefix = 3_u32.to_le_bytes().to_vec();
+    prefix.extend([10, 20, 30]);
+    let case = Case::from_raw_parts(0, prefix, true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        assert_eq!(sample_byte_sequence(&mut rng), [10, 20, 30]);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut found = false;
+    for mut rng in cautious.by_ref().take(64) {
+        let items = sample_byte_sequence(&mut rng);
+        if items == [30] {
+            found = true;
+            rng.discard();
+            break;
+        }
+        rng.discard();
+    }
+
+    assert!(
+        found,
+        "sequence projection should try keeping a later item as the only item"
+    );
+}
+
+#[test]
+fn cautious_sequence_replace_reuses_simpler_prior_items() {
+    let mut prefix = 3_u32.to_le_bytes().to_vec();
+    prefix.extend([1, 99, 99]);
+    let case = Case::from_raw_parts(0, prefix, true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..128).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        assert_eq!(sample_byte_sequence(&mut rng), [1, 99, 99]);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut found = false;
+    for mut rng in cautious.by_ref().take(128) {
+        let items = sample_byte_sequence(&mut rng);
+        if items == [1, 1, 99] || items == [1, 99, 1] {
+            found = true;
+            rng.discard();
+            break;
+        }
+        rng.discard();
+    }
+
+    assert!(
+        found,
+        "sequence replacement should reuse simpler earlier item bytes"
+    );
+}
+
+#[test]
+fn cautious_havoc_can_be_disabled() {
+    let case = Case::from_raw_parts(0, Vec::new(), true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1]]))
+        .with_options(CautiousOptions::builder().with_havoc(false))
+        .with_case(case);
+
+    {
+        let rng = cautious.next().expect("seed rng");
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    assert!(cautious.next().is_none());
 }
 
 #[test]

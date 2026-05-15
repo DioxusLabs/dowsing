@@ -1,5 +1,5 @@
 use super::{
-    prelude::{INTERESTING_BYTES, MAX_PREFIX_LEN, Mode, State},
+    prelude::{INTERESTING_BYTES, MAX_PREFIX_LEN, MinPathScore, Mode, State},
     run::min_path_schedule_energy,
 };
 use crate::coverage::{CoverageCapture, CoverageId};
@@ -455,9 +455,12 @@ pub(super) fn refresh_corpus_energies<Capture: CoverageCapture>(state: &mut Stat
                         state.stats.accepted,
                         best,
                         &entry.removed,
-                        entry.score,
-                        entry.hit_count_weight,
-                        entry.path_len,
+                        MinPathScore::with_nonzero_bytes(
+                            entry.score,
+                            entry.hit_count_weight,
+                            entry.path_len,
+                            entry.nonzero_bytes,
+                        ),
                     );
                 }
             }

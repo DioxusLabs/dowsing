@@ -1,8 +1,10 @@
 use super::{
     mutate::{choose_corpus_index, havoc_prefix, mutate_prefix, refresh_corpus_energies},
-    prelude::{Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore, Mode, State},
+    prelude::{
+        CandidateOrigin, Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore, Mode, State,
+    },
     rng::CaseRng,
-    shrink::energy_refresh_interval,
+    shrink::{energy_refresh_interval, next_cautious_reduction},
 };
 use crate::coverage::{CAPTURE_BUSY, CoverageCapture, CoverageId, ParallelCoverageCapture};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -45,9 +47,13 @@ where
             seed: candidate.seed,
             prefix: candidate.prefix,
             zero_tail: candidate.zero_tail,
+            origin: candidate.origin,
             cursor: 0,
             bytes_consumed: 0,
             trace: Vec::new(),
+            draws: Vec::new(),
+            semantics: Vec::new(),
+            sequences: Vec::new(),
             token: Some(token),
             local_capture: None,
             start_error: None,
@@ -120,9 +126,13 @@ where
         seed: candidate.seed,
         prefix: candidate.prefix,
         zero_tail: candidate.zero_tail,
+        origin: candidate.origin,
         cursor: 0,
         bytes_consumed: 0,
         trace: Vec::new(),
+        draws: Vec::new(),
+        semantics: Vec::new(),
+        sequences: Vec::new(),
         token: Some(token),
         local_capture: Some(capture),
         start_error: None,
@@ -177,6 +187,7 @@ pub(super) struct Candidate {
     pub(super) prefix: Vec<u8>,
     pub(super) mutated: bool,
     pub(super) zero_tail: bool,
+    pub(super) origin: CandidateOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -210,11 +221,8 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
             prefix: case.prefix,
             mutated: false,
             zero_tail: state.mode == Mode::Cautious || case.zero_tail,
+            origin: CandidateOrigin::SeededCase,
         }));
-    }
-
-    if let Some(candidate) = state.pending_candidates.pop_front() {
-        return Some(CandidatePlan::Ready(candidate));
     }
 
     if state.mode == Mode::Cautious && state.corpus.is_empty() {
@@ -240,6 +248,7 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
             prefix: Vec::new(),
             mutated: false,
             zero_tail: false,
+            origin: CandidateOrigin::SeededCase,
         }));
     }
 
@@ -249,6 +258,7 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
             prefix: Vec::new(),
             mutated: false,
             zero_tail: false,
+            origin: CandidateOrigin::SeededCase,
         }));
     };
 
@@ -277,6 +287,13 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
 fn choose_cautious_candidate_plan<Capture: CoverageCapture>(
     state: &mut State<Capture>,
 ) -> Option<CandidatePlan> {
+    if let Some(candidate) = next_cautious_reduction(state) {
+        return Some(CandidatePlan::Ready(candidate));
+    }
+    if !state.cautious_options.havoc() {
+        return None;
+    }
+
     let index = cautious_corpus_index(state)?;
     let (parent_seed, parent_prefix) = {
         let parent = &state.corpus[index];
@@ -331,6 +348,7 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
                 prefix,
                 mutated: true,
                 zero_tail: false,
+                origin: CandidateOrigin::CuriousMutation,
             }
         }
         CandidatePlan::CautiousMutation {
@@ -348,6 +366,7 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
                 prefix,
                 mutated: true,
                 zero_tail: true,
+                origin: CandidateOrigin::CautiousHavoc,
             }
         }
     }
@@ -372,9 +391,7 @@ pub(super) fn min_path_schedule_energy(
     accepted: u64,
     best: MinPathScore,
     removed: &[CoverageId],
-    score: usize,
-    hit_count_weight: u64,
-    path_len: usize,
+    candidate: MinPathScore,
 ) -> f64 {
     let accepted = accepted.max(1) as f64;
     let mut rarity = 0.0;
@@ -383,15 +400,20 @@ pub(super) fn min_path_schedule_energy(
         rarity += (accepted / frequency).ln().max(0.0);
     }
 
-    let byte_quality = ((best.bytes + 1) as f64 / (path_len + 1) as f64)
+    let byte_quality = ((best.bytes + 1) as f64 / (candidate.bytes + 1) as f64)
         .min(1.0)
         .powi(3);
-    let feature_quality = ((best.features + 1) as f64 / (score + 1) as f64)
+    let feature_quality = ((best.features + 1) as f64 / (candidate.features + 1) as f64)
         .min(1.0)
         .sqrt();
-    let hit_quality = ((best.hit_count_weight + 1) as f64 / (hit_count_weight + 1) as f64)
+    let hit_quality = ((best.hit_count_weight + 1) as f64
+        / (candidate.hit_count_weight + 1) as f64)
         .min(1.0)
         .sqrt();
-    let quality = byte_quality * feature_quality * hit_quality;
+    let simplicity_quality = ((best.nonzero_bytes + 1) as f64
+        / (candidate.nonzero_bytes + 1) as f64)
+        .min(1.0)
+        .sqrt();
+    let quality = byte_quality * feature_quality * hit_quality * simplicity_quality;
     ((rarity + 1.0) * quality).max(0.01)
 }
