@@ -1,7 +1,12 @@
-use crate::{CoverageCapture, CoverageId, CoverageSet};
+use crate::{
+    CoverageCapture, CoverageId, CoverageSet, ParallelCoverageCapture, coverage::CAPTURE_BUSY,
+};
 use std::{
     cell::{Cell, RefCell},
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const EDGE_NAMESPACE: u64 = 0;
@@ -12,7 +17,8 @@ const MAX_DICTIONARY_VALUES: usize = 256;
 /// In-process LLVM SanitizerCoverage feedback for `curious()` and `shy()`.
 ///
 /// Build the harness with `-Cpasses=sancov-module` plus LLVM sanitizer-coverage arguments so
-/// LLVM emits inline 8-bit edge counters and comparison callbacks.
+/// LLVM emits edge feedback and comparison callbacks. Native parallel iteration requires
+/// trace-pc-guard edge feedback; inline counters are process-global and are used serially.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SancovCoverage {
     cmp_feedback: bool,
@@ -20,7 +26,16 @@ pub struct SancovCoverage {
 
 #[derive(Debug)]
 pub struct SancovToken {
-    _guard: Option<MutexGuard<'static, ()>>,
+    _guard: Option<CaptureGuard>,
+}
+
+#[derive(Debug)]
+struct CaptureGuard(&'static AtomicBool);
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +53,7 @@ struct SancovState {
 
 thread_local! {
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+    static CAPTURE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static GUARD_EPOCH: Cell<u32> = const { Cell::new(1) };
     static GUARD_SEEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     static GUARD_FEATURES: RefCell<Vec<CoverageId>> = const { RefCell::new(Vec::new()) };
@@ -66,21 +82,20 @@ impl CoverageCapture for SancovCoverage {
         let guard = if has_guards() {
             None
         } else {
-            Some(
-                capture_lock()
-                    .lock()
-                    .map_err(|_| "sanitizer coverage capture lock poisoned".to_string())?,
-            )
+            Some(try_lock_capture()?)
         };
         if guard.is_some() {
             reset_counters();
         }
+        set_capture_active(false);
         clear_guard_feedback();
         clear_cmp_feedback();
+        set_capture_active(true);
         Ok(SancovToken { _guard: guard })
     }
 
     fn finish_capture(&mut self, _token: Self::Token) -> Result<CoverageSet, String> {
+        set_capture_active(false);
         let mut coverage = if has_guards() {
             guard_coverage()
         } else {
@@ -91,15 +106,44 @@ impl CoverageCapture for SancovCoverage {
         }
         Ok(coverage)
     }
+
+    fn discard_capture(&mut self, _token: Self::Token) -> Result<(), String> {
+        set_capture_active(false);
+        clear_guard_feedback();
+        clear_cmp_feedback();
+        Ok(())
+    }
+
+    fn dictionary_values(&mut self) -> Vec<Vec<u8>> {
+        cmp_dictionary_values()
+    }
 }
 
+impl ParallelCoverageCapture for SancovCoverage {
+    fn validate_parallel(&self) -> Result<(), String> {
+        if has_guards() {
+            Ok(())
+        } else {
+            Err(
+                "parallel SanitizerCoverage requires trace-pc-guard instrumentation; inline counters are process-global"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn with_dictionary_values<T>(f: impl FnOnce(&[Vec<u8>]) -> T) -> T {
-    suppress_callbacks(|| {
-        CMP_DICTIONARY.with(|dictionary| {
-            let dictionary = dictionary.borrow();
-            f(&dictionary)
-        })
-    })
+    suppress_callbacks(|| CMP_DICTIONARY.with(|dictionary| f(&dictionary.borrow())))
+}
+
+#[cfg(test)]
+pub(crate) fn has_trace_pc_guards() -> bool {
+    has_guards()
+}
+
+fn cmp_dictionary_values() -> Vec<Vec<u8>> {
+    suppress_callbacks(|| CMP_DICTIONARY.with(|dictionary| dictionary.borrow().clone()))
 }
 
 struct CallbackSuppression {
@@ -123,14 +167,24 @@ fn suppress_callbacks<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
+fn set_capture_active(active: bool) {
+    CAPTURE_ACTIVE.with(|capture| capture.set(active));
+}
+
 fn state() -> &'static Mutex<SancovState> {
     static STATE: OnceLock<Mutex<SancovState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(SancovState::default()))
 }
 
-fn capture_lock() -> &'static Mutex<()> {
-    static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
+fn try_lock_capture() -> Result<CaptureGuard, String> {
+    static CAPTURE_LOCK: AtomicBool = AtomicBool::new(false);
+    if CAPTURE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(CAPTURE_BUSY.to_string());
+    }
+    Ok(CaptureGuard(&CAPTURE_LOCK))
 }
 
 fn has_guards() -> bool {
@@ -197,6 +251,9 @@ fn clear_cmp_feedback() {
 }
 
 fn record_cmp(width: u8, left: u64, right: u64) {
+    if !CAPTURE_ACTIVE.with(|active| active.get()) {
+        return;
+    }
     IN_CALLBACK.with(|active| {
         if active.replace(true) {
             return;
@@ -217,6 +274,9 @@ fn record_cmp(width: u8, left: u64, right: u64) {
 }
 
 fn record_guard(guard: *mut u32) {
+    if !CAPTURE_ACTIVE.with(|active| active.get()) {
+        return;
+    }
     if guard.is_null() {
         return;
     }

@@ -7,14 +7,14 @@
 mod coverage;
 mod iter;
 mod llvm;
-mod parallel;
 mod sancov;
 
 #[cfg(test)]
 mod tests;
 
-pub use coverage::{CoverageCapture, CoverageId, CoverageSet};
-pub use iter::{DemonicCase, DemonicCoverage, DemonicRng, NoCoverage, curious, shy};
+pub use coverage::{CoverageCapture, CoverageId, CoverageSet, ParallelCoverageCapture};
+pub use iter::{
+    DemonicCase, DemonicCoverage, DemonicParIter, DemonicRng, DemonicTake, NoCoverage, curious, shy,
+};
 pub use llvm::{LlvmCoverage, reset_llvm_counters};
-pub use parallel::{RayonShard, rayon_shards, rayon_shards_from};
 pub use sancov::SancovCoverage;

@@ -10,7 +10,7 @@
 //!
 //! `DEMONIC_BENCH=1 ./target/release/examples/buggy_stack_bench`
 
-use iterator_fuzz::{RayonShard, curious, rayon_shards_from, shy};
+use iterator_fuzz::{curious, shy};
 use rand::Rng;
 use rayon::prelude::*;
 use std::{
@@ -244,22 +244,19 @@ fn check_stack(ops: &[Op]) -> Result<(), String> {
 fn main() {
     let discovery_cases = env_usize("DEMONIC_DISCOVERY_CASES", DISCOVERY_CASES);
     let minimization_cases = env_usize("DEMONIC_MINIMIZATION_CASES", MINIMIZATION_CASES);
-    let shards = env_usize("DEMONIC_SHARDS", rayon::current_num_threads()).max(1);
     let base_seed = env_u64("DEMONIC_BASE_SEED", 0);
     let bench = bench_enabled();
     let trace_best = trace_best_enabled();
-    let cases_per_shard = discovery_cases.div_ceil(shards);
 
-    let found = rayon_shards_from(base_seed, shards, cases_per_shard)
-        .find_map_any(|shard| run_shard(shard, minimization_cases, trace_best));
+    let found = curious()
+        .seed(base_seed)
+        .take(discovery_cases)
+        .into_par_iter()
+        .find_map_any(|rng| run_discovery_case(rng, minimization_cases, trace_best));
 
     if let Some(found) = found {
         if bench {
-            println!(
-                "shard {} found failure from seed {}",
-                found.shard.index(),
-                found.shard.seed()
-            );
+            println!("found failure from discovery seed {}", found.discovery_seed);
             found.bench_stats.print();
         }
         println!(
@@ -271,83 +268,84 @@ fn main() {
 
 #[derive(Debug)]
 struct FoundBug {
-    shard: RayonShard,
+    discovery_seed: u64,
     bench_stats: BenchStats,
     coverage: iterator_fuzz::DemonicCoverage,
     ops: Vec<Op>,
     failure: String,
 }
 
-fn run_shard(shard: RayonShard, minimization_cases: usize, trace_best: bool) -> Option<FoundBug> {
+fn run_discovery_case(
+    mut rng: iterator_fuzz::DemonicRng,
+    minimization_cases: usize,
+    trace_best: bool,
+) -> Option<FoundBug> {
+    let discovery_seed = rng.seed();
     // Maximize code coverage between when rng is created and dropped in the body of the loop, to increase the chance of hitting the bug.
-    for mut rng in curious().seed(shard.seed()).take(shard.cases()) {
-        let ops = sample(&mut rng);
-        if let Err(_err) = check_stack(&ops) {
-            let case = rng.fork_case();
-            let _coverage = rng.coverage().expect("finish discovery coverage");
-            // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
-            let mut shy = shy().seed_case(case);
-            let mut best = None;
-            let mut bench_stats = BenchStats::default();
-            for _ in 0..minimization_cases {
-                let case_start = Instant::now();
-                let candidate_start = Instant::now();
-                let Some(mut variant) = shy.next() else {
-                    break;
-                };
-                bench_stats.candidate_generation += candidate_start.elapsed();
-                bench_stats.minimization_cases += 1;
+    let ops = sample(&mut rng);
+    if let Err(_err) = check_stack(&ops) {
+        let case = rng.fork_case();
+        let _coverage = rng.coverage().expect("finish discovery coverage");
+        // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
+        let mut shy = shy().seed_case(case);
+        let mut best = None;
+        let mut bench_stats = BenchStats::default();
+        for _ in 0..minimization_cases {
+            let case_start = Instant::now();
+            let candidate_start = Instant::now();
+            let Some(mut variant) = shy.next() else {
+                break;
+            };
+            bench_stats.candidate_generation += candidate_start.elapsed();
+            bench_stats.minimization_cases += 1;
 
-                let sample_start = Instant::now();
-                let ops = sample(&mut variant);
-                bench_stats.sample += sample_start.elapsed();
+            let sample_start = Instant::now();
+            let ops = sample(&mut variant);
+            bench_stats.sample += sample_start.elapsed();
 
-                let check_start = Instant::now();
-                let result = check_stack(&ops);
-                bench_stats.check += check_start.elapsed();
+            let check_start = Instant::now();
+            let result = check_stack(&ops);
+            bench_stats.check += check_start.elapsed();
 
-                if let Err(error) = result {
-                    let coverage_start = Instant::now();
-                    let coverage = variant.coverage().expect("finish minimization coverage");
-                    bench_stats.coverage += coverage_start.elapsed();
+            if let Err(error) = result {
+                let coverage_start = Instant::now();
+                let coverage = variant.coverage().expect("finish minimization coverage");
+                bench_stats.coverage += coverage_start.elapsed();
 
-                    let improved = best
-                        .as_ref()
-                        .is_none_or(|(best_coverage, _, _)| coverage < *best_coverage);
-                    if improved {
-                        if trace_best {
-                            println!(
-                                "shard {} new best: {} features and {} bytes",
-                                shard.index(),
-                                coverage.feature_count,
-                                coverage.bytes_consumed
-                            );
-                        }
-                        best = Some((coverage, ops, error));
-                        bench_stats.improved_cases += 1;
-                        bench_stats.improved_total += case_start.elapsed();
-                    } else {
-                        bench_stats.non_improving_failures += 1;
-                        bench_stats.non_improving_failure_total += case_start.elapsed();
+                let improved = best
+                    .as_ref()
+                    .is_none_or(|(best_coverage, _, _)| coverage < *best_coverage);
+                if improved {
+                    if trace_best {
+                        println!(
+                            "seed {} new best: {} features and {} bytes",
+                            discovery_seed, coverage.feature_count, coverage.bytes_consumed
+                        );
                     }
+                    best = Some((coverage, ops, error));
+                    bench_stats.improved_cases += 1;
+                    bench_stats.improved_total += case_start.elapsed();
                 } else {
-                    // exclude this from the minimization search space, since it doesn't trigger the bug.
-                    let discard_start = Instant::now();
-                    variant.discard();
-                    bench_stats.discard += discard_start.elapsed();
-                    bench_stats.passing_cases += 1;
-                    bench_stats.passing_total += case_start.elapsed();
+                    bench_stats.non_improving_failures += 1;
+                    bench_stats.non_improving_failure_total += case_start.elapsed();
                 }
+            } else {
+                // exclude this from the minimization search space, since it doesn't trigger the bug.
+                let discard_start = Instant::now();
+                variant.discard();
+                bench_stats.discard += discard_start.elapsed();
+                bench_stats.passing_cases += 1;
+                bench_stats.passing_total += case_start.elapsed();
             }
-            if let Some((coverage, ops, failure)) = best {
-                return Some(FoundBug {
-                    shard,
-                    bench_stats,
-                    coverage,
-                    ops,
-                    failure,
-                });
-            }
+        }
+        if let Some((coverage, ops, failure)) = best {
+            return Some(FoundBug {
+                discovery_seed,
+                bench_stats,
+                coverage,
+                ops,
+                failure,
+            });
         }
     }
     None

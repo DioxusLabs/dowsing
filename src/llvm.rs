@@ -1,8 +1,8 @@
-use crate::{CoverageCapture, CoverageId, CoverageSet};
+use crate::{CoverageCapture, CoverageId, CoverageSet, coverage::CAPTURE_BUSY};
 use std::{
     ffi::{CStr, c_char, c_void},
     mem,
-    sync::{Mutex, MutexGuard, OnceLock},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// In-process LLVM counter coverage for `curious()` and `shy()`.
@@ -51,9 +51,7 @@ impl CoverageCapture for LlvmCoverage {
     type Token = LlvmToken;
 
     fn start_capture(&mut self) -> Result<Self::Token, String> {
-        let guard = capture_lock()
-            .lock()
-            .map_err(|_| "LLVM coverage capture lock poisoned".to_string())?;
+        let guard = try_lock_capture()?;
         self.runtime.reset_counters();
         Ok(LlvmToken { _guard: guard })
     }
@@ -65,23 +63,45 @@ impl CoverageCapture for LlvmCoverage {
 
 #[derive(Debug)]
 pub struct LlvmToken {
-    _guard: MutexGuard<'static, ()>,
+    _guard: CaptureGuard,
+}
+
+#[derive(Debug)]
+struct CaptureGuard(&'static AtomicBool);
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Reset the process-wide LLVM coverage counters.
 pub fn reset_llvm_counters() -> Result<(), String> {
-    let _guard = capture_lock()
-        .lock()
-        .map_err(|_| "LLVM coverage capture lock poisoned".to_string())?;
+    let _guard = wait_for_capture_lock();
     LlvmRuntime::new()?.reset_counters();
     Ok(())
 }
 
-fn capture_lock() -> &'static Mutex<()> {
-    static CAPTURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    CAPTURE_LOCK.get_or_init(|| Mutex::new(()))
+fn try_lock_capture() -> Result<CaptureGuard, String> {
+    static CAPTURE_LOCK: AtomicBool = AtomicBool::new(false);
+    if CAPTURE_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(CAPTURE_BUSY.to_string());
+    }
+    Ok(CaptureGuard(&CAPTURE_LOCK))
 }
 
+fn wait_for_capture_lock() -> CaptureGuard {
+    loop {
+        match try_lock_capture() {
+            Ok(guard) => return guard,
+            Err(error) if error == CAPTURE_BUSY => std::thread::yield_now(),
+            Err(_) => unreachable!("try_lock_capture only reports busy"),
+        }
+    }
+}
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }

@@ -15,7 +15,7 @@ use rand::Rng;
 use std::collections::VecDeque;
 
 const DISCOVERY_CASES: usize = 8_192;
-const MINIMIZATION_CASES: usize = 2_048;
+const MINIMIZATION_CASES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {

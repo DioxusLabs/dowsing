@@ -91,6 +91,8 @@ impl FromIterator<CoverageId> for CoverageSet {
     }
 }
 
+pub(crate) const CAPTURE_BUSY: &str = "__demonic_capture_busy";
+
 /// Starts and finishes coverage capture for one demonic RNG item.
 pub trait CoverageCapture {
     /// Opaque per-execution token.
@@ -104,6 +106,19 @@ pub trait CoverageCapture {
 
     /// Discard a capture without reading/exporting its coverage.
     fn discard_capture(&mut self, _token: Self::Token) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Values learned from comparison feedback during the most recent capture.
+    fn dictionary_values(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+}
+
+/// Coverage backend that can correctly attribute multiple concurrent in-process executions.
+pub trait ParallelCoverageCapture: CoverageCapture + Clone + Send + Sync + 'static {
+    /// Validate that the current process is configured for concurrent attribution.
+    fn validate_parallel(&self) -> Result<(), String> {
         Ok(())
     }
 }

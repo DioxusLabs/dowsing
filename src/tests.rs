@@ -39,6 +39,54 @@ struct ScriptedCapture {
     discarded: Rc<RefCell<Vec<usize>>>,
 }
 
+#[derive(Debug)]
+struct ParallelScriptedCapture {
+    next_instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    instance: u64,
+    finished: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl ParallelScriptedCapture {
+    fn new() -> Self {
+        Self {
+            next_instance: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            instance: 0,
+            finished: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn finished(&self) -> std::sync::Arc<std::sync::Mutex<Vec<u64>>> {
+        std::sync::Arc::clone(&self.finished)
+    }
+}
+
+impl Clone for ParallelScriptedCapture {
+    fn clone(&self) -> Self {
+        Self {
+            next_instance: std::sync::Arc::clone(&self.next_instance),
+            instance: self
+                .next_instance
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            finished: std::sync::Arc::clone(&self.finished),
+        }
+    }
+}
+
+impl CoverageCapture for ParallelScriptedCapture {
+    type Token = u64;
+
+    fn start_capture(&mut self) -> Result<Self::Token, String> {
+        Ok(self.instance)
+    }
+
+    fn finish_capture(&mut self, token: Self::Token) -> Result<CoverageSet, String> {
+        self.finished.lock().expect("finished lock").push(token);
+        Ok([CoverageId::new(token)].into_iter().collect())
+    }
+}
+
+impl ParallelCoverageCapture for ParallelScriptedCapture {}
+
 impl ScriptedCapture {
     fn new(coverages: impl IntoIterator<Item = impl IntoIterator<Item = u64>>) -> Self {
         Self {
@@ -163,6 +211,7 @@ fn fuzzing_style_map_sample_for_each_assert_records_each_iteration() {
 }
 
 #[test]
+#[allow(clippy::never_loop)]
 fn fuzzing_style_assert_panic_still_finishes_capture_in_default_mode() {
     let capture = ScriptedCapture::new([[1]]);
     let finished = capture.finished();
@@ -652,22 +701,141 @@ fn fresh_root_cadence_keeps_exploring_unmutated_roots() {
 }
 
 #[test]
-fn rayon_shards_split_seed_space() {
-    use rayon::iter::ParallelIterator;
+fn demonic_take_can_feed_rayon_parallel_iterator() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    let mut shards: Vec<_> = rayon_shards_from(7, 3, 11)
-        .map(|shard| (shard.index(), shard.seed(), shard.cases()))
-        .collect();
-    shards.sort_unstable();
+    let executed: usize = curious()
+        .coverage(NoCoverage)
+        .seed(7)
+        .take(32)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            rng.coverage().expect("finish parallel case");
+            1
+        })
+        .sum();
 
-    assert_eq!(shards.len(), 3);
-    assert_eq!(shards[0], (0, 7, 11));
-    assert_eq!(shards[1].0, 1);
-    assert_eq!(shards[1].2, 11);
-    assert_eq!(shards[2].0, 2);
-    assert_eq!(shards[2].2, 11);
-    assert_ne!(shards[0].1, shards[1].1);
-    assert_ne!(shards[1].1, shards[2].1);
+    assert_eq!(executed, 32);
+}
+
+#[test]
+fn parallel_iterator_uses_independent_capture_instances() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let capture = ParallelScriptedCapture::new();
+    let finished = capture.finished();
+    let executed: usize = curious()
+        .coverage(capture)
+        .seed(7)
+        .take(32)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            rng.coverage().expect("finish parallel case");
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 32);
+    let mut instances = finished.lock().expect("finished lock").clone();
+    instances.sort_unstable();
+    instances.dedup();
+    assert!(
+        instances.len() > 1,
+        "parallel capture should not reuse one shared capture instance"
+    );
+}
+
+#[test]
+fn sampling_body_runs_concurrently_through_native_parallel_iterator() {
+    use rayon::{
+        ThreadPoolBuilder,
+        iter::{IntoParallelIterator, ParallelIterator},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("build rayon pool");
+
+    pool.install(|| {
+        curious()
+            .coverage(NoCoverage)
+            .seed(7)
+            .take(32)
+            .into_par_iter()
+            .for_each(|mut rng| {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+
+                thread::sleep(Duration::from_millis(20));
+                let _: u8 = rng.random();
+
+                active.fetch_sub(1, Ordering::SeqCst);
+                rng.coverage().expect("finish parallel case");
+            });
+    });
+
+    assert!(max_active.load(Ordering::SeqCst) > 1);
+}
+
+#[test]
+fn shy_seeded_case_can_feed_native_parallel_iterator() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let case = fork_case_with_trace_len(4);
+    let executed: usize = shy()
+        .coverage(ParallelScriptedCapture::new())
+        .seed_case(case)
+        .take(32)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            rng.coverage().expect("finish parallel shy case");
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 32);
+}
+
+#[test]
+fn default_sancov_parallel_iterator_requires_trace_pc_guard() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let validation = SancovCoverage::new().validate_parallel();
+    if !crate::sancov::has_trace_pc_guards() {
+        let error = validation.expect_err("non-guard Sancov coverage should reject parallel use");
+        assert!(
+            error.contains("trace-pc-guard"),
+            "parallel validation error should mention trace-pc-guard: {error}"
+        );
+        return;
+    }
+
+    validation.expect("trace-pc-guard instrumentation should allow parallel Sancov coverage");
+    let executed: usize = curious()
+        .seed(7)
+        .take(1)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 1);
 }
 
 #[test]
