@@ -1,229 +1,103 @@
 # iterator-fuzz
 
-Small Rust helper for deterministic state-machine fuzzing.
+Minimal coverage-guided randomness.
 
-It is for tests shaped like:
-
-1. Define a printable mutation enum.
-2. Implement `rand::distr::Distribution<Op>` so `rand` can sample mutations.
-3. Replay a mutation list from a clean model/system and check invariants after each step.
-4. If a sequence fails, reduce it with a cost model to produce a smaller, cheaper repro.
-
-`Fuzzer::sequences` yields one lazy `GeneratedCase` per seed (just `seed` + `steps` + a clone of
-your distribution — no `Vec<Op>` allocated up front). `.check` / `.failures` / `.minimize` are the
-three optional pipeline stages. Passing cases stream ops through your step function without
-allocating; only failing cases materialize a `Vec<Op>` (so reduction has a slice to shrink).
-
-The pipeline is a plain `Iterator`, so `.take(N)`, `.inspect(..)`, `try_for_each`, etc. compose
-with it.
+The API has two entry points:
 
 ```rust
-use iterator_fuzz::{CaseIteratorExt, Fuzzer, Step};
-use rand::{
-    Rng,
-    distr::{Distribution, StandardUniform},
-};
+use iterator_fuzz::{curious, shy};
+use rand::Rng;
 
-#[derive(Debug, Clone, Copy)]
-enum Op {
-    Read(usize),
-    Reset(usize),
-    PointTo(usize),
-    Write(usize),
-    Peek,
+fn sample(mut rng: impl Rng) -> u8 {
+    rng.random()
 }
 
-impl Distribution<Op> for StandardUniform {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Op {
-        match rng.random_range(0..5) {
-            0 => Op::Read(rng.random_range(0..4)),
-            1 => Op::Reset(rng.random_range(0..4)),
-            2 => Op::PointTo(rng.random_range(0..4)),
-            3 => Op::Write(rng.random_range(0..4)),
-            _ => Op::Peek,
+fn check(sample: u8) -> Result<(), String> {
+    if sample == 13 {
+        Err("unlucky".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+for mut rng in curious().take(128) {
+    let input = sample(&mut rng);
+    if check(input).is_err() {
+        let case = rng.fork_case();
+        let _coverage = rng.coverage().expect("finish discovery coverage");
+        let mut shy = shy().seed_case(case);
+        let mut best = None;
+
+        for mut variant in shy.by_ref().take(128) {
+            let input = sample(&mut variant);
+            if check(input).is_err() {
+                let coverage = variant.coverage().expect("finish minimization coverage");
+                if best.as_ref().is_none_or(|best_coverage| coverage < *best_coverage) {
+                    best = Some(coverage);
+                }
+            } else {
+                // Exclude this path; it does not reproduce what the harness wants.
+                variant.discard();
+            }
         }
     }
 }
-
-struct State { model: Model, actual: System }
-impl State { fn new() -> Self { Self { model: Model::new(), actual: System::new() } } }
-
-fn apply_and_check(state: &mut State, step: Step<'_, Op>) -> Result<(), String> {
-    state.model.apply(*step.op);
-    state.actual.apply(*step.op);
-    if state.model.dirty_counts() != state.actual.dirty_counts() {
-        return Err(format!("step {}, op {:?}: dirty mismatch", step.index, step.op));
-    }
-    Ok(())
-}
-
-fn cost(op: &Op) -> u64 {
-    match op {
-        Op::Peek => 10,
-        Op::Reset(_) => 3,
-        Op::Read(_) | Op::PointTo(_) | Op::Write(_) => 1,
-    }
-}
-
-if let Some(failure) = Fuzzer::sequences(StandardUniform)
-    .base_seed(0x51a9_0000)
-    .seeds(256)
-    .steps(512)
-    .failures(State::new, apply_and_check)
-    .minimize(cost)
-    .next()
-{
-    panic!(
-        "seed {} failed: {}\nminimized to {} ops: {:?}\nminimized failure: {}",
-        failure.seed,
-        failure.error,
-        failure.minimized_ops.len(),
-        failure.minimized_ops,
-        failure.minimized_error,
-    );
-}
 ```
 
-## Pipeline stages
+`curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution is
+accepted, it stores the consumed RNG byte prefix and later mutates accepted prefixes to explore
+nearby inputs.
 
-```
-Sequences<GeneratedCase>
-  └─ .check(init, step)   ─► Check<CheckedCase>       every replay outcome, pass or fail
-      └─ .failures()      ─► Failures<FailedCase>     drop passes; keep failures only
-          └─ .minimize(cost) ─► Minimize<MinimizedFailure>
-```
+`shy()` starts from forked cases. It does not generate unrelated fresh roots. It generates byte
+variants with stacked havoc mutations: deletion, truncation, zeroing, interesting values, bit and
+arithmetic flips, random byte edits, and cmp/dictionary replacement or insertion. Passing variants
+should be consumed with `discard()`, which keeps them out of the minimization corpus. Every
+non-discarded variant is retained as a failing variant. Parent selection is not the coverage-rarity
+entropy used by `curious()`; it is the inverse signal for minimization. `shy()` records the coverage
+features from the initial failing path, then gives more energy to valid failing candidates that
+remove features that most other valid candidates still execute. The public coverage score orders
+shorter consumed RNG paths before lower feature counts, so the minimizer prefers smaller failing
+inputs while still sampling candidates that discovered hard-to-remove code.
 
-`.failures(init, step)` is a shortcut for `.check(init, step).failures()`. The closures pass once
-and thread through subsequent stages.
-
-A few shapes you can write directly:
-
-```rust
-// All failures, no minimization:
-for failed in sequences.failures(State::new, apply_and_check) {
-    eprintln!("seed {}: {}", failed.seed, failed.error);
-}
-
-// Stop after 3 minimized failures:
-let bugs: Vec<_> = sequences
-    .failures(State::new, apply_and_check)
-    .minimize(cost)
-    .take(3)
-    .collect();
-
-// Pass-rate audit (use check, not failures):
-let (pass, fail) = sequences
-    .check(State::new, apply_and_check)
-    .fold((0u64, 0u64), |(p, f), c| if c.is_failure() { (p, f + 1) } else { (p + 1, f) });
-
-// Replay a single case lazily (no Vec allocation):
-case.replay(State::new, apply_and_check)?;
-```
-
-If you want full manual control, `GeneratedCase::replay` (lazy), `replay_ops` (slice-based, for
-custom reducers), and `reduce_with_cost` are all public — the combinators are just a thin layer on
-top of them.
-
-The reducer only removes operations. It preserves order and accepts a candidate when it still fails
-and improves `(total_cost, length)`.
-
-`minimize_with_transforms` and `reduce_preserving_with_transforms` accept a `SequenceMutator`
-callback. The mutator emits valid rewritten operation sequences for your domain; the library
-decides whether each candidate keeps the failure, keeps required coverage, or adds new coverage.
-
-## Coverage-guided exploration
-
-Enable `llvm-coverage` and build the harness with LLVM source coverage instrumentation. The
-coverage-guided adapter is still an iterator: it yields runnable cases. Each case starts coverage
-capture before it is yielded; calling `finish` (or dropping the case) ends capture, accepts
-interesting cases, and queues mutation-derived follow-up cases.
-
-```rust
-use iterator_fuzz::{
-    CaseIteratorExt, Fuzzer, InputCase, InputCaseIteratorExt, MeasuredCaseIteratorExt,
-    llvm_coverage::LlvmCoverage, replay_ops,
-};
-
-let coverage = LlvmCoverage::new(
-    std::env::current_exe()?,
-    [std::path::PathBuf::from("src")],
-    "target/iterator-fuzz-cov/my-harness",
-)?;
-
-let exact_roots = vec![InputCase::root(None, vec![Op::Peek])];
-let mut explorer = exact_roots
-    .into_iter()
-    .chain(
-        Fuzzer::sequences(StandardUniform)
-            .base_seed(0)
-            .seeds(128)
-            .steps(256)
-            .materialize(),
-    )
-    .explore_coverage(coverage)
-    .mutate(mutate_ops)
-    .mutate_depth(5)
-    .seed_ratio(8)
-    .accepted_limit(128);
-
-while let Some(case) = explorer.next() {
-    let mut case = case?;
-    case.set_outcome(replay_ops(case.ops(), State::new, apply_and_check));
-    case.finish()?;
-}
-
-let corpus = explorer.corpus();
-```
-
-For simpler workflows, the coverage pieces can be composed directly:
-
-```rust
-let accepted = Fuzzer::sequences(StandardUniform)
-    .base_seed(0)
-    .seeds(128)
-    .steps(256)
-    .materialize()
-    .measure_coverage(move |ops| {
-        coverage.evaluate(|| replay_ops(ops, State::new, apply_and_check))
-    })
-    .maximize_coverage()
-    .collect::<Result<Vec<_>, _>>()?;
-```
-
-Run the harness with instrumentation:
+By default, feedback comes from LLVM SanitizerCoverage: inline 8-bit edge counters plus comparison
+callbacks. Build the clean demo with instrumentation:
 
 ```sh
-rustup component add llvm-tools-preview
-RUSTFLAGS="-Cinstrument-coverage" cargo run --features llvm-coverage --example my_harness
+cargo rustc --example buggy_stack -- -Cpasses=sancov-module \
+  -Cllvm-args=-sanitizer-coverage-level=3 \
+  -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+  -Cllvm-args=-sanitizer-coverage-pc-table \
+  -Cllvm-args=-sanitizer-coverage-trace-compares
+./target/debug/examples/buggy_stack
 ```
 
-`LlvmCoverage` resets counters before each candidate, writes a per-case `.profraw`, exports source
-regions with `llvm-cov`, and feeds those region IDs to `explore_coverage`.
+For timing breakdowns, use the benchmark variant:
 
-## Parallel fuzzing (rayon)
-
-Enable the optional `rayon` feature to fan out seeds across cores:
-
-```toml
-[dependencies]
-iterator-fuzz = { version = "0.1", features = ["rayon"] }
+```sh
+cargo rustc --release --example buggy_stack_bench -- -Cpasses=sancov-module \
+  -Cllvm-args=-sanitizer-coverage-level=3 \
+  -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+  -Cllvm-args=-sanitizer-coverage-pc-table \
+  -Cllvm-args=-sanitizer-coverage-trace-compares
+DEMONIC_BENCH=1 ./target/release/examples/buggy_stack_bench
 ```
 
-`SequencesBuilder::par()` produces a rayon `IndexedParallelIterator`, and the
-`parallel::ParCaseIteratorExt` trait provides parallel `failures` and `minimized_failures`
-stages. Closures must be `Fn + Send + Sync` (not `FnMut`), since each thread invokes them; each
-worker builds its own `State` via `init`.
+The benchmark also supports Rayon sharding:
 
-```rust
-use iterator_fuzz::{Fuzzer, parallel::ParCaseIteratorExt};
-use rayon::iter::ParallelIterator;
-
-let bug = Fuzzer::sequences(StandardUniform)
-    .base_seed(0).seeds(10_000).steps(64)
-    .par()
-    .minimized_failures(State::new, apply_and_check, cost)
-    .find_any(|_| true);          // first failure any thread sees
+```sh
+DEMONIC_BENCH=1 DEMONIC_SHARDS=8 ./target/release/examples/buggy_stack_bench
 ```
 
-Order is not preserved; reproduce by seed. Reduction stays per-case — scaling comes from spreading
-distinct failing seeds across cores, not from parallelizing inside a single reduction.
+For true concurrent in-process SanitizerCoverage, build with trace-pc-guard feedback instead of
+inline counters; inline counters are process-global and demonic serializes those captures for
+correctness.
+
+```sh
+cargo rustc --release --example buggy_stack_bench -- -Cpasses=sancov-module \
+  -Cllvm-args=-sanitizer-coverage-level=3 \
+  -Cllvm-args=-sanitizer-coverage-trace-pc-guard \
+  -Cllvm-args=-sanitizer-coverage-trace-compares
+DEMONIC_BENCH=1 DEMONIC_SHARDS=8 ./target/release/examples/buggy_stack_bench
+```
+
+Custom coverage is available by implementing `CoverageCapture` and passing it to `.coverage(...)`.

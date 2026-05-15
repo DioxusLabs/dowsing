@@ -3,16 +3,6 @@ name = "iterator-fuzz"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-rayon = ["dep:rayon"]
-llvm-coverage = ["dep:serde_json"]
-
 [dependencies]
 rand = { version = "0.9", features = ["small_rng"] }
-rayon = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
-
-[[example]]
-name = "parallel_buggy_stack"
-required-features = ["rayon"]
+rayon = "1.10"
