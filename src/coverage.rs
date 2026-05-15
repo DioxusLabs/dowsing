@@ -91,9 +91,77 @@ impl FromIterator<CoverageId> for CoverageSet {
     }
 }
 
-pub(crate) const CAPTURE_BUSY: &str = "__demonic_capture_busy";
+/// Feedback observed during one execution.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionFeedback {
+    /// Coverage features observed during the execution.
+    pub(crate) features: CoverageSet,
 
-/// Starts and finishes coverage capture for one demonic RNG item.
+    /// Coarse execution intensity derived from hit-count buckets when available.
+    pub(crate) hit_count_weight: u64,
+
+    /// Values learned from comparison feedback during this execution.
+    pub(crate) dictionary: Vec<Vec<u8>>,
+}
+
+impl ExecutionFeedback {
+    /// Build feedback from all observed parts.
+    pub fn new(features: CoverageSet, hit_count_weight: u64, dictionary: Vec<Vec<u8>>) -> Self {
+        Self {
+            features,
+            hit_count_weight,
+            dictionary,
+        }
+    }
+
+    /// Build feedback from coverage features. The default hit-count weight is one unit per feature.
+    pub fn from_features(features: CoverageSet) -> Self {
+        let hit_count_weight = features.len() as u64;
+        Self::new(features, hit_count_weight, Vec::new())
+    }
+
+    /// Override the coarse execution intensity.
+    pub fn with_hit_count_weight(mut self, hit_count_weight: u64) -> Self {
+        self.hit_count_weight = hit_count_weight;
+        self
+    }
+
+    /// Attach comparison dictionary values to this feedback.
+    pub fn with_dictionary(mut self, dictionary: Vec<Vec<u8>>) -> Self {
+        self.dictionary = dictionary;
+        self
+    }
+
+    /// Coverage features observed during the execution.
+    pub fn features(&self) -> &CoverageSet {
+        &self.features
+    }
+
+    /// Coarse execution intensity derived from hit-count buckets when available.
+    pub fn hit_count_weight(&self) -> u64 {
+        self.hit_count_weight
+    }
+
+    /// Values learned from comparison feedback during this execution.
+    pub fn dictionary(&self) -> &[Vec<u8>] {
+        &self.dictionary
+    }
+
+    /// Split feedback into owned parts.
+    pub fn into_parts(self) -> (CoverageSet, u64, Vec<Vec<u8>>) {
+        (self.features, self.hit_count_weight, self.dictionary)
+    }
+}
+
+impl From<CoverageSet> for ExecutionFeedback {
+    fn from(features: CoverageSet) -> Self {
+        Self::from_features(features)
+    }
+}
+
+pub(crate) const CAPTURE_BUSY: &str = "__iterator_fuzz_capture_busy";
+
+/// Starts and finishes coverage capture for one RNG case.
 pub trait CoverageCapture {
     /// Opaque per-execution token.
     type Token;
@@ -101,17 +169,12 @@ pub trait CoverageCapture {
     /// Start capturing coverage.
     fn start_capture(&mut self) -> Result<Self::Token, String>;
 
-    /// Finish coverage capture and return the observed coverage.
-    fn finish_capture(&mut self, token: Self::Token) -> Result<CoverageSet, String>;
+    /// Finish coverage capture and return the observed feedback.
+    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String>;
 
     /// Discard a capture without reading/exporting its coverage.
     fn discard_capture(&mut self, _token: Self::Token) -> Result<(), String> {
         Ok(())
-    }
-
-    /// Values learned from comparison feedback during the most recent capture.
-    fn dictionary_values(&mut self) -> Vec<Vec<u8>> {
-        Vec::new()
     }
 }
 

@@ -5,7 +5,7 @@ Minimal coverage-guided randomness.
 The API has two entry points:
 
 ```rust
-use iterator_fuzz::{curious, shy};
+use iterator_fuzz::{curious, cautious};
 use rand::Rng;
 
 fn sample(mut rng: impl Rng) -> u8 {
@@ -25,10 +25,10 @@ for mut rng in curious().take(128) {
     if check(input).is_err() {
         let case = rng.fork_case();
         let _coverage = rng.coverage().expect("finish discovery coverage");
-        let mut shy = shy().seed_case(case);
+        let mut cautious = cautious().with_case(case);
         let mut best = None;
 
-        for mut variant in shy.by_ref().take(128) {
+        for mut variant in cautious.by_ref().take(128) {
             let input = sample(&mut variant);
             if check(input).is_err() {
                 let coverage = variant.coverage().expect("finish minimization coverage");
@@ -66,16 +66,16 @@ let found = curious()
     });
 ```
 
-`shy()` starts from forked cases. It does not generate unrelated fresh roots. It generates byte
+`cautious()` starts from forked cases. It does not generate unrelated fresh roots. It generates byte
 variants with stacked havoc mutations: deletion, truncation, zeroing, interesting values, bit and
 arithmetic flips, random byte edits, and cmp/dictionary replacement or insertion. Passing variants
 should be consumed with `discard()`, which keeps them out of the minimization corpus. Every
 non-discarded variant is retained as a failing variant. Parent selection is not the coverage-rarity
-entropy used by `curious()`; it is the inverse signal for minimization. `shy()` records the coverage
+entropy used by `curious()`; it is the inverse signal for minimization. `cautious()` records the coverage
 features from the initial failing path, then gives more energy to valid failing candidates that
 remove features that most other valid candidates still execute. The public coverage score orders
-shorter consumed RNG paths before lower feature counts, so the minimizer prefers smaller failing
-inputs while still sampling candidates that discovered hard-to-remove code.
+fewer features, lower hit-count weight, then fewer consumed RNG bytes, so the minimizer prefers
+smaller failing inputs while still sampling candidates that discovered hard-to-remove code.
 
 By default, feedback comes from LLVM SanitizerCoverage: inline 8-bit edge counters plus comparison
 callbacks. Build the clean demo with instrumentation:
@@ -100,7 +100,7 @@ cargo rustc --release --example buggy_stack_bench -- -Cpasses=sancov-module \
   -Cllvm-args=-sanitizer-coverage-level=3 \
   -Cllvm-args=-sanitizer-coverage-trace-pc-guard \
   -Cllvm-args=-sanitizer-coverage-trace-compares
-DEMONIC_BENCH=1 ./target/release/examples/buggy_stack_bench
+ITERATOR_FUZZ_BENCH=1 ./target/release/examples/buggy_stack_bench
 ```
 
-Custom coverage is available by implementing `CoverageCapture` and passing it to `.coverage(...)`.
+Custom coverage is available by implementing `CoverageCapture` and passing it to `.with_coverage(...)`.

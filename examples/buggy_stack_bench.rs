@@ -8,9 +8,9 @@
 //! -Cllvm-args=-sanitizer-coverage-pc-table \
 //! -Cllvm-args=-sanitizer-coverage-trace-compares`
 //!
-//! `DEMONIC_BENCH=1 ./target/release/examples/buggy_stack_bench`
+//! `ITERATOR_FUZZ_BENCH=1 ./target/release/examples/buggy_stack_bench`
 
-use iterator_fuzz::{curious, shy};
+use iterator_fuzz::{cautious, curious};
 use rand::Rng;
 use rayon::prelude::*;
 use std::{
@@ -81,11 +81,11 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn bench_enabled() -> bool {
-    env::var_os("DEMONIC_BENCH").is_some()
+    env::var_os("ITERATOR_FUZZ_BENCH").is_some()
 }
 
 fn trace_best_enabled() -> bool {
-    env::var_os("DEMONIC_TRACE_BEST").is_some()
+    env::var_os("ITERATOR_FUZZ_TRACE_BEST").is_some()
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -242,14 +242,14 @@ fn check_stack(ops: &[Op]) -> Result<(), String> {
 }
 
 fn main() {
-    let discovery_cases = env_usize("DEMONIC_DISCOVERY_CASES", DISCOVERY_CASES);
-    let minimization_cases = env_usize("DEMONIC_MINIMIZATION_CASES", MINIMIZATION_CASES);
-    let base_seed = env_u64("DEMONIC_BASE_SEED", 0);
+    let discovery_cases = env_usize("ITERATOR_FUZZ_DISCOVERY_CASES", DISCOVERY_CASES);
+    let minimization_cases = env_usize("ITERATOR_FUZZ_MINIMIZATION_CASES", MINIMIZATION_CASES);
+    let base_seed = env_u64("ITERATOR_FUZZ_BASE_SEED", 0);
     let bench = bench_enabled();
     let trace_best = trace_best_enabled();
 
     let found = curious()
-        .seed(base_seed)
+        .with_seed(base_seed)
         .take(discovery_cases)
         .into_par_iter()
         .find_map_any(|rng| run_discovery_case(rng, minimization_cases, trace_best));
@@ -261,7 +261,10 @@ fn main() {
         }
         println!(
             "found stack bug with {} features and {} bytes: {:?}\nerror: {}",
-            found.coverage.feature_count, found.coverage.bytes_consumed, found.ops, found.failure
+            found.coverage.feature_count(),
+            found.coverage.bytes_consumed(),
+            found.ops,
+            found.failure
         );
     }
 }
@@ -270,13 +273,13 @@ fn main() {
 struct FoundBug {
     discovery_seed: u64,
     bench_stats: BenchStats,
-    coverage: iterator_fuzz::DemonicCoverage,
+    coverage: iterator_fuzz::CaseCoverage,
     ops: Vec<Op>,
     failure: String,
 }
 
 fn run_discovery_case(
-    mut rng: iterator_fuzz::DemonicRng,
+    mut rng: iterator_fuzz::CaseRng,
     minimization_cases: usize,
     trace_best: bool,
 ) -> Option<FoundBug> {
@@ -287,13 +290,13 @@ fn run_discovery_case(
         let case = rng.fork_case();
         let _coverage = rng.coverage().expect("finish discovery coverage");
         // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
-        let mut shy = shy().seed_case(case);
+        let mut cautious = cautious().with_case(case);
         let mut best = None;
         let mut bench_stats = BenchStats::default();
         for _ in 0..minimization_cases {
             let case_start = Instant::now();
             let candidate_start = Instant::now();
-            let Some(mut variant) = shy.next() else {
+            let Some(mut variant) = cautious.next() else {
                 break;
             };
             bench_stats.candidate_generation += candidate_start.elapsed();
@@ -319,7 +322,9 @@ fn run_discovery_case(
                     if trace_best {
                         println!(
                             "seed {} new best: {} features and {} bytes",
-                            discovery_seed, coverage.feature_count, coverage.bytes_consumed
+                            discovery_seed,
+                            coverage.feature_count(),
+                            coverage.bytes_consumed()
                         );
                     }
                     best = Some((coverage, ops, error));

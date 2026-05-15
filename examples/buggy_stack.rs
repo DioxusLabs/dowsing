@@ -1,4 +1,4 @@
-//! Stateful demonic loop with a deliberately subtle stack bug.
+//! Stateful search loop with a deliberately subtle stack bug.
 //!
 //! Run with LLVM SanitizerCoverage instrumentation:
 //!
@@ -10,7 +10,7 @@
 //!
 //! `./target/debug/examples/buggy_stack`
 
-use iterator_fuzz::{curious, shy};
+use iterator_fuzz::{cautious, curious};
 use rand::Rng;
 use std::collections::VecDeque;
 
@@ -171,9 +171,9 @@ fn main() {
             let case = rng.fork_case();
             let _coverage = rng.coverage().expect("finish discovery coverage");
             // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
-            let mut shy = shy().seed_case(case);
+            let mut cautious = cautious().with_case(case);
             let mut best = None;
-            for mut variant in shy.by_ref().take(MINIMIZATION_CASES) {
+            for mut variant in cautious.by_ref().take(MINIMIZATION_CASES) {
                 let ops = sample(&mut variant);
                 if let Err(error) = check_stack(&ops) {
                     let coverage = variant.coverage().expect("finish minimization coverage");
@@ -192,7 +192,10 @@ fn main() {
             if let Some((coverage, ops, failure)) = best {
                 println!(
                     "found stack bug with {} features and {} bytes: {:?}\nerror: {}",
-                    coverage.feature_count, coverage.bytes_consumed, ops, failure
+                    coverage.feature_count(),
+                    coverage.bytes_consumed(),
+                    ops,
+                    failure
                 );
                 return;
             }

@@ -1,5 +1,6 @@
 use crate::{
-    CoverageCapture, CoverageId, CoverageSet, ParallelCoverageCapture, coverage::CAPTURE_BUSY,
+    CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, ParallelCoverageCapture,
+    coverage::CAPTURE_BUSY,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -14,7 +15,7 @@ const CMP_NAMESPACE: u64 = 1;
 const MAX_CMP_FEATURES: usize = 4096;
 const MAX_DICTIONARY_VALUES: usize = 256;
 
-/// In-process LLVM SanitizerCoverage feedback for `curious()` and `shy()`.
+/// In-process LLVM SanitizerCoverage feedback for `curious()` and `cautious()`.
 ///
 /// Build the harness with `-Cpasses=sancov-module` plus LLVM sanitizer-coverage arguments so
 /// LLVM emits edge feedback and comparison callbacks. Native parallel iteration requires
@@ -94,17 +95,23 @@ impl CoverageCapture for SancovCoverage {
         Ok(SancovToken { _guard: guard })
     }
 
-    fn finish_capture(&mut self, _token: Self::Token) -> Result<CoverageSet, String> {
+    fn finish_capture(&mut self, _token: Self::Token) -> Result<ExecutionFeedback, String> {
         set_capture_active(false);
-        let mut coverage = if has_guards() {
-            guard_coverage()
+        let guard_mode = has_guards();
+        let mut feedback = if guard_mode {
+            ExecutionFeedback::from_features(guard_coverage())
         } else {
             counter_coverage()
         };
         if self.cmp_feedback {
-            CMP_FEATURES.with(|features| coverage.extend(features.borrow().iter().copied()));
+            CMP_FEATURES
+                .with(|features| feedback.features.extend(features.borrow().iter().copied()));
+            feedback.dictionary = cmp_dictionary_values();
         }
-        Ok(coverage)
+        if guard_mode {
+            feedback.hit_count_weight = feedback.features.len() as u64;
+        }
+        Ok(feedback)
     }
 
     fn discard_capture(&mut self, _token: Self::Token) -> Result<(), String> {
@@ -112,10 +119,6 @@ impl CoverageCapture for SancovCoverage {
         clear_guard_feedback();
         clear_cmp_feedback();
         Ok(())
-    }
-
-    fn dictionary_values(&mut self) -> Vec<Vec<u8>> {
-        cmp_dictionary_values()
     }
 }
 
@@ -130,11 +133,6 @@ impl ParallelCoverageCapture for SancovCoverage {
             )
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn with_dictionary_values<T>(f: impl FnOnce(&[Vec<u8>]) -> T) -> T {
-    suppress_callbacks(|| CMP_DICTIONARY.with(|dictionary| f(&dictionary.borrow())))
 }
 
 #[cfg(test)]
@@ -223,26 +221,30 @@ fn reset_counters() {
     }
 }
 
-fn counter_coverage() -> CoverageSet {
+fn counter_coverage() -> ExecutionFeedback {
     let Ok(state) = state().lock() else {
-        return CoverageSet::new();
+        return ExecutionFeedback::default();
     };
     let mut ids = Vec::new();
+    let mut hit_count_weight = 0_u64;
     let mut index = 0_u64;
     for range in &state.counters {
         let len = range.end.saturating_sub(range.start);
         let counters = unsafe { std::slice::from_raw_parts(range.start as *const u8, len) };
         for counter in counters.iter().copied() {
             if counter != 0 {
-                ids.push(feature_id(
-                    EDGE_NAMESPACE,
-                    (index << 8) | u64::from(hit_count_bucket(counter)),
-                ));
+                let bucket = hit_count_bucket(counter);
+                ids.push(feature_id(EDGE_NAMESPACE, (index << 8) | u64::from(bucket)));
+                hit_count_weight = hit_count_weight.saturating_add(1 + u64::from(bucket));
             }
             index = index.wrapping_add(1);
         }
     }
-    CoverageSet::from_unsorted(ids)
+    ExecutionFeedback {
+        features: CoverageSet::from_unsorted(ids),
+        hit_count_weight,
+        dictionary: Vec::new(),
+    }
 }
 
 fn clear_cmp_feedback() {
@@ -455,7 +457,18 @@ pub unsafe extern "C" fn __sanitizer_cov_trace_switch(value: u64, cases: *const 
     if cases.is_null() {
         return;
     }
-    record_cmp(8, value, unsafe { cases.add(2).read_unaligned() });
+    let count = unsafe { cases.read_unaligned() as usize };
+    let bit_width = unsafe { cases.add(1).read_unaligned() };
+    let width = match bit_width {
+        0..=8 => 1,
+        9..=16 => 2,
+        17..=32 => 4,
+        _ => 8,
+    };
+    for index in 0..count.min(MAX_CMP_FEATURES) {
+        let case = unsafe { cases.add(2 + index).read_unaligned() };
+        record_cmp(width, value, case);
+    }
 }
 
 #[cfg(test)]

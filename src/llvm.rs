@@ -1,11 +1,11 @@
-use crate::{CoverageCapture, CoverageId, CoverageSet, coverage::CAPTURE_BUSY};
+use crate::{CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, coverage::CAPTURE_BUSY};
 use std::{
     ffi::{CStr, c_char, c_void},
     mem,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-/// In-process LLVM counter coverage for `curious()` and `shy()`.
+/// In-process LLVM counter coverage for `curious()` and `cautious()`.
 ///
 /// Build the harness with `RUSTFLAGS="-Cinstrument-coverage"` so LLVM exposes coverage counters
 /// in the current process. Each nonzero counter becomes a coverage feature. With bucketing enabled,
@@ -19,9 +19,18 @@ pub struct LlvmCoverage {
 
 #[derive(Debug, Clone, Copy)]
 struct LlvmRuntime {
-    reset_counters: unsafe extern "C" fn(),
-    begin_counters: unsafe extern "C" fn() -> *const u64,
-    end_counters: unsafe extern "C" fn() -> *const u64,
+    counters: LlvmCounters,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LlvmCounters {
+    RuntimeFunctions {
+        reset_counters: unsafe extern "C" fn(),
+        begin_counters: unsafe extern "C" fn() -> *const u64,
+        end_counters: unsafe extern "C" fn() -> *const u64,
+    },
+    #[cfg(target_os = "macos")]
+    MachOSection { begin: *mut u64, end: *mut u64 },
 }
 
 impl LlvmCoverage {
@@ -56,7 +65,7 @@ impl CoverageCapture for LlvmCoverage {
         Ok(LlvmToken { _guard: guard })
     }
 
-    fn finish_capture(&mut self, _token: Self::Token) -> Result<CoverageSet, String> {
+    fn finish_capture(&mut self, _token: Self::Token) -> Result<ExecutionFeedback, String> {
         counter_coverage(self.runtime, self.counter_count, self.bucketing)
     }
 }
@@ -108,27 +117,178 @@ unsafe extern "C" {
 
 impl LlvmRuntime {
     fn new() -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        if let Some(counters) = macos_profile_counters() {
+            return Ok(Self { counters });
+        }
+
         Ok(Self {
-            reset_counters: load_symbol(c"__llvm_profile_reset_counters")?,
-            begin_counters: load_symbol(c"__llvm_profile_begin_counters")?,
-            end_counters: load_symbol(c"__llvm_profile_end_counters")?,
+            counters: LlvmCounters::RuntimeFunctions {
+                reset_counters: load_symbol(c"__llvm_profile_reset_counters")?,
+                begin_counters: load_symbol(c"__llvm_profile_begin_counters")?,
+                end_counters: load_symbol(c"__llvm_profile_end_counters")?,
+            },
         })
     }
 
     fn reset_counters(self) {
-        unsafe {
-            (self.reset_counters)();
+        match self.counters {
+            LlvmCounters::RuntimeFunctions { reset_counters, .. } => unsafe {
+                reset_counters();
+            },
+            #[cfg(target_os = "macos")]
+            LlvmCounters::MachOSection { begin, end } => {
+                let len = unsafe { end.offset_from(begin) };
+                if len > 0 {
+                    unsafe {
+                        std::ptr::write_bytes(begin, 0, len as usize);
+                    }
+                }
+            }
         }
     }
 
     fn counter_bounds(self) -> Result<(*const u64, *const u64), String> {
-        let begin = unsafe { (self.begin_counters)() };
-        let end = unsafe { (self.end_counters)() };
+        let (begin, end) = match self.counters {
+            LlvmCounters::RuntimeFunctions {
+                begin_counters,
+                end_counters,
+                ..
+            } => unsafe { (begin_counters(), end_counters()) },
+            #[cfg(target_os = "macos")]
+            LlvmCounters::MachOSection { begin, end } => (begin.cast_const(), end.cast_const()),
+        };
         if begin.is_null() || end.is_null() {
             return Err("LLVM coverage runtime returned null counter bounds".to_string());
         }
         Ok((begin, end))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_profile_counters() -> Option<LlvmCounters> {
+    let image_count = unsafe { _dyld_image_count() };
+    for image_index in 0..image_count {
+        let header = unsafe { _dyld_get_image_header(image_index) };
+        if header.is_null() || unsafe { (*header).magic } != MH_MAGIC_64 {
+            continue;
+        }
+        let slide = unsafe { _dyld_get_image_vmaddr_slide(image_index) };
+        let Some((begin, end)) = (unsafe { macho_profile_counter_section(header, slide) }) else {
+            continue;
+        };
+        if begin < end {
+            return Some(LlvmCounters::MachOSection { begin, end });
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn macho_profile_counter_section(
+    header: *const MachHeader64,
+    slide: isize,
+) -> Option<(*mut u64, *mut u64)> {
+    let mut command = unsafe { header.add(1).cast::<LoadCommand>() };
+    for _ in 0..unsafe { (*header).ncmds } {
+        if unsafe { (*command).cmd } == LC_SEGMENT_64 {
+            let segment = command.cast::<SegmentCommand64>();
+            let mut section = unsafe { segment.add(1).cast::<Section64>() };
+            for _ in 0..unsafe { (*segment).nsects } {
+                if fixed_name_eq(unsafe { &(*section).sectname }, b"__llvm_prf_cnts") {
+                    let addr = unsafe { (*section).addr };
+                    let size = unsafe { (*section).size };
+                    if size != 0 && size % mem::size_of::<u64>() as u64 == 0 {
+                        let begin = (addr.wrapping_add(slide as u64)) as *mut u64;
+                        let end = unsafe { begin.add(size as usize / mem::size_of::<u64>()) };
+                        return Some((begin, end));
+                    }
+                }
+                section = unsafe { section.add(1) };
+            }
+        }
+        command = unsafe { (command.cast::<u8>()).add((*command).cmdsize as usize) }
+            .cast::<LoadCommand>();
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn fixed_name_eq(fixed: &[c_char; 16], expected: &[u8]) -> bool {
+    let len = fixed
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(fixed.len());
+    len == expected.len()
+        && fixed[..len]
+            .iter()
+            .map(|byte| *byte as u8)
+            .eq(expected.iter().copied())
+}
+
+#[cfg(target_os = "macos")]
+const MH_MAGIC_64: u32 = 0xfeed_facf;
+#[cfg(target_os = "macos")]
+const LC_SEGMENT_64: u32 = 0x19;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachHeader64 {
+    magic: u32,
+    cputype: i32,
+    cpusubtype: i32,
+    filetype: u32,
+    ncmds: u32,
+    sizeofcmds: u32,
+    flags: u32,
+    reserved: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct LoadCommand {
+    cmd: u32,
+    cmdsize: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct SegmentCommand64 {
+    cmd: u32,
+    cmdsize: u32,
+    segname: [c_char; 16],
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: i32,
+    initprot: i32,
+    nsects: u32,
+    flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Section64 {
+    sectname: [c_char; 16],
+    segname: [c_char; 16],
+    addr: u64,
+    size: u64,
+    offset: u32,
+    align: u32,
+    reloff: u32,
+    nreloc: u32,
+    flags: u32,
+    reserved1: u32,
+    reserved2: u32,
+    reserved3: u32,
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_header(image_index: u32) -> *const MachHeader64;
+    fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
 }
 
 fn load_symbol<F>(symbol: &'static CStr) -> Result<F, String>
@@ -154,7 +314,7 @@ fn counter_coverage(
     runtime: LlvmRuntime,
     counter_count: usize,
     bucketing: bool,
-) -> Result<CoverageSet, String> {
+) -> Result<ExecutionFeedback, String> {
     let (begin, end) = runtime.counter_bounds()?;
     let current_count = unsafe { end.offset_from(begin) };
     if current_count < 0 || current_count as usize != counter_count {
@@ -164,19 +324,26 @@ fn counter_coverage(
     }
 
     let mut coverage = CoverageSet::new();
+    let mut hit_count_weight = 0_u64;
     for index in 0..counter_count {
         let counter = unsafe { std::ptr::read_volatile(begin.add(index)) };
         if counter == 0 {
             continue;
         }
+        let bucket = hit_count_bucket(counter);
         let id = if bucketing {
-            ((index as u64) << 8) | u64::from(hit_count_bucket(counter))
+            ((index as u64) << 8) | u64::from(bucket)
         } else {
             index as u64
         };
         coverage.insert(CoverageId::new(id));
+        hit_count_weight = hit_count_weight.saturating_add(1 + u64::from(bucket));
     }
-    Ok(coverage)
+    Ok(ExecutionFeedback {
+        features: coverage,
+        hit_count_weight,
+        dictionary: Vec::new(),
+    })
 }
 
 fn hit_count_bucket(counter: u64) -> u8 {
