@@ -1,27 +1,23 @@
-//! Deterministic mutation-sequence fuzzing with invariant replay and cost-aware reduction.
+//! Minimal coverage-guided randomness.
 //!
-//! The core workflow is:
-//! 1. Sample printable mutations with `rand`'s [`Distribution`](rand::distr::Distribution) trait.
-//! 2. Replay each mutation list from a clean state and check invariants after each step.
-//! 3. If replay fails, reduce the operation list using a caller-provided cost model.
-//!
-//! This is meant for state-machine bugs where normal unit tests miss ordering edge cases, but the
-//! whole failure can be reproduced from a list of small operations.
+//! Use [`curious`] to maximize coverage while discovering interesting paths, then fork a path with
+//! [`CaseRng::fork_case`] and feed it to [`cautious`] to minimize the code path that still matters to
+//! the harness.
 
 mod coverage;
-mod coverage_guided;
-mod pipeline;
-mod reduce;
-
-#[cfg(feature = "llvm-coverage")]
-pub mod llvm_coverage;
-#[cfg(feature = "rayon")]
-pub mod parallel;
+mod iter;
+mod llvm;
+mod sancov;
 
 #[cfg(test)]
 mod tests;
 
-pub use coverage::*;
-pub use coverage_guided::*;
-pub use pipeline::*;
-pub use reduce::*;
+pub use coverage::{
+    CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, ParallelCoverageCapture,
+};
+pub use iter::{
+    Case, CaseCoverage, CaseRng, Cases, Cautious, Curious, NoCoverage, ParallelCases, SearchStats,
+    cautious, curious,
+};
+pub use llvm::{LlvmCoverage, reset_llvm_counters};
+pub use sancov::SancovCoverage;

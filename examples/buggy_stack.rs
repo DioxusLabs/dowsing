@@ -1,137 +1,204 @@
-//! Find a real ordering bug in a stack that tracks a `reversed` flag.
+//! Stateful search loop with a deliberately subtle stack bug.
 //!
-//! The "buggy" implementation tries to be clever: instead of physically reversing its storage on
-//! `Reverse`, it flips a flag and adapts `push` to prepend when reversed. But `pop` was never
-//! updated — it still pops from the physical end regardless of the flag. The fuzzer will find
-//! that bug and minimize it to a tiny repro.
+//! Run with LLVM SanitizerCoverage instrumentation:
 //!
-//! Run with `cargo run --example buggy_stack`.
+//! `cargo rustc --example buggy_stack -- -Cpasses=sancov-module \
+//! -Cllvm-args=-sanitizer-coverage-level=3 \
+//! -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
+//! -Cllvm-args=-sanitizer-coverage-pc-table \
+//! -Cllvm-args=-sanitizer-coverage-trace-compares`
+//!
+//! `./target/debug/examples/buggy_stack`
 
-use iterator_fuzz::{CaseIteratorExt, Fuzzer, Step};
-use rand::{
-    Rng,
-    distr::{Distribution, StandardUniform},
-};
+use iterator_fuzz::{cautious, curious};
+use rand::Rng;
+use std::collections::VecDeque;
+
+const DISCOVERY_CASES: usize = 8_192;
+const MINIMIZATION_CASES: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     Push(i32),
     Pop,
-    Reverse,
+    Flip,
+    Spill,
+    Flush,
+    Save,
+    Restore,
 }
 
-impl Distribution<Op> for StandardUniform {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Op {
-        match rng.random_range(0..3) {
-            0 => Op::Push(rng.random_range(0..10)),
+fn sample(rng: &mut impl Rng) -> Vec<Op> {
+    let len = usize::from(rng.random::<u8>() % 80);
+
+    (0..len)
+        .map(|_| match rng.random::<u8>() % 7 {
+            0 => Op::Push(i32::from(rng.random::<u8>() % 16)),
             1 => Op::Pop,
-            _ => Op::Reverse,
-        }
-    }
+            2 => Op::Flip,
+            3 => Op::Spill,
+            4 => Op::Flush,
+            5 => Op::Save,
+            _ => Op::Restore,
+        })
+        .collect()
 }
 
-/// The model: a `Vec<i32>` that actually reverses on `Reverse`.
-#[derive(Debug, Default)]
-struct ModelStack(Vec<i32>);
-
-impl ModelStack {
-    fn push(&mut self, v: i32) {
-        self.0.push(v);
-    }
-    fn pop(&mut self) -> Option<i32> {
-        self.0.pop()
-    }
-    fn reverse(&mut self) {
-        self.0.reverse();
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Model {
+    stack: Vec<i32>,
+    spill: Vec<i32>,
+    saved: Option<(Vec<i32>, Vec<i32>)>,
 }
 
-/// The buggy implementation: keeps a `reversed` flag but `pop` ignores it.
-#[derive(Debug, Default)]
-struct LazyReverseStack {
-    data: Vec<i32>,
-    reversed: bool,
-}
-
-impl LazyReverseStack {
-    fn push(&mut self, v: i32) {
-        if self.reversed {
-            self.data.insert(0, v);
-        } else {
-            self.data.push(v);
-        }
-    }
-    fn pop(&mut self) -> Option<i32> {
-        // BUG: should be `if self.reversed { self.data.remove(0) ... }`.
-        self.data.pop()
-    }
-    fn reverse(&mut self) {
-        self.reversed = !self.reversed;
-    }
-}
-
-#[derive(Debug, Default)]
-struct Harness {
-    model: ModelStack,
-    buggy: LazyReverseStack,
-}
-
-fn apply(h: &mut Harness, step: Step<'_, Op>) -> Result<(), String> {
-    match *step.op() {
-        Op::Push(v) => {
-            h.model.push(v);
-            h.buggy.push(v);
-        }
-        Op::Pop => {
-            let expected = h.model.pop();
-            let actual = h.buggy.pop();
-            if expected != actual {
-                return Err(format!(
-                    "step {}: pop returned {actual:?}, expected {expected:?}",
-                    step.index()
-                ));
+impl Model {
+    fn apply(&mut self, op: Op) -> Option<i32> {
+        match op {
+            Op::Push(value) => self.stack.push(value),
+            Op::Pop => return self.stack.pop(),
+            Op::Flip => self.stack.reverse(),
+            Op::Spill => {
+                if let Some(value) = self.stack.pop() {
+                    self.spill.push(value);
+                }
+            }
+            Op::Flush => self.stack.extend(self.spill.drain(..).rev()),
+            Op::Save => self.saved = Some((self.stack.clone(), self.spill.clone())),
+            Op::Restore => {
+                if let Some((stack, spill)) = &self.saved {
+                    self.stack.clone_from(stack);
+                    self.spill.clone_from(spill);
+                }
             }
         }
-        Op::Reverse => {
-            h.model.reverse();
-            h.buggy.reverse();
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Actual {
+    deque: VecDeque<i32>,
+    spill: Vec<i32>,
+    reversed: bool,
+    saved: Option<(VecDeque<i32>, Vec<i32>, bool)>,
+}
+
+impl Actual {
+    fn logical_stack(&self) -> Vec<i32> {
+        if self.reversed {
+            self.deque.iter().rev().copied().collect()
+        } else {
+            self.deque.iter().copied().collect()
         }
     }
+
+    fn apply(&mut self, op: Op) -> Option<i32> {
+        match op {
+            Op::Push(value) if self.reversed => self.deque.push_front(value),
+            Op::Push(value) => self.deque.push_back(value),
+            Op::Pop if self.reversed => return self.deque.pop_front(),
+            Op::Pop => return self.deque.pop_back(),
+            Op::Flip => self.reversed = !self.reversed,
+            Op::Spill => {
+                if let Some(value) = self.apply(Op::Pop) {
+                    self.spill.push(value);
+                }
+            }
+            Op::Flush => {
+                while let Some(value) = self.spill.pop() {
+                    self.apply(Op::Push(value));
+                }
+            }
+            Op::Save => self.saved = Some((self.deque.clone(), self.spill.clone(), self.reversed)),
+            Op::Restore => {
+                if let Some((deque, spill, _reversed)) = &self.saved {
+                    self.deque.clone_from(deque);
+                    self.spill.clone_from(spill);
+                    // BUG: restore forgets to restore orientation.
+                }
+            }
+        }
+        None
+    }
+}
+
+fn check_stack(ops: &[Op]) -> Result<(), String> {
+    let mut model = Model {
+        stack: Vec::new(),
+        spill: Vec::new(),
+        saved: None,
+    };
+    let mut actual = Actual {
+        deque: VecDeque::new(),
+        spill: Vec::new(),
+        reversed: false,
+        saved: None,
+    };
+
+    for (index, op) in ops.iter().copied().enumerate() {
+        let expected = model.apply(op);
+        let actual_value = actual.apply(op);
+        if actual_value != expected {
+            return Err(format!(
+                "op {index} returned {actual_value:?}, expected {expected:?}: {ops:?}"
+            ));
+        }
+    }
+
+    let actual_stack = actual.logical_stack();
+    if actual_stack != model.stack {
+        return Err(format!(
+            "final stack {actual_stack:?}, expected {:?}: {ops:?}",
+            model.stack
+        ));
+    }
+
+    if actual.spill != model.spill {
+        return Err(format!(
+            "spill {:?}, expected {:?}: {ops:?}",
+            actual.spill, model.spill
+        ));
+    }
+
     Ok(())
 }
 
-/// `Reverse` is the operation we suspect of being load-bearing in the bug, so make it cheap so
-/// the reducer keeps it; make `Pop` slightly costlier so it prefers shorter pop-trails.
-fn cost(op: &Op) -> u64 {
-    match op {
-        Op::Reverse => 1,
-        Op::Push(_) => 1,
-        Op::Pop => 2,
-    }
-}
-
 fn main() {
-    let bug = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(256)
-        .steps(64)
-        .minimized_failures(Harness::default, apply, cost)
-        .next();
-
-    match bug {
-        None => println!("no bug found in 256 seeds × 64 ops"),
-        Some(bug) => {
-            println!("seed {} failed:", bug.seed());
-            println!(
-                "  original {} ops -> minimized to {} ops",
-                bug.ops().len(),
-                bug.minimized_ops().len()
-            );
-            println!("  minimized repro:");
-            for (i, op) in bug.minimized_ops().iter().enumerate() {
-                println!("    {i}: {op:?}");
+    // Maximize code coverage between when rng is created and dropped in the body of the loop, to increase the chance of hitting the bug.
+    for mut rng in curious().take(DISCOVERY_CASES) {
+        let ops = sample(&mut rng);
+        if let Err(_err) = check_stack(&ops) {
+            let case = rng.fork_case();
+            let _coverage = rng.coverage().expect("finish discovery coverage");
+            // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
+            let mut cautious = cautious().with_case(case);
+            let mut best = None;
+            for mut variant in cautious.by_ref().take(MINIMIZATION_CASES) {
+                let ops = sample(&mut variant);
+                if let Err(error) = check_stack(&ops) {
+                    let coverage = variant.coverage().expect("finish minimization coverage");
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_coverage, _, _)| coverage < *best_coverage)
+                    {
+                        best = Some((coverage, ops, error));
+                    }
+                } else {
+                    // exclude this from the minimization search space, since it doesn't trigger the bug.
+                    variant.discard();
+                }
             }
-            println!("  minimized error: {}", bug.minimized_error());
+
+            if let Some((coverage, ops, failure)) = best {
+                println!(
+                    "found stack bug with {} features and {} bytes: {:?}\nerror: {}",
+                    coverage.feature_count(),
+                    coverage.bytes_consumed(),
+                    ops,
+                    failure
+                );
+                return;
+            }
         }
     }
 }

@@ -1,54 +1,21 @@
 use crate::*;
-use rand::{
-    Rng,
-    distr::{Distribution, StandardUniform},
+use rand::{Rng, RngCore};
+use std::{
+    cell::RefCell,
+    panic::{AssertUnwindSafe, catch_unwind},
+    rc::Rc,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
-    Read(usize),
-    Subscribe(usize),
-    Reset(usize),
-    PointTo(usize),
-    Write(usize),
-    Peek,
-}
-
-impl Distribution<Op> for StandardUniform {
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Op {
-        match rng.random_range(0..6) {
-            0 => Op::Read(rng.random_range(0..CONTEXTS)),
-            1 => Op::Subscribe(rng.random_range(0..CONTEXTS)),
-            2 => Op::Reset(rng.random_range(0..CONTEXTS)),
-            3 => Op::PointTo(rng.random_range(0..SIGNALS)),
-            4 => Op::Write(rng.random_range(0..SIGNALS)),
-            _ => Op::Peek,
-        }
-    }
-}
-
-const SIGNALS: usize = 3;
-const CONTEXTS: usize = 3;
+mod sancov;
 
 #[derive(Debug, Clone)]
 struct TestCapture {
     next_id: u64,
-    fail_finish: bool,
 }
 
 impl TestCapture {
     fn new() -> Self {
-        Self {
-            next_id: 1,
-            fail_finish: false,
-        }
-    }
-
-    fn failing() -> Self {
-        Self {
-            next_id: 1,
-            fail_finish: true,
-        }
+        Self { next_id: 1 }
     }
 }
 
@@ -61,807 +28,1005 @@ impl CoverageCapture for TestCapture {
         Ok(id)
     }
 
-    fn finish_capture(
-        &mut self,
-        token: Self::Token,
-        outcome: Result<(), String>,
-    ) -> Result<CoverageEvaluation, String> {
-        if self.fail_finish {
-            return Err("coverage failed".to_string());
-        }
-        Ok(CoverageEvaluation::from_outcome(
-            outcome,
-            [CoverageId(token)].into_iter().collect(),
+    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String> {
+        Ok(ExecutionFeedback::from_features(
+            [CoverageId::new(token)].into_iter().collect(),
         ))
     }
 }
 
 #[derive(Debug, Clone)]
-struct ForwardingModel {
-    current_signal: usize,
-    signal_values: [i32; SIGNALS],
-    wrapper_subscribers: [bool; CONTEXTS],
-    dirty_counts: [usize; CONTEXTS],
+struct ScriptedCapture {
+    next_token: usize,
+    coverages: Vec<Vec<u64>>,
+    hit_count_weights: Vec<u64>,
+    dictionary: Vec<Vec<u8>>,
+    finished: Rc<RefCell<Vec<usize>>>,
+    discarded: Rc<RefCell<Vec<usize>>>,
 }
 
-impl ForwardingModel {
+#[derive(Debug)]
+struct ParallelScriptedCapture {
+    next_instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    instance: u64,
+    finished: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl ParallelScriptedCapture {
     fn new() -> Self {
         Self {
-            current_signal: 0,
-            signal_values: [0, 10, 20],
-            wrapper_subscribers: [false; CONTEXTS],
-            dirty_counts: [0; CONTEXTS],
+            next_instance: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            instance: 0,
+            finished: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
-    fn read(&mut self, context: usize) -> i32 {
-        self.wrapper_subscribers[context] = true;
-        self.peek()
-    }
-
-    fn subscribe(&mut self, context: usize) {
-        self.wrapper_subscribers[context] = true;
-    }
-
-    fn reset(&mut self, context: usize) {
-        self.wrapper_subscribers[context] = false;
-    }
-
-    fn point_to(&mut self, signal: usize) {
-        self.current_signal = signal;
-    }
-
-    fn write(&mut self, signal: usize) {
-        self.signal_values[signal] += 1;
-        if signal == self.current_signal {
-            for context in 0..CONTEXTS {
-                if self.wrapper_subscribers[context] {
-                    self.dirty_counts[context] += 1;
-                }
-            }
-        }
-    }
-
-    fn peek(&self) -> i32 {
-        self.signal_values[self.current_signal]
+    fn finished(&self) -> std::sync::Arc<std::sync::Mutex<Vec<u64>>> {
+        std::sync::Arc::clone(&self.finished)
     }
 }
 
-#[derive(Debug, Clone)]
-struct BuggyForwardingImpl {
-    current_signal: usize,
-    forwarding_signal: usize,
-    signal_values: [i32; SIGNALS],
-    wrapper_subscribers: [bool; CONTEXTS],
-    dirty_counts: [usize; CONTEXTS],
-}
-
-impl BuggyForwardingImpl {
-    fn new() -> Self {
+impl Clone for ParallelScriptedCapture {
+    fn clone(&self) -> Self {
         Self {
-            current_signal: 0,
-            forwarding_signal: 0,
-            signal_values: [0, 10, 20],
-            wrapper_subscribers: [false; CONTEXTS],
-            dirty_counts: [0; CONTEXTS],
+            next_instance: std::sync::Arc::clone(&self.next_instance),
+            instance: self
+                .next_instance
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            finished: std::sync::Arc::clone(&self.finished),
         }
-    }
-
-    fn read(&mut self, context: usize) -> i32 {
-        self.forwarding_signal = self.current_signal;
-        self.wrapper_subscribers[context] = true;
-        self.peek()
-    }
-
-    fn subscribe(&mut self, context: usize) {
-        self.forwarding_signal = self.current_signal;
-        self.wrapper_subscribers[context] = true;
-    }
-
-    fn reset(&mut self, context: usize) {
-        self.wrapper_subscribers[context] = false;
-    }
-
-    fn point_to(&mut self, signal: usize) {
-        self.current_signal = signal;
-        // Bug: retargeting should also clear/repoint forwarding state.
-    }
-
-    fn write(&mut self, signal: usize) {
-        self.signal_values[signal] += 1;
-        if signal == self.forwarding_signal {
-            for context in 0..CONTEXTS {
-                if self.wrapper_subscribers[context] {
-                    self.dirty_counts[context] += 1;
-                }
-            }
-        }
-    }
-
-    fn peek(&self) -> i32 {
-        self.signal_values[self.current_signal]
     }
 }
 
-#[derive(Debug, Clone)]
-struct ForwardingHarness {
-    model: ForwardingModel,
-    implementation: BuggyForwardingImpl,
+impl CoverageCapture for ParallelScriptedCapture {
+    type Token = u64;
+
+    fn start_capture(&mut self) -> Result<Self::Token, String> {
+        Ok(self.instance)
+    }
+
+    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String> {
+        self.finished.lock().expect("finished lock").push(token);
+        Ok(ExecutionFeedback::from_features(
+            [CoverageId::new(token)].into_iter().collect(),
+        ))
+    }
 }
 
-impl ForwardingHarness {
-    fn new() -> Self {
+impl ParallelCoverageCapture for ParallelScriptedCapture {}
+
+impl ScriptedCapture {
+    fn new(coverages: impl IntoIterator<Item = impl IntoIterator<Item = u64>>) -> Self {
         Self {
-            model: ForwardingModel::new(),
-            implementation: BuggyForwardingImpl::new(),
-        }
-    }
-}
-
-fn apply_forwarding_step(
-    state: &mut ForwardingHarness,
-    step: Step<'_, Op>,
-) -> Result<(), String> {
-    let index = step.index;
-    let op = *step.op;
-
-    match op {
-        Op::Read(context) => {
-            let expected = state.model.read(context);
-            let actual = state.implementation.read(context);
-            if actual != expected {
-                return Err(format!(
-                    "step {index}, op {op:?}: read {actual}, expected {expected}"
-                ));
-            }
-        }
-        Op::Subscribe(context) => {
-            state.model.subscribe(context);
-            state.implementation.subscribe(context);
-        }
-        Op::Reset(context) => {
-            state.model.reset(context);
-            state.implementation.reset(context);
-        }
-        Op::PointTo(signal) => {
-            state.model.point_to(signal);
-            state.implementation.point_to(signal);
-        }
-        Op::Write(signal) => {
-            state.model.write(signal);
-            state.implementation.write(signal);
-        }
-        Op::Peek => {
-            let expected = state.model.peek();
-            let actual = state.implementation.peek();
-            if actual != expected {
-                return Err(format!(
-                    "step {index}, op {op:?}: peeked {actual}, expected {expected}"
-                ));
-            }
+            next_token: 0,
+            coverages: coverages
+                .into_iter()
+                .map(|coverage| coverage.into_iter().collect())
+                .collect(),
+            hit_count_weights: Vec::new(),
+            dictionary: Vec::new(),
+            finished: Rc::new(RefCell::new(Vec::new())),
+            discarded: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
-    if state.implementation.dirty_counts != state.model.dirty_counts {
-        return Err(format!(
-            "step {index}, op {op:?}: dirty {:?}, expected {:?}",
-            state.implementation.dirty_counts, state.model.dirty_counts
-        ));
+    fn with_hit_count_weights(mut self, weights: impl IntoIterator<Item = u64>) -> Self {
+        self.hit_count_weights = weights.into_iter().collect();
+        self
     }
 
-    Ok(())
-}
+    fn with_dictionary(mut self, dictionary: impl IntoIterator<Item = impl Into<Vec<u8>>>) -> Self {
+        self.dictionary = dictionary.into_iter().map(Into::into).collect();
+        self
+    }
 
-fn check_forwarding_model(ops: &[Op]) -> Result<(), String> {
-    replay_ops(ops, ForwardingHarness::new, apply_forwarding_step)
-}
+    fn finished(&self) -> Rc<RefCell<Vec<usize>>> {
+        Rc::clone(&self.finished)
+    }
 
-fn op_cost(op: &Op) -> u64 {
-    match op {
-        Op::Peek => 10,
-        Op::Reset(_) => 3,
-        Op::Read(_) | Op::Subscribe(_) | Op::PointTo(_) | Op::Write(_) => 1,
+    fn discarded(&self) -> Rc<RefCell<Vec<usize>>> {
+        Rc::clone(&self.discarded)
     }
 }
 
-#[test]
-fn reducer_removes_unnecessary_mutations() {
-    let ops = [
-        Op::Peek,
-        Op::Read(0),
-        Op::PointTo(1),
-        Op::Reset(1),
-        Op::Write(0),
-        Op::Write(1),
-    ];
+impl CoverageCapture for ScriptedCapture {
+    type Token = usize;
 
-    let minimized = reduce_with_cost(&ops, &op_cost, |candidate| {
-        check_forwarding_model(candidate).is_err()
-    });
+    fn start_capture(&mut self) -> Result<Self::Token, String> {
+        let token = self.next_token;
+        self.next_token += 1;
+        Ok(token)
+    }
 
-    assert_eq!(minimized, [Op::Read(0), Op::PointTo(1), Op::Write(1)]);
+    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String> {
+        self.finished.borrow_mut().push(token);
+        let coverage = self
+            .coverages
+            .get(token)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(CoverageId::new)
+            .collect();
+        let mut feedback =
+            ExecutionFeedback::from_features(coverage).with_dictionary(self.dictionary.clone());
+        if let Some(weight) = self.hit_count_weights.get(token) {
+            feedback = feedback.with_hit_count_weight(*weight);
+        }
+        Ok(feedback)
+    }
+
+    fn discard_capture(&mut self, token: Self::Token) -> Result<(), String> {
+        self.discarded.borrow_mut().push(token);
+        Ok(())
+    }
+}
+
+fn sample_byte(mut rng: impl Rng) -> u8 {
+    rng.random()
+}
+
+fn assert_byte(_sample: u8) {}
+
+fn fork_case_with_trace_len(len: usize) -> Case {
+    let mut runner = curious().with_coverage(ScriptedCapture::new([[1]]));
+    let mut rng = runner.next().expect("case source rng");
+    let mut bytes = vec![0; len];
+    rng.fill_bytes(&mut bytes);
+    rng.fork_case()
 }
 
 #[test]
-fn reducer_accepts_user_provided_transforms() {
-    let ops = [Op::Read(2), Op::Write(2)];
+fn curious_yields_rng_and_records_on_drop() {
+    let mut curious = curious().with_coverage(TestCapture::new());
 
-    let minimized = reduce_with_cost_and_transforms(
-        &ops,
-        &|op: &Op| match op {
-            Op::Read(index) | Op::Write(index) => 1 + *index as u64,
-            _ => 10,
-        },
-        |candidate| matches!(candidate, [Op::Read(a), Op::Write(b)] if a == b),
-        |candidate: &[Op], emit: &mut dyn FnMut(Vec<Op>)| {
-            if matches!(candidate, [Op::Read(a), Op::Write(b)] if a == b && *a != 0) {
-                emit(vec![Op::Read(0), Op::Write(0)]);
-            }
-        },
-    );
-
-    assert_eq!(minimized, [Op::Read(0), Op::Write(0)]);
-}
-
-#[test]
-fn coverage_delta_tracks_new_ids() {
-    let mut global = CoverageSet::new();
-    global.insert(CoverageId(1));
-
-    let mut candidate = CoverageSet::new();
-    candidate.insert(CoverageId(1));
-    candidate.insert(CoverageId(2));
-
-    let delta = coverage_delta(&global, &candidate);
-    assert_eq!(delta.iter().collect::<Vec<_>>(), [CoverageId(2)]);
-    assert!(is_coverage_interesting(&global, &candidate, false));
-    assert!(is_coverage_interesting(&global, &global, true));
-    assert!(!is_coverage_interesting(&global, &global, false));
-}
-
-#[test]
-fn materialize_cases_preserves_seed_and_ops() {
-    let case: InputCase<Op> = Fuzzer::sequences(StandardUniform)
-        .base_seed(42)
-        .seeds(1)
-        .steps(4)
-        .materialize_cases()
-        .next()
-        .expect("one materialized case");
-
-    assert_eq!(case.seed, Some(42));
-    assert_eq!(case.parent, None);
-    assert_eq!(case.depth, 0);
-    assert_eq!(case.ops.len(), 4);
-}
-
-#[test]
-fn measure_coverage_yields_measured_cases_in_order() {
-    let measured: Vec<_> = Fuzzer::sequences(StandardUniform)
-        .base_seed(10)
-        .seeds(2)
-        .steps(1)
-        .materialize_cases()
-        .measure_coverage(|ops: &[Op]| {
-            let mut coverage = CoverageSet::new();
-            coverage.insert(CoverageId(ops.len() as u64));
-            Ok(CoverageEvaluation::pass(coverage))
-        })
-        .collect::<Result<_, _>>()
-        .expect("coverage evaluation should pass");
-
-    assert_eq!(measured.len(), 2);
-    assert_eq!(measured[0].case.seed, Some(10));
-    assert_eq!(measured[1].case.seed, Some(11));
-    assert_eq!(measured[0].evaluation.coverage.len(), 1);
-}
-
-#[test]
-fn maximize_coverage_filters_duplicates_and_accepts_failures() {
-    let cases = vec![
-        Ok(MeasuredCase {
-            case: CoverageCase::root(Some(0), vec![Op::Peek]),
-            evaluation: CoverageEvaluation::pass([CoverageId(1)].into_iter().collect()),
-        }),
-        Ok(MeasuredCase {
-            case: CoverageCase::root(Some(1), vec![Op::Peek]),
-            evaluation: CoverageEvaluation::pass([CoverageId(1)].into_iter().collect()),
-        }),
-        Ok(MeasuredCase {
-            case: CoverageCase::root(Some(2), vec![Op::Peek]),
-            evaluation: CoverageEvaluation::fail("boom", CoverageSet::new()),
-        }),
-    ];
-
-    let accepted: Vec<_> = cases
-        .into_iter()
-        .maximize_coverage()
-        .collect::<Result<_, _>>()
-        .expect("maximizer should not error");
-
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[0].seed, Some(0));
-    assert_eq!(accepted[0].unique_coverage.len(), 1);
-    assert_eq!(accepted[1].seed, Some(2));
-    assert!(accepted[1].is_failure());
-}
-
-#[test]
-fn coverage_guided_reports_measurement_errors() {
-    let mut explorer = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(1)
-        .steps(1)
-        .materialize::<Op>()
-        .explore_coverage(TestCapture::failing());
-
-    let case = explorer
-        .next()
-        .expect("one generated case")
-        .expect("case should start");
-    let error = case.finish().expect_err("measurement should fail");
-
-    assert_eq!(error, "coverage failed");
-    assert_eq!(explorer.stats().executed, 1);
-    assert_eq!(explorer.stats().errors, 1);
-    assert_eq!(explorer.stats().accepted, 0);
-}
-
-#[test]
-fn reducer_preserves_arbitrary_predicate_with_transforms() {
-    let ops = [Op::Read(2), Op::Write(2)];
-
-    let minimized = reduce_preserving_with_transforms(
-        &ops,
-        &|op: &Op| match op {
-            Op::Read(index) | Op::Write(index) => 1 + *index as u64,
-            _ => 10,
-        },
-        |candidate| matches!(candidate, [Op::Read(a), Op::Write(b)] if a == b),
-        |candidate: &[Op], emit: &mut dyn FnMut(Vec<Op>)| {
-            if matches!(candidate, [Op::Read(a), Op::Write(b)] if a == b && *a != 0) {
-                emit(vec![Op::Read(0), Op::Write(0)]);
-            }
-        },
-    );
-
-    assert_eq!(minimized, [Op::Read(0), Op::Write(0)]);
-}
-
-#[test]
-fn lazy_case_regenerates_same_ops() {
-    let case = Fuzzer::sequences(StandardUniform)
-        .base_seed(123)
-        .seeds(1)
-        .steps(5)
-        .into_iter()
-        .next()
-        .expect("one case requested");
-
-    assert_eq!(case.steps, 5);
-    let first: Vec<Op> = case.ops();
-    let second: Vec<Op> = case.ops();
-    assert_eq!(
-        first, second,
-        "ops() must be deterministic for the same seed"
-    );
-    assert_eq!(first.len(), 5);
-
-    let streamed: Vec<Op> = case.iter_ops().collect();
-    assert_eq!(streamed, first);
-}
-
-#[test]
-fn iterator_driven_failure_minimizes() {
-    let mut minimized: Option<Vec<Op>> = None;
-
-    for case in Fuzzer::sequences(StandardUniform)
-        .base_seed(7)
-        .seeds(128)
-        .steps(64)
     {
-        if case
-            .replay(ForwardingHarness::new, apply_forwarding_step)
-            .is_err()
-        {
-            let ops = case.ops();
-            let reduced = reduce_with_cost(&ops, &op_cost, |candidate| {
-                replay_ops(candidate, ForwardingHarness::new, apply_forwarding_step).is_err()
-            });
-            minimized = Some(reduced);
-            break;
-        }
+        let mut rng = curious.next().expect("first rng");
+        let _ = rng.random::<u64>();
     }
 
-    let minimized = minimized.expect("the stale model should fail within these seeds");
-    assert!(!minimized.is_empty());
-    assert!(check_forwarding_model(&minimized).is_err());
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 1);
+    assert_eq!(stats.executed(), 1);
+    assert_eq!(stats.accepted(), 1);
+    assert_eq!(stats.coverage_ids(), 1);
 }
 
 #[test]
-fn check_yields_one_per_case_in_order() {
-    let base_seed = 100;
-    let seeds: u64 = 5;
-    let steps = 8;
-
-    let checked: Vec<_> = Fuzzer::sequences(StandardUniform)
-        .base_seed(base_seed)
-        .seeds(seeds)
-        .steps(steps)
-        .check(|| (), |_: &mut (), _: Step<'_, Op>| Ok(()))
-        .collect();
-
-    assert_eq!(checked.len() as u64, seeds);
-    for (i, c) in checked.iter().enumerate() {
-        assert_eq!(c.case.seed, base_seed + i as u64);
-        assert_eq!(c.case.steps, steps);
-        assert!(c.outcome.is_ok());
-    }
-}
-
-#[test]
-fn failures_filters_to_failing_cases() {
-    let failures: Vec<_> = Fuzzer::sequences(StandardUniform)
-        .base_seed(7)
-        .seeds(128)
-        .steps(64)
-        .failures(ForwardingHarness::new, apply_forwarding_step)
-        .collect();
-
-    assert!(
-        !failures.is_empty(),
-        "the stale model should fail within these seeds"
-    );
-    for failed in &failures {
-        assert!(!failed.error.is_empty());
-        assert!(check_forwarding_model(&failed.ops).is_err());
-    }
-}
-
-#[test]
-fn minimize_produces_smaller_failing_repro() {
-    let minimized = Fuzzer::sequences(StandardUniform)
-        .base_seed(7)
-        .seeds(128)
-        .steps(64)
-        .minimized_failures(ForwardingHarness::new, apply_forwarding_step, op_cost)
-        .next()
-        .expect("the stale model should fail within these seeds");
-
-    assert!(minimized.minimized_ops.len() <= minimized.ops.len());
-    assert!(!minimized.minimized_ops.is_empty());
-    assert!(check_forwarding_model(&minimized.minimized_ops).is_err());
-    assert_eq!(minimized.minimized_error, {
-        replay_ops(
-            &minimized.minimized_ops,
-            ForwardingHarness::new,
-            apply_forwarding_step,
-        )
-        .unwrap_err()
-    });
-}
-
-#[test]
-fn pipeline_is_lazy() {
-    let mut produced = 0usize;
-    let one = Fuzzer::sequences(StandardUniform)
-        .base_seed(7)
-        .seeds(10_000)
-        .steps(64)
-        .into_iter()
-        .inspect(|_| produced += 1)
-        .minimized_failures(ForwardingHarness::new, apply_forwarding_step, op_cost)
-        .next();
-
-    assert!(one.is_some(), "expected at least one failure");
-    assert!(
-        produced < 10_000,
-        "pipeline materialized {produced} cases; should short-circuit far earlier"
-    );
-}
-
-#[test]
-fn check_to_failures_threads_closures() {
-    let via_check: Vec<_> = Fuzzer::sequences(StandardUniform)
-        .base_seed(7)
-        .seeds(32)
-        .steps(64)
-        .check(ForwardingHarness::new, apply_forwarding_step)
-        .failures::<Op>()
-        .map(|f| (f.seed, f.error))
-        .collect();
-
-    let direct: Vec<_> = Fuzzer::sequences(StandardUniform)
-        .base_seed(7)
-        .seeds(32)
-        .steps(64)
-        .failures(ForwardingHarness::new, apply_forwarding_step)
-        .map(|f| (f.seed, f.error))
-        .collect();
-
-    assert_eq!(via_check, direct);
-    assert!(!via_check.is_empty());
-}
-
-#[test]
-fn coverage_guided_yields_new_coverage() {
-    let mut explorer = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(32)
-        .steps(8)
-        .materialize::<Op>()
-        .explore_coverage(TestCapture::new());
-
-    for _ in 0..6 {
-        let case = explorer
-            .next()
-            .expect("case")
-            .expect("coverage case should start");
-        case.finish().expect("coverage evaluation should pass");
-    }
-    let accepted = explorer.corpus();
-
-    assert!(!accepted.is_empty());
-    let mut seen = CoverageSet::new();
-    for case in accepted {
-        assert!(!case.unique_coverage.is_empty());
-        assert!(case.unique_coverage.is_subset(&case.coverage));
-        for id in case.unique_coverage.iter() {
-            assert!(!seen.contains(&id));
-        }
-        seen.extend(case.coverage.iter());
-    }
-}
-
-#[test]
-fn coverage_guided_evaluates_initial_cases_before_generated_seeds() {
-    let roots = vec![
-        InputCase::root(None, vec![Op::Peek]),
-        InputCase::root(None, vec![Op::Read(0), Op::Write(0)]),
-    ];
-    let mut explorer = roots
-        .into_iter()
-        .chain(
-            Fuzzer::sequences(StandardUniform)
-                .base_seed(0)
-                .seeds(1)
-                .steps(1)
-                .materialize(),
-        )
-        .explore_coverage(TestCapture::new())
-        .seed_ratio(1);
-
-    for _ in 0..2 {
-        let case = explorer
-            .next()
-            .expect("case")
-            .expect("coverage case should start");
-        case.finish().expect("coverage evaluation should pass");
-    }
-    let accepted = explorer.corpus();
-
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[0].ops, vec![Op::Peek]);
-    assert_eq!(accepted[1].ops, vec![Op::Read(0), Op::Write(0)]);
-    assert_eq!(accepted[0].seed, None);
-    assert_eq!(accepted[1].seed, None);
-    assert_eq!(accepted[0].parent, None);
-    assert_eq!(accepted[1].parent, None);
-    assert_eq!(explorer.stats().generated, 2);
-}
-
-#[test]
-fn coverage_guided_mutates_accepted_cases() {
-    let mut explorer = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(1)
-        .steps(1)
-        .materialize::<Op>()
-        .explore_coverage(TestCapture::new())
-        .mutate(|ops: &[Op], emit: &mut dyn FnMut(Vec<Op>)| {
-            let mut candidate = ops.to_vec();
-            candidate.push(Op::Peek);
-            emit(candidate);
-        })
-        .mutate_depth(1);
-
-    for _ in 0..2 {
-        let case = explorer
-            .next()
-            .expect("case")
-            .expect("coverage case should start");
-        case.finish().expect("coverage evaluation should pass");
-    }
-    let accepted = explorer.corpus();
-
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[1].parent, Some(accepted[0].id));
-    assert_eq!(accepted[1].depth, 1);
-}
-
-#[test]
-fn coverage_guided_returns_to_seed_stream_between_mutations() {
-    let mut explorer = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(2)
-        .steps(1)
-        .materialize::<Op>()
-        .explore_coverage(TestCapture::new())
-        .mutate(|ops: &[Op], emit: &mut dyn FnMut(Vec<Op>)| {
-            let mut candidate = ops.to_vec();
-            candidate.push(Op::Peek);
-            emit(candidate);
-        })
-        .mutate_depth(1)
-        .seed_ratio(2);
+fn cautious_accepts_first_seed_then_smaller_code_paths() {
+    let case = fork_case_with_trace_len(8);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([
+            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
+            vec![1, 2],
+        ]))
+        .with_case(case);
 
     for _ in 0..3 {
-        let case = explorer
-            .next()
-            .expect("case")
-            .expect("coverage case should start");
-        case.finish().expect("coverage evaluation should pass");
+        let mut rng = cautious.next().expect("cautious rng");
+        let mut bytes = [0; 8];
+        rng.fill_bytes(&mut bytes);
     }
-    let accepted = explorer.corpus();
 
-    assert_eq!(accepted.len(), 3);
-    assert_eq!(accepted[0].seed, Some(0));
-    assert_eq!(accepted[1].parent, Some(accepted[0].id));
-    assert_eq!(accepted[2].seed, Some(1));
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), 3);
+    assert_eq!(stats.executed(), 3);
+    assert_eq!(stats.accepted(), 3);
+    assert_eq!(stats.coverage_ids(), 2);
+    assert_eq!(cautious.test_best_path_score(), Some((2, 2, 8)));
 }
 
 #[test]
-fn coverage_guided_energy_concentrates_on_rare_features() {
-    // A capture that gives root 0 a rare feature and root 1 a common one. Subsequent
-    // executions only hit the common feature, so frequency for `COMMON` grows
-    // unboundedly while `RARE` stays at 1. Entropic energy should drive nearly all
-    // mutation samples to root 0 once the run is warm.
-    const RARE: u64 = 1;
-    const COMMON: u64 = 2;
+fn fuzzing_style_map_sample_for_each_assert_records_each_iteration() {
+    let mut curious = curious().with_coverage(ScriptedCapture::new([[1], [2], [3]]));
 
-    #[derive(Debug, Clone)]
-    struct LabelledCapture {
-        next_seq: u64,
+    curious
+        .by_ref()
+        .take(3)
+        .map(sample_byte)
+        .for_each(assert_byte);
+
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 3);
+    assert_eq!(stats.executed(), 3);
+    assert_eq!(stats.accepted(), 3);
+    assert_eq!(stats.coverage_ids(), 3);
+    assert_eq!(stats.mutated(), 2);
+}
+
+#[test]
+#[allow(clippy::never_loop)]
+fn fuzzing_style_assert_panic_still_finishes_capture_in_default_mode() {
+    let capture = ScriptedCapture::new([[1]]);
+    let finished = capture.finished();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        curious()
+            .with_coverage(capture)
+            .take(1)
+            .map(sample_byte)
+            .for_each(|_| panic!("invariant failed"));
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(*finished.borrow(), [0]);
+}
+
+#[test]
+fn variant_discard_consumes_and_excludes_coverage() {
+    let capture = ScriptedCapture::new([[1], [2]]);
+    let finished = capture.finished();
+    let discarded = capture.discarded();
+    let mut curious = curious().with_coverage(capture);
+
+    {
+        let rng = curious.next().expect("first rng");
+        rng.discard();
     }
-    impl CoverageCapture for LabelledCapture {
-        type Token = u64;
-        fn start_capture(&mut self) -> Result<Self::Token, String> {
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            Ok(seq)
-        }
-        fn finish_capture(
-            &mut self,
-            token: Self::Token,
-            outcome: Result<(), String>,
-        ) -> Result<CoverageEvaluation, String> {
-            let mut coverage = CoverageSet::new();
-            match token {
-                0 => {
-                    coverage.insert(CoverageId(RARE));
-                    coverage.insert(CoverageId(1_000));
-                }
-                _ => {
-                    coverage.insert(CoverageId(COMMON));
-                }
-            }
-            Ok(CoverageEvaluation::from_outcome(outcome, coverage))
-        }
+    drop(curious.next().expect("second rng"));
+
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.executed(), 2);
+    assert_eq!(stats.accepted(), 1);
+    assert_eq!(*finished.borrow(), [1]);
+    assert_eq!(*discarded.borrow(), [0]);
+}
+
+#[test]
+fn variant_coverage_consumes_and_reports_feature_and_byte_counts() {
+    let capture = ScriptedCapture::new([vec![1, 2, 3]]);
+    let finished = capture.finished();
+    let mut curious = curious().with_coverage(capture);
+
+    let coverage = {
+        let mut rng = curious.next().expect("first rng");
+        let mut bytes = [0; 5];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish coverage")
+    };
+
+    assert_eq!(coverage, CaseCoverage::new(3, 3, 5));
+    assert_eq!(*finished.borrow(), [0]);
+
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 1);
+    assert_eq!(stats.executed(), 1);
+    assert_eq!(stats.accepted(), 1);
+    assert_eq!(stats.coverage_ids(), 3);
+}
+
+#[test]
+fn fork_case_replays_consumed_rng_path() {
+    let mut discovery = curious().with_coverage(ScriptedCapture::new([[1]]));
+    let (case, original) = {
+        let mut rng = discovery.next().expect("discovery rng");
+        let bytes = [rng.random::<u8>(), rng.random::<u8>(), rng.random::<u8>()];
+        (rng.fork_case(), bytes)
+    };
+
+    let mut rng = case.replay();
+    let replayed = [rng.random::<u8>(), rng.random::<u8>(), rng.random::<u8>()];
+
+    assert_eq!(replayed, original);
+}
+
+#[test]
+fn fork_case_replays_consumed_rng_paths_longer_than_mutation_prefix_limit() {
+    let len = 5000;
+    let mut discovery = curious()
+        .with_coverage(ScriptedCapture::new([[1]]))
+        .with_seed(99);
+    let (case, original) = {
+        let mut rng = discovery.next().expect("discovery rng");
+        let mut bytes = vec![0; len];
+        rng.fill_bytes(&mut bytes);
+        (rng.fork_case(), bytes)
+    };
+
+    let mut replay = cautious()
+        .with_coverage(ScriptedCapture::new([[1]]))
+        .with_case(case);
+    let replayed = {
+        let mut rng = replay.next().expect("cautious replay rng");
+        let mut bytes = vec![0; len];
+        rng.fill_bytes(&mut bytes);
+        bytes
+    };
+
+    assert_eq!(replayed, original);
+}
+
+#[test]
+fn cautious_with_case_replays_word_rng_path() {
+    let mut discovery = curious()
+        .with_coverage(ScriptedCapture::new([[1]]))
+        .with_seed(99);
+    let (case, original) = {
+        let mut rng = discovery.next().expect("discovery rng");
+        let mut bytes = [0; 7];
+        rng.fill_bytes(&mut bytes);
+        let values = (
+            bytes,
+            rng.random::<u16>(),
+            rng.random::<u32>(),
+            rng.random::<u64>(),
+            rng.random_range(0..1000u32),
+        );
+        (rng.fork_case(), values)
+    };
+
+    let mut replay = cautious()
+        .with_coverage(ScriptedCapture::new([[1]]))
+        .with_case(case);
+    let replayed = {
+        let mut rng = replay.next().expect("cautious replay rng");
+        let mut bytes = [0; 7];
+        rng.fill_bytes(&mut bytes);
+        (
+            bytes,
+            rng.random::<u16>(),
+            rng.random::<u32>(),
+            rng.random::<u64>(),
+            rng.random_range(0..1000u32),
+        )
+    };
+
+    assert_eq!(replayed, original);
+}
+
+#[test]
+fn seeded_cases_run_before_fresh_roots() {
+    let mut source = curious()
+        .with_seed(123)
+        .with_coverage(ScriptedCapture::new([[1]]));
+    let (case, seeded_bytes) = {
+        let mut rng = source.next().expect("source rng");
+        let bytes = [rng.random::<u8>(), rng.random::<u8>()];
+        (rng.fork_case(), bytes)
+    };
+    let fresh_bytes = {
+        let mut fresh = curious()
+            .with_seed(5)
+            .with_coverage(ScriptedCapture::new([[1]]));
+        let mut rng = fresh.next().expect("fresh rng");
+        [rng.random::<u8>(), rng.random::<u8>()]
+    };
+
+    let mut curious = curious()
+        .with_seed(5)
+        .with_coverage(ScriptedCapture::new([[1], [2]]))
+        .with_case(case);
+
+    let first = {
+        let mut rng = curious.next().expect("seeded rng");
+        let bytes = [rng.random::<u8>(), rng.random::<u8>()];
+        rng.discard();
+        bytes
+    };
+    let second = {
+        let mut rng = curious.next().expect("fresh rng");
+        [rng.random::<u8>(), rng.random::<u8>()]
+    };
+
+    assert_eq!(first, seeded_bytes);
+    assert_eq!(second, fresh_bytes);
+}
+
+#[test]
+fn cautious_without_case_yields_no_variants() {
+    let mut cautious = cautious().with_coverage(ScriptedCapture::new([[1]]));
+
+    assert!(cautious.next().is_none());
+    assert_eq!(cautious.stats().generated(), 0);
+}
+
+#[test]
+fn fuzzing_style_maximize_accepts_only_new_coverage() {
+    let mut curious = curious().with_coverage(ScriptedCapture::new([vec![1], vec![1], vec![1, 2]]));
+
+    curious
+        .by_ref()
+        .take(3)
+        .map(sample_byte)
+        .for_each(assert_byte);
+
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 3);
+    assert_eq!(stats.executed(), 3);
+    assert_eq!(stats.accepted(), 2);
+    assert_eq!(stats.coverage_ids(), 2);
+    assert_eq!(stats.mutated(), 2);
+}
+
+#[test]
+fn cautious_accepts_smaller_code_paths() {
+    let case = fork_case_with_trace_len(8);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([
+            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
+            vec![1, 2],
+            vec![1],
+        ]))
+        .with_case(case);
+
+    for mut rng in cautious.by_ref().take(4) {
+        let _ = sample_byte(&mut rng);
     }
 
-    let mut explorer = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(2)
-        .steps(1)
-        .materialize::<Op>()
-        .explore_coverage(LabelledCapture { next_seq: 0 })
-        .mutate(|ops: &[Op], emit: &mut dyn FnMut(Vec<Op>)| {
-            let mut candidate = ops.to_vec();
-            candidate.push(Op::Peek);
-            emit(candidate);
-        })
-        .mutate_depth(1)
-        .seed_ratio(4)
-        .rng_seed(0xC0FFEE);
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), 4);
+    assert_eq!(stats.executed(), 4);
+    assert_eq!(stats.accepted(), 4);
+    assert_eq!(stats.coverage_ids(), 1);
+    assert_eq!(stats.mutated(), 3);
+    assert_eq!(cautious.test_best_path_score(), Some((1, 1, 4)));
+}
 
-    for _ in 0..2 {
-        let case = explorer
-            .next()
-            .expect("seed case")
-            .expect("seed should start");
-        case.finish().expect("seed should pass");
+#[test]
+fn cautious_rejects_discarded_smaller_paths() {
+    let capture = ScriptedCapture::new([vec![1, 2, 3], vec![1]]);
+    let finished = capture.finished();
+    let discarded = capture.discarded();
+    let case = fork_case_with_trace_len(8);
+    let mut cautious = cautious().with_coverage(capture).with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("first rng");
+        let _ = sample_byte(&mut rng);
     }
-    assert_eq!(explorer.corpus().len(), 2);
+    {
+        let mut rng = cautious.next().expect("second rng");
+        let _ = sample_byte(&mut rng);
+        rng.discard();
+    }
 
-    let mut lineage_rare = 0usize;
-    let mut lineage_common = 0usize;
-    for _ in 0..400 {
-        let case = explorer.next().expect("more cases").expect("case starts");
-        let parent = case.meta().parent;
-        case.finish().expect("case passes");
-        match parent {
-            Some(0) => lineage_rare += 1,
-            Some(1) => lineage_common += 1,
-            _ => {}
-        }
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.executed(), 2);
+    assert_eq!(stats.accepted(), 1);
+    assert_eq!(stats.coverage_ids(), 3);
+    assert_eq!(*finished.borrow(), [0]);
+    assert_eq!(*discarded.borrow(), [1]);
+}
+
+#[test]
+fn cautious_havoc_keeps_generating_byte_variants() {
+    let case = fork_case_with_trace_len(4);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..32).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+    }
+
+    let mut variants = 0;
+    for mut rng in cautious.by_ref().take(64) {
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        rng.discard();
+        variants += 1;
+    }
+
+    assert_eq!(variants, 64, "cautious should keep producing byte variants");
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), variants + 1);
+    assert_eq!(stats.executed(), variants + 1);
+    assert_eq!(stats.accepted(), 1);
+}
+
+#[test]
+fn cautious_best_neighbors_try_structural_shrinks_before_byte_budget_is_exhausted() {
+    let case = Case::from_raw_parts(0, vec![255; 80], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..16).map(|_| vec![1])))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        let mut bytes = [0; 80];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish seed coverage");
+    }
+
+    let mut saw_structural_shrink = false;
+    for mut rng in cautious.by_ref().take(8) {
+        let mut bytes = [0; 80];
+        rng.fill_bytes(&mut bytes);
+        saw_structural_shrink |= bytes[79] == 0;
+        rng.discard();
     }
 
     assert!(
-        lineage_rare > lineage_common * 4,
-        "rare-feature root should dominate the weighted sample: \
-         lineage_rare={lineage_rare}, lineage_common={lineage_common}"
+        saw_structural_shrink,
+        "best-neighbor queue should try prefix deletion/truncation before byte shrinks can exhaust it"
     );
 }
 
 #[test]
-fn coverage_guided_rejects_overlapping_active_cases() {
-    let mut explorer = Fuzzer::sequences(StandardUniform)
-        .base_seed(0)
-        .seeds(2)
-        .steps(1)
-        .materialize::<Op>()
-        .explore_coverage(TestCapture::new());
+fn cautious_best_neighbors_try_small_word_targets() {
+    let case = Case::from_raw_parts(0, vec![44, 1, 0, 0], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
+        .with_case(case);
 
-    let case = explorer
-        .next()
-        .expect("case")
-        .expect("first case should start");
-    let error = match explorer.next().expect("overlap error") {
-        Ok(_) => panic!("second case should be rejected while first is alive"),
-        Err(error) => error,
-    };
-    assert!(error.contains("previous case is alive"));
-    drop(case);
+    {
+        let mut rng = cautious.next().expect("seed rng");
+        let len = rng.random::<u16>() % 512;
+        assert_eq!(len, 300);
+        rng.coverage().expect("finish seed coverage");
+    }
 
-    let case = explorer
-        .next()
-        .expect("case after drop")
-        .expect("case should start after previous drop");
-    case.finish().expect("coverage evaluation should pass");
+    let mut found = false;
+    for mut rng in cautious.by_ref().take(64) {
+        let len = rng.random::<u16>() % 512;
+        if len == 11 {
+            rng.coverage().expect("finish word-shrunk coverage");
+            found = true;
+            break;
+        }
+        rng.discard();
+    }
+
+    assert!(
+        found,
+        "best-neighbor queue should try small little-endian word targets directly"
+    );
 }
 
-#[cfg(feature = "rayon")]
-mod parallel_tests {
-    use super::*;
-    use crate::parallel::ParCaseIteratorExt;
-    use rayon::iter::ParallelIterator;
+#[test]
+fn cautious_entropic_scheduler_raises_energy_for_rare_removed_coverage() {
+    let initial = fork_case_with_trace_len(8);
+    let smaller = fork_case_with_trace_len(4);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1, 2, 3]]))
+        .with_case(initial);
 
-    #[test]
-    fn par_finds_a_failure() {
-        let bug = Fuzzer::sequences(StandardUniform)
-            .base_seed(7)
-            .seeds(128)
-            .steps(64)
-            .par()
-            .minimized_failures(ForwardingHarness::new, apply_forwarding_step, op_cost)
-            .find_any(|_| true)
-            .expect("the stale model should fail within these seeds");
-
-        assert!(bug.minimized_ops.len() <= bug.ops.len());
-        assert!(!bug.minimized_ops.is_empty());
-        assert!(check_forwarding_model(&bug.minimized_ops).is_err());
+    {
+        let mut rng = cautious.next().expect("initial failing rng");
+        let mut bytes = [0; 8];
+        rng.fill_bytes(&mut bytes);
     }
 
-    #[test]
-    fn par_failures_set_matches_serial() {
-        let serial: std::collections::BTreeSet<u64> = Fuzzer::sequences(StandardUniform)
-            .base_seed(7)
-            .seeds(64)
-            .steps(64)
-            .failures(ForwardingHarness::new, apply_forwarding_step)
-            .map(|f| f.seed)
-            .collect();
-
-        let parallel: std::collections::BTreeSet<u64> = Fuzzer::sequences(StandardUniform)
-            .base_seed(7)
-            .seeds(64)
-            .steps(64)
-            .par()
-            .failures(ForwardingHarness::new, apply_forwarding_step)
-            .map(|f| f.seed)
-            .collect();
-
-        assert!(!serial.is_empty());
-        assert_eq!(serial, parallel);
+    for _ in 0..64 {
+        let mut rng = cautious.next().expect("scheduled variant");
+        let mut bytes = [0; 8];
+        rng.fill_bytes(&mut bytes);
+        rng.discard();
     }
+
+    cautious = cautious.with_case(smaller);
+    {
+        let mut rng = cautious.next().expect("smaller failing rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+    }
+
+    let energies = cautious.test_corpus_energies();
+    assert_eq!(energies.len(), 2);
+    assert!(
+        energies[1] > energies[0] * 2.0,
+        "candidate that removes previously sticky coverage should have higher schedule energy: {energies:?}"
+    );
+}
+
+#[test]
+fn cautious_gives_rare_removed_coverage_more_energy_than_common_removed_coverage() {
+    let case = fork_case_with_trace_len(8);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([
+            vec![1, 2, 3, 4],
+            vec![1, 2, 3],
+            vec![1, 2, 3],
+            vec![1, 2, 3],
+            vec![1, 3, 4],
+        ]))
+        .with_case(case);
+
+    for _ in 0..5 {
+        let mut rng = cautious.next().expect("cautious rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+    }
+
+    let energies = cautious.test_corpus_energies();
+    assert_eq!(energies.len(), 5);
+    assert!(
+        energies[4] > energies[3] * 2.0,
+        "rare removed feature should have more energy than repeatedly removed feature: {energies:?}"
+    );
+}
+
+#[test]
+fn cautious_minimizes_feature_count_before_rng_bytes() {
+    let case = fork_case_with_trace_len(8);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1, 2], vec![1, 2, 3]]))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("first rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+    }
+    {
+        let mut rng = cautious.next().expect("second rng");
+        let mut bytes = [0; 1];
+        rng.fill_bytes(&mut bytes);
+    }
+
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.executed(), 2);
+    assert_eq!(stats.accepted(), 2);
+    assert_eq!(cautious.test_best_path_score(), Some((2, 2, 4)));
+    assert_eq!(cautious.test_corpus_path_lens(), [4, 1]);
+}
+
+#[test]
+fn cautious_minimizes_hit_count_weight_before_rng_bytes() {
+    let first = Case::from_raw_parts(0, vec![1], true);
+    let second = Case::from_raw_parts(0, vec![1, 2, 3, 4], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1], vec![1]]).with_hit_count_weights([10, 1]))
+        .with_case(first)
+        .with_case(second);
+
+    {
+        let mut rng = cautious.next().expect("first rng");
+        let mut bytes = [0; 1];
+        rng.fill_bytes(&mut bytes);
+    }
+    {
+        let mut rng = cautious.next().expect("second rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+    }
+
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.executed(), 2);
+    assert_eq!(stats.accepted(), 2);
+    assert_eq!(cautious.test_best_path_score(), Some((1, 1, 4)));
+}
+
+#[test]
+fn cautious_uses_rng_bytes_as_feature_count_tie_breaker() {
+    let case = fork_case_with_trace_len(8);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1], vec![1]]))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("first rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+    }
+    {
+        let mut rng = cautious.next().expect("second rng");
+        let mut bytes = [0; 2];
+        rng.fill_bytes(&mut bytes);
+    }
+
+    let stats = cautious.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.executed(), 2);
+    assert_eq!(stats.accepted(), 2);
+    assert_eq!(cautious.test_best_path_score(), Some((1, 1, 2)));
+    assert_eq!(cautious.test_corpus_path_lens(), [4, 2]);
+}
+
+fn sample_modulo_len_payload(rng: &mut impl Rng) -> usize {
+    let len = (rng.random::<u16>() % 64) as usize;
+    let mut payload = vec![0; len];
+    rng.fill_bytes(&mut payload);
+    len
+}
+
+#[test]
+fn cautious_minimizes_word_modulo_length_prefix() {
+    let mut prefix = vec![63, 0, 0, 0];
+    prefix.extend(std::iter::repeat_n(0, 63));
+    let case = Case::from_raw_parts(0, prefix, true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new((0..128).map(|_| vec![1])))
+        .with_case(case);
+
+    let mut best_len = usize::MAX;
+    for _ in 0..128 {
+        let Some(mut rng) = cautious.next() else {
+            break;
+        };
+        let len = sample_modulo_len_payload(&mut rng);
+        if len == 0 {
+            rng.discard();
+            continue;
+        }
+
+        rng.coverage().expect("finish cautious modulo candidate");
+        best_len = best_len.min(len);
+    }
+
+    assert_eq!(best_len, 1);
+}
+
+#[test]
+fn fuzzing_style_reuses_and_mutates_successful_rng_prefixes() {
+    let mut curious = curious().with_coverage(ScriptedCapture::new([[1], [2], [3], [4]]));
+    let samples: Vec<_> = curious
+        .by_ref()
+        .take(4)
+        .map(|mut rng| [rng.random::<u8>(), rng.random::<u8>(), rng.random::<u8>()])
+        .collect();
+
+    let stats = curious.stats();
+    assert_eq!(stats.executed(), 4);
+    assert_eq!(stats.accepted(), 4);
+    assert_eq!(stats.mutated(), 3);
+    assert_ne!(
+        samples[0], samples[1],
+        "after the first accepted case, subsequent samples should come from mutated RNG prefixes"
+    );
+}
+
+#[test]
+fn entropic_scheduler_raises_energy_for_rare_coverage() {
+    let mut coverages = vec![vec![1, 100], vec![1, 2]];
+    coverages.extend((0..70).map(|_| vec![1, 2]));
+    let mut curious = curious().with_coverage(ScriptedCapture::new(coverages));
+
+    curious
+        .by_ref()
+        .take(72)
+        .map(sample_byte)
+        .for_each(assert_byte);
+
+    let energies = curious.test_corpus_energies();
+    assert_eq!(energies.len(), 2);
+    assert!(
+        energies[0] > energies[1] * 2.0,
+        "rare-feature corpus entry should have higher entropic energy: {energies:?}"
+    );
+    assert_eq!(curious.test_feature_frequency(CoverageId::new(100)), 1);
+    assert!(curious.test_feature_frequency(CoverageId::new(2)) > 60);
+}
+
+#[test]
+fn mutate_depth_stacks_prefix_mutations() {
+    let mut shallow = curious()
+        .with_seed(7)
+        .with_coverage(ScriptedCapture::new([[1], [2]]))
+        .with_mutate_depth(1);
+    let shallow_samples: Vec<_> = shallow
+        .by_ref()
+        .take(2)
+        .map(|mut rng| {
+            let mut bytes = [0; 16];
+            rng.fill_bytes(&mut bytes);
+            bytes
+        })
+        .collect();
+
+    let mut deep = curious()
+        .with_seed(7)
+        .with_coverage(ScriptedCapture::new([[1], [2]]))
+        .with_mutate_depth(5);
+    let deep_samples: Vec<_> = deep
+        .by_ref()
+        .take(2)
+        .map(|mut rng| {
+            let mut bytes = [0; 16];
+            rng.fill_bytes(&mut bytes);
+            bytes
+        })
+        .collect();
+
+    assert_eq!(shallow_samples[0], deep_samples[0]);
+    assert_ne!(
+        shallow_samples[1], deep_samples[1],
+        "stacking more prefix mutations should change the generated neighbourhood"
+    );
+}
+
+#[test]
+fn dictionary_mutation_can_insert_comparison_constants() {
+    let mut prefix = vec![1, 2, 3];
+    crate::iter::test_dictionary_mutation(&mut prefix, &[vec![0x13, 0x37]]);
+
+    assert!(prefix.windows(2).any(|window| window == [0x13, 0x37]));
+}
+
+#[test]
+fn cautious_merges_dictionary_values_from_failing_corpus() {
+    let case = fork_case_with_trace_len(4);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([[1]]).with_dictionary([vec![0x13, 0x37]]))
+        .with_case(case);
+
+    {
+        let mut rng = cautious.next().expect("initial cautious rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage().expect("finish cautious dictionary case");
+    }
+
+    assert_eq!(cautious.test_dictionary_values(), vec![vec![0x13, 0x37]]);
+}
+
+#[test]
+fn fresh_root_cadence_keeps_exploring_unmutated_roots() {
+    let mut curious = curious()
+        .with_coverage(ScriptedCapture::new((0..9).map(|id| vec![id + 1])))
+        .with_seed_ratio(8);
+
+    curious
+        .by_ref()
+        .take(9)
+        .map(sample_byte)
+        .for_each(assert_byte);
+
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 9);
+    assert_eq!(stats.accepted(), 9);
+    assert_eq!(stats.mutated(), 7);
+}
+
+#[test]
+fn cases_take_can_feed_rayon_parallel_iterator() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let executed: usize = curious()
+        .with_coverage(NoCoverage)
+        .with_seed(7)
+        .take(32)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            rng.coverage().expect("finish parallel case");
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 32);
+}
+
+#[test]
+fn parallel_iterator_uses_independent_capture_instances() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let capture = ParallelScriptedCapture::new();
+    let finished = capture.finished();
+    let executed: usize = curious()
+        .with_coverage(capture)
+        .with_seed(7)
+        .take(32)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            rng.coverage().expect("finish parallel case");
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 32);
+    let mut instances = finished.lock().expect("finished lock").clone();
+    instances.sort_unstable();
+    instances.dedup();
+    assert!(
+        instances.len() > 1,
+        "parallel capture should not reuse one shared capture instance"
+    );
+}
+
+#[test]
+fn sampling_body_runs_concurrently_through_native_parallel_iterator() {
+    use rayon::{
+        ThreadPoolBuilder,
+        iter::{IntoParallelIterator, ParallelIterator},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("build rayon pool");
+
+    pool.install(|| {
+        curious()
+            .with_coverage(NoCoverage)
+            .with_seed(7)
+            .take(32)
+            .into_par_iter()
+            .for_each(|mut rng| {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+
+                thread::sleep(Duration::from_millis(20));
+                let _: u8 = rng.random();
+
+                active.fetch_sub(1, Ordering::SeqCst);
+                rng.coverage().expect("finish parallel case");
+            });
+    });
+
+    assert!(max_active.load(Ordering::SeqCst) > 1);
+}
+
+#[test]
+fn cautious_seeded_case_can_feed_native_parallel_iterator() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let case = fork_case_with_trace_len(4);
+    let executed: usize = cautious()
+        .with_coverage(ParallelScriptedCapture::new())
+        .with_case(case)
+        .take(32)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            rng.coverage().expect("finish parallel cautious case");
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 32);
+}
+
+#[test]
+fn default_sancov_parallel_iterator_requires_trace_pc_guard() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let validation = SancovCoverage::new().validate_parallel();
+    if !crate::sancov::has_trace_pc_guards() {
+        let error = validation.expect_err("non-guard Sancov coverage should reject parallel use");
+        assert!(
+            error.contains("trace-pc-guard"),
+            "parallel validation error should mention trace-pc-guard: {error}"
+        );
+        return;
+    }
+
+    validation.expect("trace-pc-guard instrumentation should allow parallel Sancov coverage");
+    let executed: usize = curious()
+        .with_seed(7)
+        .take(1)
+        .into_par_iter()
+        .map(|mut rng| {
+            let _: u8 = rng.random();
+            1
+        })
+        .sum();
+
+    assert_eq!(executed, 1);
+}
+
+#[test]
+fn llvm_coverage_fuzzing_style_workflow_runs_when_instrumented() {
+    let Ok(mut curious) = curious().llvm_coverage() else {
+        return;
+    };
+
+    curious
+        .by_ref()
+        .take(2)
+        .map(sample_byte)
+        .for_each(assert_byte);
+
+    let stats = curious.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.executed(), 2);
 }
