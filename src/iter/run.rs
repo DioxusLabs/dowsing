@@ -1,7 +1,8 @@
 use super::{
     mutate::{choose_corpus_index, havoc_prefix, mutate_prefix, refresh_corpus_energies},
     prelude::{
-        CandidateOrigin, Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore, Mode, State,
+        CandidateOrigin, CaseCost, Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore, Mode,
+        State,
     },
     rng::CaseRng,
     shrink::{energy_refresh_interval, next_cautious_reduction},
@@ -410,10 +411,15 @@ pub(super) fn min_path_schedule_energy(
         / (candidate.hit_count_weight + 1) as f64)
         .min(1.0)
         .sqrt();
+    let cost_quality = case_cost_quality(best.case_cost, candidate.case_cost).powi(3);
     let simplicity_quality = ((best.nonzero_bytes + 1) as f64
         / (candidate.nonzero_bytes + 1) as f64)
         .min(1.0)
         .sqrt();
-    let quality = byte_quality * feature_quality * hit_quality * simplicity_quality;
+    let quality = cost_quality * byte_quality * feature_quality * hit_quality * simplicity_quality;
     ((rarity + 1.0) * quality).max(0.01)
+}
+
+fn case_cost_quality(best: CaseCost, candidate: CaseCost) -> f64 {
+    (best.get().saturating_add(1) as f64 / candidate.get().saturating_add(1) as f64).min(1.0)
 }

@@ -16,7 +16,7 @@ pub use coverage::{
     CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback, ParallelCoverageCapture,
 };
 pub use iter::{
-    Case, CaseCoverage, CaseRng, Cases, Cautious, CautiousOptions, Curious, NoCoverage,
+    Case, CaseCost, CaseCoverage, CaseRng, Cases, Cautious, CautiousOptions, Curious, NoCoverage,
     ParallelCases, SearchStats, SemanticKind, SequenceElement, SequenceMap, TakeRange, cautious,
     curious,
 };

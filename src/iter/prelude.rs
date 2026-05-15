@@ -269,22 +269,76 @@ impl Default for CautiousOptions {
     }
 }
 
-/// Coverage and path-size stats for one completed [`crate::CaseRng`] execution.
+/// Domain-specific cost for one valid generated value.
+///
+/// Lower costs are better. `cautious()` uses this before coverage and RNG-path size when the
+/// caller finishes a reproducing case with [`crate::CaseRng::coverage_with_cost`]. This lets a
+/// harness keep invalid or non-reproducing cases out of the corpus with [`crate::CaseRng::discard`]
+/// while still telling the minimizer which reproducing values are smaller in the harness domain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CaseCost(usize);
+
+impl CaseCost {
+    /// Build the neutral cost used by [`crate::CaseRng::coverage`].
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+
+    /// Build a cost from a domain-specific value. Lower is better.
+    pub const fn new(cost: usize) -> Self {
+        Self(cost)
+    }
+
+    /// Return the raw cost value.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for CaseCost {
+    fn from(value: usize) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Coverage, path-size, and domain-cost stats for one completed [`crate::CaseRng`] execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CaseCoverage {
+    pub(crate) case_cost: CaseCost,
     pub(crate) feature_count: usize,
     pub(crate) hit_count_weight: u64,
     pub(crate) bytes_consumed: usize,
 }
 
 impl CaseCoverage {
-    /// Build coverage stats from all observed parts.
+    /// Build coverage stats with the neutral domain cost.
     pub const fn new(feature_count: usize, hit_count_weight: u64, bytes_consumed: usize) -> Self {
+        Self::with_cost(
+            CaseCost::zero(),
+            feature_count,
+            hit_count_weight,
+            bytes_consumed,
+        )
+    }
+
+    /// Build coverage stats from all observed parts.
+    pub const fn with_cost(
+        case_cost: CaseCost,
+        feature_count: usize,
+        hit_count_weight: u64,
+        bytes_consumed: usize,
+    ) -> Self {
         Self {
+            case_cost,
             feature_count,
             hit_count_weight,
             bytes_consumed,
         }
+    }
+
+    /// Domain-specific cost supplied by the harness.
+    pub const fn case_cost(self) -> CaseCost {
+        self.case_cost
     }
 
     /// Number of unique coverage features observed during the execution.
@@ -312,11 +366,13 @@ impl PartialOrd for CaseCoverage {
 impl Ord for CaseCoverage {
     fn cmp(&self, other: &Self) -> Ordering {
         (
+            self.case_cost,
             self.feature_count,
             self.hit_count_weight,
             self.bytes_consumed,
         )
             .cmp(&(
+                other.case_cost,
                 other.feature_count,
                 other.hit_count_weight,
                 other.bytes_consumed,
@@ -406,6 +462,7 @@ pub(super) struct CorpusSeed {
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) coverage: Vec<CoverageId>,
     pub(super) removed: Vec<CoverageId>,
+    pub(super) case_cost: CaseCost,
     pub(super) score: usize,
     pub(super) hit_count_weight: u64,
     pub(super) path_len: usize,
@@ -415,6 +472,7 @@ pub(super) struct CorpusSeed {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct MinPathScore {
+    pub(super) case_cost: CaseCost,
     pub(super) features: usize,
     pub(super) hit_count_weight: u64,
     pub(super) bytes: usize,
@@ -608,13 +666,15 @@ pub(super) enum ReductionOp {
 }
 
 impl MinPathScore {
-    pub(super) fn with_nonzero_bytes(
+    pub(super) fn with_case_cost(
+        case_cost: CaseCost,
         feature_count: usize,
         hit_count_weight: u64,
         bytes_consumed: usize,
         nonzero_bytes: usize,
     ) -> Self {
         Self {
+            case_cost,
             features: feature_count,
             hit_count_weight,
             bytes: bytes_consumed,

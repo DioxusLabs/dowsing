@@ -455,7 +455,8 @@ pub(super) fn refresh_corpus_energies<Capture: CoverageCapture>(state: &mut Stat
                         state.stats.accepted,
                         best,
                         &entry.removed,
-                        MinPathScore::with_nonzero_bytes(
+                        MinPathScore::with_case_cost(
+                            entry.case_cost,
                             entry.score,
                             entry.hit_count_weight,
                             entry.path_len,

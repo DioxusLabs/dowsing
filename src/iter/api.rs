@@ -197,7 +197,8 @@ impl<Capture: CoverageCapture> Engine<Capture> {
             .corpus
             .iter()
             .min_by_key(|entry| {
-                MinPathScore::with_nonzero_bytes(
+                MinPathScore::with_case_cost(
+                    entry.case_cost,
                     entry.score,
                     entry.hit_count_weight,
                     entry.path_len,
@@ -205,6 +206,15 @@ impl<Capture: CoverageCapture> Engine<Capture> {
                 )
             })
             .map(|entry| (entry.score, entry.hit_count_weight, entry.path_len))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_best_case_cost(&self) -> Option<super::prelude::CaseCost> {
+        self.shared
+            .lock()
+            .expect("search state poisoned")
+            .min_path_best
+            .map(|score| score.case_cost)
     }
 
     #[cfg(test)]
@@ -241,6 +251,39 @@ impl<Capture: CoverageCapture> Engine<Capture> {
             state.cautious_reducer.range_pressure.clone(),
             state.cautious_reducer.exhausted,
         )
+    }
+}
+
+impl<Capture> Clone for Engine<Capture>
+where
+    Capture: CoverageCapture,
+{
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<Capture> Clone for Curious<Capture>
+where
+    Capture: CoverageCapture,
+{
+    fn clone(&self) -> Self {
+        Self {
+            engine: self.engine.clone(),
+        }
+    }
+}
+
+impl<Capture> Clone for Cautious<Capture>
+where
+    Capture: CoverageCapture,
+{
+    fn clone(&self) -> Self {
+        Self {
+            engine: self.engine.clone(),
+        }
     }
 }
 
@@ -427,6 +470,11 @@ impl<Capture: CoverageCapture> Cautious<Capture> {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_best_case_cost(&self) -> Option<super::prelude::CaseCost> {
+        self.engine.test_best_case_cost()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_best_nonzero_bytes(&self) -> Option<usize> {
         self.engine.test_best_nonzero_bytes()
     }
@@ -539,7 +587,7 @@ where
     }
 
     fn opt_len(&self) -> Option<usize> {
-        Some(self.limit)
+        None
     }
 }
 

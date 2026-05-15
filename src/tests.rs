@@ -669,6 +669,41 @@ fn cautious_minimizes_feature_count_before_rng_bytes() {
 }
 
 #[test]
+fn cautious_minimizes_case_cost_before_coverage_features() {
+    let larger_coverage = Case::from_raw_parts(0, vec![1, 2, 3, 4], true);
+    let smaller_coverage = Case::from_raw_parts(0, vec![1], true);
+    let mut cautious = cautious()
+        .with_coverage(ScriptedCapture::new([vec![1, 2, 3], vec![1]]))
+        .with_cases([larger_coverage, smaller_coverage]);
+
+    {
+        let mut rng = cautious.next().expect("first rng");
+        let mut bytes = [0; 4];
+        rng.fill_bytes(&mut bytes);
+        let coverage = rng
+            .coverage_with_cost(CaseCost::new(1))
+            .expect("finish first case");
+        assert_eq!(coverage.case_cost(), CaseCost::new(1));
+    }
+    {
+        let mut rng = cautious.next().expect("second rng");
+        let mut bytes = [0; 1];
+        rng.fill_bytes(&mut bytes);
+        rng.coverage_with_cost(CaseCost::new(2))
+            .expect("finish second case");
+    }
+
+    assert_eq!(cautious.test_best_case_cost(), Some(CaseCost::new(1)));
+    assert_eq!(cautious.test_best_path_score(), Some((3, 3, 4)));
+}
+
+#[test]
+fn case_cost_orders_lower_values_first() {
+    assert!(CaseCost::new(2) < CaseCost::new(3));
+    assert_eq!(CaseCost::new(2).get(), 2);
+}
+
+#[test]
 fn cautious_minimizes_hit_count_weight_before_rng_bytes() {
     let first = Case::from_raw_parts(0, vec![1], true);
     let second = Case::from_raw_parts(0, vec![1, 2, 3, 4], true);

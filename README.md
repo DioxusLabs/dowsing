@@ -44,6 +44,18 @@ for mut rng in curious().take(128) {
 }
 ```
 
+Valid failing variants can also report a domain-specific cost:
+
+```rust
+let coverage = variant
+    .coverage_with_cost(input.len())
+    .expect("finish minimization coverage");
+```
+
+`cautious()` minimizes this [`CaseCost`](crate::CaseCost) before coverage features and consumed RNG
+bytes. Use it for stable value-level preferences like operation count; keep using `discard()` for
+cases that do not reproduce the target failure.
+
 `curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution is
 accepted, it stores the consumed RNG byte prefix and later mutates accepted prefixes to explore
 nearby inputs.

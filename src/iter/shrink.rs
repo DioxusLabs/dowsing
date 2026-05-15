@@ -1445,7 +1445,8 @@ pub(super) fn prune_corpus<Capture: CoverageCapture>(state: &mut State<Capture>)
             .iter()
             .enumerate()
             .max_by_key(|(_, entry)| {
-                MinPathScore::with_nonzero_bytes(
+                MinPathScore::with_case_cost(
+                    entry.case_cost,
                     entry.score,
                     entry.hit_count_weight,
                     entry.path_len,
@@ -1488,7 +1489,8 @@ fn refresh_min_path_best<Capture: CoverageCapture>(state: &mut State<Capture>) {
         .map(|(index, entry)| {
             (
                 index,
-                MinPathScore::with_nonzero_bytes(
+                MinPathScore::with_case_cost(
+                    entry.case_cost,
                     entry.score,
                     entry.hit_count_weight,
                     entry.path_len,

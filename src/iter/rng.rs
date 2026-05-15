@@ -2,7 +2,7 @@ use super::{
     api::coverage_delta,
     mutate::{corpus_energy, refresh_corpus_energies},
     prelude::{
-        Active, CandidateOrigin, Case, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
+        Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
         MAX_PREFIX_LEN, MinPathScore, Mode, SemanticKind, SemanticSpan, SequenceItemSpan,
         SequenceSpan, State,
     },
@@ -136,12 +136,21 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     /// This consumes the RNG because coverage is only meaningful after the caller has finished
     /// executing the path being measured.
     pub fn coverage(mut self) -> Result<CaseCoverage, String> {
-        self.finish(true)
+        self.finish(true, CaseCost::zero())
+    }
+
+    /// Finish this execution with a domain-specific value cost.
+    ///
+    /// Lower costs are better. In `cautious()` mode the minimizer uses this cost before coverage
+    /// and RNG-path length, so a harness can prefer shorter or simpler reproducing values while
+    /// still rejecting non-reproducing values with [`Self::discard`].
+    pub fn coverage_with_cost(mut self, cost: impl Into<CaseCost>) -> Result<CaseCoverage, String> {
+        self.finish(true, cost.into())
     }
 
     /// Exclude this execution from coverage feedback when the RNG is dropped.
     pub fn discard(mut self) {
-        let _ = self.finish(false);
+        let _ = self.finish(false, CaseCost::zero());
     }
 }
 
@@ -397,7 +406,11 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         }
     }
 
-    fn finish(&mut self, record_coverage: bool) -> Result<CaseCoverage, String> {
+    fn finish(
+        &mut self,
+        record_coverage: bool,
+        case_cost: CaseCost,
+    ) -> Result<CaseCoverage, String> {
         if self.finished {
             return Err("coverage already finished".to_string());
         }
@@ -424,7 +437,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             match outcome {
                 Ok(outcome) => {
                     let mut state = self.shared.lock().expect("search state poisoned");
-                    merge_finished_execution(&mut state, active, outcome)
+                    merge_finished_execution(&mut state, active, outcome, case_cost)
                 }
                 Err(error) => {
                     let mut state = self.shared.lock().expect("search state poisoned");
@@ -442,7 +455,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
                 record_coverage,
             );
             match outcome {
-                Ok(outcome) => merge_finished_execution(&mut state, active, outcome),
+                Ok(outcome) => merge_finished_execution(&mut state, active, outcome, case_cost),
                 Err(error) => {
                     state.stats.executed += 1;
                     state.active_cases = state.active_cases.saturating_sub(1);
@@ -459,7 +472,7 @@ where
 {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.finish(true);
+            let _ = self.finish(true, CaseCost::zero());
         }
     }
 }
@@ -497,6 +510,7 @@ fn merge_finished_execution<Capture>(
     state: &mut State<Capture>,
     active: Active,
     finished: FinishedCapture,
+    case_cost: CaseCost,
 ) -> Result<CaseCoverage, String>
 where
     Capture: CoverageCapture,
@@ -508,20 +522,22 @@ where
         if state.mode == Mode::Cautious {
             record_cautious_discard(state, &active.origin);
         }
-        return Ok(CaseCoverage {
-            feature_count: 0,
-            hit_count_weight: 0,
-            bytes_consumed: active.bytes_consumed,
-        });
+        return Ok(CaseCoverage::with_cost(
+            CaseCost::zero(),
+            0,
+            0,
+            active.bytes_consumed,
+        ));
     };
     merge_dictionary_values(state, feedback.dictionary);
 
     let coverage = feedback.features;
-    let run_coverage = CaseCoverage {
-        feature_count: coverage.len(),
-        hit_count_weight: feedback.hit_count_weight,
-        bytes_consumed: active.bytes_consumed,
-    };
+    let run_coverage = CaseCoverage::with_cost(
+        case_cost,
+        coverage.len(),
+        feedback.hit_count_weight,
+        active.bytes_consumed,
+    );
     let score = run_coverage.feature_count;
     let hit_count_weight = run_coverage.hit_count_weight;
     let path_len = run_coverage.bytes_consumed;
@@ -546,7 +562,7 @@ where
         .then_some(state.min_path_best)
         .flatten();
     let candidate_score =
-        MinPathScore::with_nonzero_bytes(score, hit_count_weight, path_len, nonzero_bytes);
+        MinPathScore::with_case_cost(case_cost, score, hit_count_weight, path_len, nonzero_bytes);
     let improves_best_cautious =
         best_cautious_score.is_none_or(|_| improves_min_path(state, candidate_score, &active));
 
@@ -607,6 +623,7 @@ where
             sequences: active.sequences,
             coverage: coverage_ids,
             removed: removed_ids,
+            case_cost,
             score,
             hit_count_weight,
             path_len,
