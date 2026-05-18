@@ -496,7 +496,7 @@ pub struct ParallelCases<Capture: ParallelCoverageCapture = SancovCoverage> {
 impl<Capture> IntoParallelIterator for Cases<Curious<Capture>>
 where
     Capture: ParallelCoverageCapture,
-    Capture::Token: Send,
+    Capture::Session: Send,
 {
     type Item = CaseRng<Capture>;
     type Iter = ParallelCases<Capture>;
@@ -509,7 +509,7 @@ where
 impl<Capture> IntoParallelIterator for Cases<Cautious<Capture>>
 where
     Capture: ParallelCoverageCapture,
-    Capture::Token: Send,
+    Capture::Session: Send,
 {
     type Item = CaseRng<Capture>;
     type Iter = ParallelCases<Capture>;
@@ -522,7 +522,7 @@ where
 impl<Capture> ParallelIterator for ParallelCases<Capture>
 where
     Capture: ParallelCoverageCapture,
-    Capture::Token: Send,
+    Capture::Session: Send,
 {
     type Item = CaseRng<Capture>;
 
@@ -549,7 +549,7 @@ where
 fn into_parallel_cases<Capture>(engine: Engine<Capture>, limit: usize) -> ParallelCases<Capture>
 where
     Capture: ParallelCoverageCapture,
-    Capture::Token: Send,
+    Capture::Session: Send,
 {
     let capture = engine
         .shared

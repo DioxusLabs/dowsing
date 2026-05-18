@@ -159,21 +159,32 @@ impl From<CoverageSet> for ExecutionFeedback {
     }
 }
 
-pub(crate) const CAPTURE_BUSY: &str = "__dowsing_capture_busy";
+/// Result of attempting to start one coverage capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureStart<Session> {
+    /// Capture started and must be finished or discarded with this session.
+    Started(Session),
+
+    /// The backend is temporarily busy and the caller may retry later.
+    Busy,
+}
 
 /// Starts and finishes coverage capture for one RNG case.
 pub trait CoverageCapture {
-    /// Opaque per-execution token.
-    type Token;
+    /// Opaque per-execution session.
+    type Session;
 
     /// Start capturing coverage.
-    fn start_capture(&mut self) -> Result<Self::Token, String>;
+    ///
+    /// [`CaptureStart::Busy`] represents retryable contention. `Err` represents a backend failure
+    /// that should be surfaced to the caller.
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String>;
 
     /// Finish coverage capture and return the observed feedback.
-    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String>;
+    fn finish_capture(&mut self, session: Self::Session) -> Result<ExecutionFeedback, String>;
 
     /// Discard a capture without reading/exporting its coverage.
-    fn discard_capture(&mut self, _token: Self::Token) -> Result<(), String> {
+    fn discard_capture(&mut self, _session: Self::Session) -> Result<(), String> {
         Ok(())
     }
 }

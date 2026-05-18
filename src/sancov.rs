@@ -1,5 +1,5 @@
 use crate::coverage::{
-    CAPTURE_BUSY, CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback,
+    CaptureStart, CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback,
     ParallelCoverageCapture,
 };
 use std::{
@@ -26,7 +26,7 @@ pub struct SancovCoverage {
 }
 
 #[derive(Debug)]
-pub struct SancovToken {
+pub struct SancovSession {
     _guard: Option<CaptureGuard>,
 }
 
@@ -77,13 +77,16 @@ impl SancovCoverage {
 }
 
 impl CoverageCapture for SancovCoverage {
-    type Token = SancovToken;
+    type Session = SancovSession;
 
-    fn start_capture(&mut self) -> Result<Self::Token, String> {
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
         let guard = if has_guards() {
             None
         } else {
-            Some(try_lock_capture()?)
+            let Some(guard) = try_lock_capture() else {
+                return Ok(CaptureStart::Busy);
+            };
+            Some(guard)
         };
         if guard.is_some() {
             reset_counters();
@@ -92,10 +95,10 @@ impl CoverageCapture for SancovCoverage {
         clear_guard_feedback();
         clear_cmp_feedback();
         set_capture_active(true);
-        Ok(SancovToken { _guard: guard })
+        Ok(CaptureStart::Started(SancovSession { _guard: guard }))
     }
 
-    fn finish_capture(&mut self, _token: Self::Token) -> Result<ExecutionFeedback, String> {
+    fn finish_capture(&mut self, _session: Self::Session) -> Result<ExecutionFeedback, String> {
         set_capture_active(false);
         let guard_mode = has_guards();
         let mut feedback = if guard_mode {
@@ -114,7 +117,7 @@ impl CoverageCapture for SancovCoverage {
         Ok(feedback)
     }
 
-    fn discard_capture(&mut self, _token: Self::Token) -> Result<(), String> {
+    fn discard_capture(&mut self, _session: Self::Session) -> Result<(), String> {
         set_capture_active(false);
         clear_guard_feedback();
         clear_cmp_feedback();
@@ -174,15 +177,15 @@ fn state() -> &'static Mutex<SancovState> {
     STATE.get_or_init(|| Mutex::new(SancovState::default()))
 }
 
-fn try_lock_capture() -> Result<CaptureGuard, String> {
+fn try_lock_capture() -> Option<CaptureGuard> {
     static CAPTURE_LOCK: AtomicBool = AtomicBool::new(false);
     if CAPTURE_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        return Err(CAPTURE_BUSY.to_string());
+        return None;
     }
-    Ok(CaptureGuard(&CAPTURE_LOCK))
+    Some(CaptureGuard(&CAPTURE_LOCK))
 }
 
 fn has_guards() -> bool {

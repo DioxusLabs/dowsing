@@ -1,17 +1,17 @@
-use crate::coverage::{CoverageCapture, ExecutionFeedback, ParallelCoverageCapture};
+use crate::coverage::{CaptureStart, CoverageCapture, ExecutionFeedback, ParallelCoverageCapture};
 
 /// Coverage backend used when callers only want the RNG shape.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoCoverage;
 
 impl CoverageCapture for NoCoverage {
-    type Token = ();
+    type Session = ();
 
-    fn start_capture(&mut self) -> Result<Self::Token, String> {
-        Ok(())
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
+        Ok(CaptureStart::Started(()))
     }
 
-    fn finish_capture(&mut self, _token: Self::Token) -> Result<ExecutionFeedback, String> {
+    fn finish_capture(&mut self, _session: Self::Session) -> Result<ExecutionFeedback, String> {
         Ok(ExecutionFeedback::default())
     }
 }

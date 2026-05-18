@@ -12,7 +12,7 @@ use super::{
     },
 };
 use crate::{
-    coverage::{CAPTURE_BUSY, CoverageCapture, ExecutionFeedback},
+    coverage::{CaptureStart, CoverageCapture, ExecutionFeedback},
     sancov::SancovCoverage,
 };
 use rand::{RngCore, rngs::SmallRng};
@@ -36,7 +36,7 @@ pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
     pub(super) trace: Vec<u8>,
     pub(super) draws: Vec<DrawSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
-    pub(super) token: Option<Capture::Token>,
+    pub(super) session: Option<Capture::Session>,
     pub(super) local_capture: Option<Capture>,
     pub(super) start_error: Option<String>,
     pub(super) finished: bool,
@@ -198,11 +198,11 @@ pub struct ChildRng<'a, Capture: CoverageCapture = SancovCoverage> {
 
 impl<Capture: CoverageCapture> RngCore for ChildRng<'_, Capture> {
     fn next_u32(&mut self) -> u32 {
-        self.shared.rng.borrow_mut().next_u32()
+        rand::rand_core::impls::next_u32_via_fill(self)
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.shared.rng.borrow_mut().next_u64()
+        rand::rand_core::impls::next_u64_via_fill(self)
     }
 
     fn fill_bytes(&mut self, dst: &mut [u8]) {
@@ -302,11 +302,11 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     }
 
     fn ensure_started(&mut self) {
-        if self.finished || self.token.is_some() || self.start_error.is_some() {
+        if self.finished || self.session.is_some() || self.start_error.is_some() {
             return;
         }
         loop {
-            let token = if let Some(capture) = self.local_capture.as_mut() {
+            let session = if let Some(capture) = self.local_capture.as_mut() {
                 capture.start_capture()
             } else {
                 self.shared
@@ -315,12 +315,12 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
                     .capture
                     .start_capture()
             };
-            match token {
-                Ok(token) => {
-                    self.token = Some(token);
+            match session {
+                Ok(CaptureStart::Started(session)) => {
+                    self.session = Some(session);
                     return;
                 }
-                Err(error) if error == CAPTURE_BUSY => {
+                Ok(CaptureStart::Busy) => {
                     std::thread::yield_now();
                 }
                 Err(error) => {
@@ -350,11 +350,11 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             bytes_consumed: self.bytes_consumed,
             origin: self.origin.clone(),
         };
-        let token = self.token.take();
+        let session = self.session.take();
         if let Some(mut capture) = self.local_capture.take() {
             let outcome = finish_capture(
                 &mut capture,
-                token,
+                session,
                 self.start_error.take(),
                 record_coverage,
             );
@@ -374,7 +374,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             let mut state = self.shared.lock().expect("search state poisoned");
             let outcome = finish_capture(
                 &mut state.capture,
-                token,
+                session,
                 self.start_error.take(),
                 record_coverage,
             );
@@ -407,7 +407,7 @@ struct FinishedCapture {
 
 fn finish_capture<Capture>(
     capture: &mut Capture,
-    token: Option<Capture::Token>,
+    session: Option<Capture::Session>,
     start_error: Option<String>,
     record_coverage: bool,
 ) -> Result<FinishedCapture, String>
@@ -415,8 +415,8 @@ where
     Capture: CoverageCapture,
 {
     if !record_coverage {
-        if let Some(token) = token {
-            capture.discard_capture(token)?;
+        if let Some(session) = session {
+            capture.discard_capture(session)?;
         }
         return Ok(FinishedCapture { feedback: None });
     }
@@ -424,9 +424,9 @@ where
     if let Some(error) = start_error {
         return Err(error);
     }
-    let token = token.ok_or_else(|| "coverage capture never started".to_string())?;
+    let session = session.ok_or_else(|| "coverage capture never started".to_string())?;
     Ok(FinishedCapture {
-        feedback: Some(capture.finish_capture(token)?),
+        feedback: Some(capture.finish_capture(session)?),
     })
 }
 

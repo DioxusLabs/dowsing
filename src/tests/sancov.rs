@@ -1,4 +1,8 @@
-use crate::{backends::SancovCoverage, coverage::CoverageCapture};
+use crate::{
+    backends::SancovCoverage,
+    coverage::{CaptureStart, CoverageCapture},
+    sancov::SancovSession,
+};
 
 #[test]
 fn counter_feedback_records_edge_buckets() {
@@ -11,10 +15,10 @@ fn counter_feedback_records_edge_buckets() {
     }
 
     let mut capture = SancovCoverage::new().with_cmp_feedback(false);
-    let token = capture.start_capture().expect("start capture");
+    let session = start_sancov_capture(&mut capture);
     counters[1] = 1;
     counters[2] = 9;
-    let feedback = capture.finish_capture(token).expect("finish capture");
+    let feedback = capture.finish_capture(session).expect("finish capture");
 
     assert!(
         feedback.features().len() >= 2,
@@ -33,9 +37,9 @@ fn counter_feedback_records_edge_buckets() {
 #[test]
 fn comparison_feedback_records_features_and_dictionary_values() {
     let mut capture = SancovCoverage::new();
-    let token = capture.start_capture().expect("start capture");
+    let session = start_sancov_capture(&mut capture);
     crate::sancov::test_record_cmp(1, 0x41, 0x42);
-    let feedback = capture.finish_capture(token).expect("finish capture");
+    let feedback = capture.finish_capture(session).expect("finish capture");
 
     assert!(
         feedback.features().iter().any(|id| id.raw() >> 60 == 1),
@@ -48,12 +52,12 @@ fn comparison_feedback_records_features_and_dictionary_values() {
 #[test]
 fn switch_feedback_records_all_case_values() {
     let mut capture = SancovCoverage::new();
-    let token = capture.start_capture().expect("start capture");
+    let session = start_sancov_capture(&mut capture);
     let cases = [2_u64, 8, 0x41, 0x42];
     unsafe {
         crate::sancov::__sanitizer_cov_trace_switch(0x40, cases.as_ptr());
     }
-    let feedback = capture.finish_capture(token).expect("finish capture");
+    let feedback = capture.finish_capture(session).expect("finish capture");
 
     assert!(
         feedback.features().iter().any(|id| id.raw() >> 60 == 1),
@@ -61,4 +65,13 @@ fn switch_feedback_records_all_case_values() {
     );
     assert!(feedback.dictionary().contains(&vec![0x41]));
     assert!(feedback.dictionary().contains(&vec![0x42]));
+}
+
+fn start_sancov_capture(capture: &mut SancovCoverage) -> SancovSession {
+    loop {
+        match capture.start_capture().expect("start capture") {
+            CaptureStart::Started(session) => return session,
+            CaptureStart::Busy => std::thread::yield_now(),
+        }
+    }
 }

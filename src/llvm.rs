@@ -1,4 +1,4 @@
-use crate::coverage::{CAPTURE_BUSY, CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback};
+use crate::coverage::{CaptureStart, CoverageCapture, CoverageId, CoverageSet, ExecutionFeedback};
 use std::{
     ffi::{CStr, c_char, c_void},
     mem,
@@ -57,21 +57,23 @@ impl LlvmCoverage {
 }
 
 impl CoverageCapture for LlvmCoverage {
-    type Token = LlvmToken;
+    type Session = LlvmSession;
 
-    fn start_capture(&mut self) -> Result<Self::Token, String> {
-        let guard = try_lock_capture()?;
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
+        let Some(guard) = try_lock_capture() else {
+            return Ok(CaptureStart::Busy);
+        };
         self.runtime.reset_counters();
-        Ok(LlvmToken { _guard: guard })
+        Ok(CaptureStart::Started(LlvmSession { _guard: guard }))
     }
 
-    fn finish_capture(&mut self, _token: Self::Token) -> Result<ExecutionFeedback, String> {
+    fn finish_capture(&mut self, _session: Self::Session) -> Result<ExecutionFeedback, String> {
         counter_coverage(self.runtime, self.counter_count, self.bucketing)
     }
 }
 
 #[derive(Debug)]
-pub struct LlvmToken {
+pub struct LlvmSession {
     _guard: CaptureGuard,
 }
 
@@ -91,24 +93,23 @@ pub fn reset_llvm_counters() -> Result<(), String> {
     Ok(())
 }
 
-fn try_lock_capture() -> Result<CaptureGuard, String> {
+fn try_lock_capture() -> Option<CaptureGuard> {
     static CAPTURE_LOCK: AtomicBool = AtomicBool::new(false);
     if CAPTURE_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        return Err(CAPTURE_BUSY.to_string());
+        return None;
     }
-    Ok(CaptureGuard(&CAPTURE_LOCK))
+    Some(CaptureGuard(&CAPTURE_LOCK))
 }
 
 fn wait_for_capture_lock() -> CaptureGuard {
     loop {
-        match try_lock_capture() {
-            Ok(guard) => return guard,
-            Err(error) if error == CAPTURE_BUSY => std::thread::yield_now(),
-            Err(_) => unreachable!("try_lock_capture only reports busy"),
+        if let Some(guard) = try_lock_capture() {
+            return guard;
         }
+        std::thread::yield_now();
     }
 }
 unsafe extern "C" {

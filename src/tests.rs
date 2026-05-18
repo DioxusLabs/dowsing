@@ -1,7 +1,9 @@
 use crate::*;
 use crate::{
     backends::SancovCoverage,
-    coverage::{CoverageCapture, CoverageId, ExecutionFeedback, ParallelCoverageCapture},
+    coverage::{
+        CaptureStart, CoverageCapture, CoverageId, ExecutionFeedback, ParallelCoverageCapture,
+    },
 };
 use rand::{Rng, RngCore};
 use std::{
@@ -24,24 +26,24 @@ impl TestCapture {
 }
 
 impl CoverageCapture for TestCapture {
-    type Token = u64;
+    type Session = u64;
 
-    fn start_capture(&mut self) -> Result<Self::Token, String> {
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
         let id = self.next_id;
         self.next_id += 1;
-        Ok(id)
+        Ok(CaptureStart::Started(id))
     }
 
-    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String> {
+    fn finish_capture(&mut self, session: Self::Session) -> Result<ExecutionFeedback, String> {
         Ok(ExecutionFeedback::from_features(
-            [CoverageId::new(token)].into_iter().collect(),
+            [CoverageId::new(session)].into_iter().collect(),
         ))
     }
 }
 
 #[derive(Debug, Clone)]
 struct ScriptedCapture {
-    next_token: usize,
+    next_session: usize,
     coverages: Vec<Vec<u64>>,
     hit_count_weights: Vec<u64>,
     dictionary: Vec<Vec<u8>>,
@@ -83,26 +85,64 @@ impl Clone for ParallelScriptedCapture {
 }
 
 impl CoverageCapture for ParallelScriptedCapture {
-    type Token = u64;
+    type Session = u64;
 
-    fn start_capture(&mut self) -> Result<Self::Token, String> {
-        Ok(self.instance)
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
+        Ok(CaptureStart::Started(self.instance))
     }
 
-    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String> {
-        self.finished.lock().expect("finished lock").push(token);
+    fn finish_capture(&mut self, session: Self::Session) -> Result<ExecutionFeedback, String> {
+        self.finished.lock().expect("finished lock").push(session);
         Ok(ExecutionFeedback::from_features(
-            [CoverageId::new(token)].into_iter().collect(),
+            [CoverageId::new(session)].into_iter().collect(),
         ))
     }
 }
 
 impl ParallelCoverageCapture for ParallelScriptedCapture {}
 
+#[derive(Debug, Clone)]
+struct BusyOnceCapture {
+    busy: Rc<RefCell<bool>>,
+    attempts: Rc<RefCell<usize>>,
+}
+
+impl BusyOnceCapture {
+    fn new() -> Self {
+        Self {
+            busy: Rc::new(RefCell::new(true)),
+            attempts: Rc::new(RefCell::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> Rc<RefCell<usize>> {
+        Rc::clone(&self.attempts)
+    }
+}
+
+impl CoverageCapture for BusyOnceCapture {
+    type Session = u64;
+
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
+        *self.attempts.borrow_mut() += 1;
+        if std::mem::take(&mut *self.busy.borrow_mut()) {
+            Ok(CaptureStart::Busy)
+        } else {
+            Ok(CaptureStart::Started(1))
+        }
+    }
+
+    fn finish_capture(&mut self, session: Self::Session) -> Result<ExecutionFeedback, String> {
+        Ok(ExecutionFeedback::from_features(
+            [CoverageId::new(session)].into_iter().collect(),
+        ))
+    }
+}
+
 impl ScriptedCapture {
     fn new(coverages: impl IntoIterator<Item = impl IntoIterator<Item = u64>>) -> Self {
         Self {
-            next_token: 0,
+            next_session: 0,
             coverages: coverages
                 .into_iter()
                 .map(|coverage| coverage.into_iter().collect())
@@ -134,19 +174,19 @@ impl ScriptedCapture {
 }
 
 impl CoverageCapture for ScriptedCapture {
-    type Token = usize;
+    type Session = usize;
 
-    fn start_capture(&mut self) -> Result<Self::Token, String> {
-        let token = self.next_token;
-        self.next_token += 1;
-        Ok(token)
+    fn start_capture(&mut self) -> Result<CaptureStart<Self::Session>, String> {
+        let session = self.next_session;
+        self.next_session += 1;
+        Ok(CaptureStart::Started(session))
     }
 
-    fn finish_capture(&mut self, token: Self::Token) -> Result<ExecutionFeedback, String> {
-        self.finished.borrow_mut().push(token);
+    fn finish_capture(&mut self, session: Self::Session) -> Result<ExecutionFeedback, String> {
+        self.finished.borrow_mut().push(session);
         let coverage = self
             .coverages
-            .get(token)
+            .get(session)
             .cloned()
             .unwrap_or_default()
             .into_iter()
@@ -154,14 +194,14 @@ impl CoverageCapture for ScriptedCapture {
             .collect();
         let mut feedback =
             ExecutionFeedback::from_features(coverage).with_dictionary(self.dictionary.clone());
-        if let Some(weight) = self.hit_count_weights.get(token) {
+        if let Some(weight) = self.hit_count_weights.get(session) {
             feedback = feedback.with_hit_count_weight(*weight);
         }
         Ok(feedback)
     }
 
-    fn discard_capture(&mut self, token: Self::Token) -> Result<(), String> {
-        self.discarded.borrow_mut().push(token);
+    fn discard_capture(&mut self, session: Self::Session) -> Result<(), String> {
+        self.discarded.borrow_mut().push(session);
         Ok(())
     }
 }
@@ -194,6 +234,21 @@ fn curious_yields_rng_and_records_on_drop() {
     assert_eq!(stats.executed(), 1);
     assert_eq!(stats.accepted(), 1);
     assert_eq!(stats.coverage_ids(), 1);
+}
+
+#[test]
+fn capture_busy_start_is_retried() {
+    let capture = BusyOnceCapture::new();
+    let attempts = capture.attempts();
+    let mut curious = curious().with_coverage(capture);
+
+    {
+        let mut rng = curious.next().expect("rng after retry");
+        let _ = rng.random::<u64>();
+    }
+
+    assert_eq!(*attempts.borrow(), 2);
+    assert_eq!(curious.stats().executed(), 1);
 }
 
 #[test]

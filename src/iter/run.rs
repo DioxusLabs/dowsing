@@ -7,7 +7,7 @@ use super::{
     rng::CaseRng,
     shrink::{energy_refresh_interval, next_cautious_reduction},
 };
-use crate::coverage::{CAPTURE_BUSY, CoverageCapture, CoverageId, ParallelCoverageCapture};
+use crate::coverage::{CaptureStart, CoverageCapture, CoverageId, ParallelCoverageCapture};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::{
     collections::HashMap,
@@ -29,8 +29,8 @@ where
         };
         let candidate = materialize_candidate(plan);
 
-        let token = match start_capture_retry(&self.shared) {
-            Some(token) => token,
+        let session = match start_capture_retry(&self.shared) {
+            Some(session) => session,
             None => {
                 finish_started_case(&self.shared);
                 return None;
@@ -54,7 +54,7 @@ where
             trace: Vec::new(),
             draws: Vec::new(),
             sequences: Vec::new(),
-            token: Some(token),
+            session: Some(session),
             local_capture: None,
             start_error: None,
             finished: false,
@@ -90,7 +90,7 @@ pub(super) fn next_parallel_rng<Capture>(
 ) -> Option<CaseRng<Capture>>
 where
     Capture: ParallelCoverageCapture,
-    Capture::Token: Send,
+    Capture::Session: Send,
 {
     let plan = loop {
         let mut state = shared.lock().expect("search state poisoned");
@@ -106,8 +106,8 @@ where
     };
     let candidate = materialize_candidate(plan);
 
-    let token = match start_local_capture_retry(&mut capture) {
-        Some(token) => token,
+    let session = match start_local_capture_retry(&mut capture) {
+        Some(session) => session,
         None => {
             finish_started_case(shared);
             return None;
@@ -132,26 +132,26 @@ where
         trace: Vec::new(),
         draws: Vec::new(),
         sequences: Vec::new(),
-        token: Some(token),
+        session: Some(session),
         local_capture: Some(capture),
         start_error: None,
         finished: false,
     })
 }
 
-fn start_capture_retry<Capture>(shared: &Arc<Mutex<State<Capture>>>) -> Option<Capture::Token>
+fn start_capture_retry<Capture>(shared: &Arc<Mutex<State<Capture>>>) -> Option<Capture::Session>
 where
     Capture: CoverageCapture,
 {
     loop {
-        let token = shared
+        let session = shared
             .lock()
             .expect("search state poisoned")
             .capture
             .start_capture();
-        match token {
-            Ok(token) => return Some(token),
-            Err(error) if error == CAPTURE_BUSY => {
+        match session {
+            Ok(CaptureStart::Started(session)) => return Some(session),
+            Ok(CaptureStart::Busy) => {
                 std::thread::yield_now();
             }
             Err(_) => return None,
@@ -159,14 +159,14 @@ where
     }
 }
 
-fn start_local_capture_retry<Capture>(capture: &mut Capture) -> Option<Capture::Token>
+fn start_local_capture_retry<Capture>(capture: &mut Capture) -> Option<Capture::Session>
 where
     Capture: CoverageCapture,
 {
     loop {
         match capture.start_capture() {
-            Ok(token) => return Some(token),
-            Err(error) if error == CAPTURE_BUSY => std::thread::yield_now(),
+            Ok(CaptureStart::Started(session)) => return Some(session),
+            Ok(CaptureStart::Busy) => std::thread::yield_now(),
             Err(_) => return None,
         }
     }
