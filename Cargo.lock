@@ -37,9 +37,22 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 name = "dowsing"
 version = "0.1.0"
 dependencies = [
+ "dowsing-rng",
+ "dowsing-sys",
  "rand",
  "rayon",
 ]
+
+[[package]]
+name = "dowsing-rng"
+version = "0.1.0"
+dependencies = [
+ "rand",
+]
+
+[[package]]
+name = "dowsing-sys"
+version = "0.1.0"
 
 [[package]]
 name = "either"

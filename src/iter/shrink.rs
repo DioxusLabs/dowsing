@@ -3,27 +3,41 @@ use super::{
         CAUTIOUS_ENERGY_REFRESH_INTERVAL, CURIOUS_ENERGY_REFRESH_INTERVAL, CandidateOrigin,
         CautiousOptions, CautiousReducer, CorpusSeed, MAX_CORPUS_LEN, MAX_DICTIONARY_VALUES,
         MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore, Mode, PrefixFingerprint,
-        ReducerPass, ReductionId, ReductionOp, ReductionSpec, SequenceSpan, State,
+        ReductionId, ReductionOp, ReductionOperation, ReductionOperationState, ReductionSpec,
+        SequenceSpan, State,
     },
     run::Candidate,
 };
 use crate::coverage::CoverageCapture;
 use std::ops::Range;
 
-const REDUCER_PASSES: [ReducerPass; 12] = [
-    ReducerPass::SequenceDelete,
-    ReducerPass::DrawLength,
-    ReducerPass::TailTrim,
-    ReducerPass::DrawDelete,
-    ReducerPass::SequenceProject,
-    ReducerPass::SequenceReplace,
-    ReducerPass::WeightedBlockDelete,
-    ReducerPass::BlockZero,
-    ReducerPass::WordLower,
-    ReducerPass::ByteLower,
-    ReducerPass::RepeatedValue,
-    ReducerPass::DictionaryRepair,
+const REDUCTION_OPERATIONS: [ReductionOperation; 12] = [
+    ReductionOperation::SequenceDelete,
+    ReductionOperation::DrawLength,
+    ReductionOperation::TailTrim,
+    ReductionOperation::DrawDelete,
+    ReductionOperation::SequenceProject,
+    ReductionOperation::SequenceReplace,
+    ReductionOperation::WeightedBlockDelete,
+    ReductionOperation::BlockZero,
+    ReductionOperation::WordLower,
+    ReductionOperation::ByteLower,
+    ReductionOperation::RepeatedValue,
+    ReductionOperation::DictionaryRepair,
 ];
+
+impl ReductionOperationState {
+    fn new(operation: ReductionOperation) -> Self {
+        Self {
+            operation,
+            specs: Vec::new(),
+            cursor: 0,
+            rejects: 0,
+            preserves: 0,
+            drained: false,
+        }
+    }
+}
 
 pub(super) fn merge_dictionary_values<Capture: CoverageCapture>(
     state: &mut State<Capture>,
@@ -86,10 +100,11 @@ impl CautiousReducer {
         self.best_prefix = entry.prefix.clone();
         self.best_draws = entry.draws.clone();
         self.best_sequences = entry.sequences.clone();
-        self.pass_index = 0;
-        self.cursor = 0;
-        self.cached_pass = None;
-        self.cached_specs.clear();
+        self.operation_states = REDUCTION_OPERATIONS
+            .iter()
+            .copied()
+            .map(ReductionOperationState::new)
+            .collect();
         self.tried_prefixes.clear();
         self.tried_prefixes
             .insert(prefix_fingerprint(&self.best_prefix));
@@ -110,38 +125,22 @@ impl CautiousReducer {
         }
 
         for _ in 0..options.reducer_budget() {
-            if self.pass_index >= REDUCER_PASSES.len() {
+            self.prepare_operation_states(dictionary, options);
+            let Some(state_index) = self.next_operation_index() else {
                 self.exhausted = true;
                 return None;
+            };
+
+            let state = &mut self.operation_states[state_index];
+            let operation = state.operation;
+            let cursor = state.cursor;
+            let spec = state.specs[cursor].clone();
+            state.cursor += 1;
+            if state.cursor >= state.specs.len() {
+                state.drained = true;
             }
 
-            let pass = REDUCER_PASSES[self.pass_index];
-            if self.cached_pass != Some(pass) {
-                self.cached_specs = reduction_specs(
-                    pass,
-                    ReductionContext {
-                        prefix: &self.best_prefix,
-                        draws: &self.best_draws,
-                        sequences: &self.best_sequences,
-                        dictionary,
-                        pressure: &self.range_pressure,
-                        options,
-                    },
-                );
-                self.cached_pass = Some(pass);
-            }
-            if self.cursor >= self.cached_specs.len() {
-                self.pass_index += 1;
-                self.cursor = 0;
-                self.cached_pass = None;
-                self.cached_specs.clear();
-                continue;
-            }
-
-            let cursor = self.cursor;
-            self.cursor += 1;
-            let spec = &self.cached_specs[cursor];
-            let Some(mut prefix) = materialize_reduction(&self.best_prefix, dictionary, spec)
+            let Some(mut prefix) = materialize_reduction(&self.best_prefix, dictionary, &spec)
             else {
                 continue;
             };
@@ -165,7 +164,7 @@ impl CautiousReducer {
 
             let id = ReductionId {
                 epoch: self.epoch,
-                pass,
+                operation,
                 cursor,
                 start: spec.start(),
                 len: spec.len(),
@@ -173,15 +172,56 @@ impl CautiousReducer {
                 fingerprint,
             };
             return Some(Candidate {
-                seed: self.best_seed,
-                prefix,
+                case: super::prelude::Case::from_flat_prefix(self.best_seed, prefix),
                 mutated: true,
-                zero_tail: true,
                 origin: CandidateOrigin::CautiousReduction(id),
             });
         }
 
         None
+    }
+
+    fn prepare_operation_states(&mut self, dictionary: &[Vec<u8>], options: CautiousOptions) {
+        let prefix = &self.best_prefix;
+        let draws = &self.best_draws;
+        let sequences = &self.best_sequences;
+        let pressure = &self.range_pressure;
+        for state in &mut self.operation_states {
+            if state.drained || !state.specs.is_empty() {
+                continue;
+            }
+
+            state.specs = reduction_specs(
+                state.operation,
+                ReductionContext {
+                    prefix,
+                    draws,
+                    sequences,
+                    dictionary,
+                    pressure,
+                    options,
+                },
+            );
+            sort_operation_tail(state, pressure);
+            state.drained = state.specs.is_empty();
+        }
+    }
+
+    fn next_operation_index(&self) -> Option<usize> {
+        let mut best = None;
+        for (index, state) in self.operation_states.iter().enumerate() {
+            if state.drained || state.cursor >= state.specs.len() {
+                continue;
+            }
+            let spec = &state.specs[state.cursor];
+            let priority = candidate_priority(state, spec, &self.range_pressure);
+            if best.is_none_or(|(best_priority, best_index)| {
+                (priority, index) < (best_priority, best_index)
+            }) {
+                best = Some((priority, index));
+            }
+        }
+        best.map(|(_, index)| index)
     }
 
     fn record_discard(&mut self, origin: &CandidateOrigin) {
@@ -193,7 +233,15 @@ impl CautiousReducer {
         }
 
         self.rejects = self.rejects.saturating_add(1);
+        if let Some(state) = self
+            .operation_states
+            .iter_mut()
+            .find(|state| state.operation == id.operation)
+        {
+            state.rejects = state.rejects.saturating_add(1);
+        }
         self.apply_range_feedback(id.start, id.len, Feedback::Rejected);
+        self.sort_operation_tails();
     }
 
     fn record_preserved(&mut self, origin: &CandidateOrigin) {
@@ -205,7 +253,22 @@ impl CautiousReducer {
         }
 
         self.preserves = self.preserves.saturating_add(1);
+        if let Some(state) = self
+            .operation_states
+            .iter_mut()
+            .find(|state| state.operation == id.operation)
+        {
+            state.preserves = state.preserves.saturating_add(1);
+        }
         self.apply_range_feedback(id.start, id.len, Feedback::Preserved);
+        self.sort_operation_tails();
+    }
+
+    fn sort_operation_tails(&mut self) {
+        let pressure = &self.range_pressure;
+        for state in &mut self.operation_states {
+            sort_operation_tail(state, pressure);
+        }
     }
 
     fn apply_range_feedback(&mut self, start: usize, len: usize, feedback: Feedback) {
@@ -232,6 +295,91 @@ enum Feedback {
     Preserved,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidatePriority {
+    operation_penalty: u64,
+    range_score: u64,
+    structure_rank: u8,
+    simplification: std::cmp::Reverse<usize>,
+    operation_rank: u8,
+    start: usize,
+    len: usize,
+    target: u64,
+}
+
+fn candidate_priority(
+    state: &ReductionOperationState,
+    spec: &ReductionSpec,
+    pressure: &[u16],
+) -> CandidatePriority {
+    CandidatePriority {
+        operation_penalty: state.rejects.saturating_sub(state.preserves),
+        range_score: spec.bias + spec_pressure(pressure, spec),
+        structure_rank: operation_structure_rank(state.operation),
+        simplification: std::cmp::Reverse(spec.simplification()),
+        operation_rank: operation_stable_rank(state.operation),
+        start: spec.start(),
+        len: spec.len(),
+        target: spec.target(),
+    }
+}
+
+fn sort_operation_tail(state: &mut ReductionOperationState, pressure: &[u16]) {
+    if state.cursor >= state.specs.len() {
+        state.drained = true;
+        return;
+    }
+
+    let operation = state.operation;
+    state.specs[state.cursor..].sort_by_key(|spec| {
+        (
+            spec.bias + spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
+            spec.start(),
+            spec.len(),
+            spec.target(),
+            operation_stable_rank(operation),
+        )
+    });
+}
+
+fn spec_pressure(pressure: &[u16], spec: &ReductionSpec) -> u64 {
+    range_weight(pressure, spec.start(), spec.len()).max(1)
+}
+
+fn operation_structure_rank(operation: ReductionOperation) -> u8 {
+    match operation {
+        ReductionOperation::SequenceDelete
+        | ReductionOperation::SequenceProject
+        | ReductionOperation::SequenceReplace => 0,
+        ReductionOperation::DrawLength | ReductionOperation::DrawDelete => 1,
+        ReductionOperation::TailTrim
+        | ReductionOperation::WeightedBlockDelete
+        | ReductionOperation::DictionaryRepair => 2,
+        ReductionOperation::BlockZero
+        | ReductionOperation::WordLower
+        | ReductionOperation::ByteLower
+        | ReductionOperation::RepeatedValue => 3,
+    }
+}
+
+fn operation_stable_rank(operation: ReductionOperation) -> u8 {
+    match operation {
+        ReductionOperation::SequenceDelete => 0,
+        ReductionOperation::DrawLength => 1,
+        ReductionOperation::TailTrim => 2,
+        ReductionOperation::DrawDelete => 3,
+        ReductionOperation::SequenceProject => 4,
+        ReductionOperation::SequenceReplace => 5,
+        ReductionOperation::WeightedBlockDelete => 6,
+        ReductionOperation::BlockZero => 7,
+        ReductionOperation::WordLower => 8,
+        ReductionOperation::ByteLower => 9,
+        ReductionOperation::RepeatedValue => 10,
+        ReductionOperation::DictionaryRepair => 11,
+    }
+}
+
 struct ReductionContext<'a> {
     prefix: &'a [u8],
     draws: &'a [Range<usize>],
@@ -241,16 +389,21 @@ struct ReductionContext<'a> {
     options: CautiousOptions,
 }
 
-fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<ReductionSpec> {
-    let mut specs = match pass {
-        ReducerPass::SequenceDelete if context.options.range_reductions() => sequence_delete_specs(
-            context.prefix,
-            context.sequences,
-            context.pressure,
-            context.options,
-        ),
-        ReducerPass::SequenceDelete => Vec::new(),
-        ReducerPass::SequenceProject if context.options.range_reductions() => {
+fn reduction_specs(
+    operation: ReductionOperation,
+    context: ReductionContext<'_>,
+) -> Vec<ReductionSpec> {
+    let mut specs = match operation {
+        ReductionOperation::SequenceDelete if context.options.range_reductions() => {
+            sequence_delete_specs(
+                context.prefix,
+                context.sequences,
+                context.pressure,
+                context.options,
+            )
+        }
+        ReductionOperation::SequenceDelete => Vec::new(),
+        ReductionOperation::SequenceProject if context.options.range_reductions() => {
             sequence_project_specs(
                 context.prefix,
                 context.sequences,
@@ -258,7 +411,7 @@ fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<Redu
                 context.options,
             )
         }
-        ReducerPass::SequenceReplace if context.options.range_reductions() => {
+        ReductionOperation::SequenceReplace if context.options.range_reductions() => {
             sequence_replace_specs(
                 context.prefix,
                 context.sequences,
@@ -266,37 +419,37 @@ fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<Redu
                 context.options,
             )
         }
-        ReducerPass::SequenceProject | ReducerPass::SequenceReplace => Vec::new(),
-        ReducerPass::DrawLength => draw_length_specs(
+        ReductionOperation::SequenceProject | ReductionOperation::SequenceReplace => Vec::new(),
+        ReductionOperation::DrawLength => draw_length_specs(
             context.prefix,
             context.draws,
             context.pressure,
             context.options,
         ),
-        ReducerPass::TailTrim => tail_trim_specs(context.prefix, context.pressure),
-        ReducerPass::DrawDelete => draw_delete_specs(
+        ReductionOperation::TailTrim => tail_trim_specs(context.prefix, context.pressure),
+        ReductionOperation::DrawDelete => draw_delete_specs(
             context.prefix,
             context.draws,
             context.pressure,
             context.options,
         ),
-        ReducerPass::WeightedBlockDelete => {
+        ReductionOperation::WeightedBlockDelete => {
             weighted_block_delete_specs(context.prefix, context.pressure)
         }
-        ReducerPass::BlockZero => block_zero_specs(context.prefix, context.pressure),
-        ReducerPass::WordLower => word_lower_specs(
+        ReductionOperation::BlockZero => block_zero_specs(context.prefix, context.pressure),
+        ReductionOperation::WordLower => word_lower_specs(
             context.prefix,
             context.draws,
             context.pressure,
             context.options,
         ),
-        ReducerPass::ByteLower => byte_lower_specs(context.prefix, context.pressure),
-        ReducerPass::RepeatedValue => repeated_value_specs(context.prefix),
-        ReducerPass::DictionaryRepair => {
+        ReductionOperation::ByteLower => byte_lower_specs(context.prefix, context.pressure),
+        ReductionOperation::RepeatedValue => repeated_value_specs(context.prefix),
+        ReductionOperation::DictionaryRepair => {
             dictionary_repair_specs(context.prefix, context.dictionary, context.pressure)
         }
     };
-    truncate_specs(&mut specs, context.options.pass_candidate_limit());
+    truncate_specs(&mut specs, context.options.operation_candidate_limit());
     specs
 }
 
@@ -342,12 +495,18 @@ fn sequence_delete_specs(
                         start: first.start,
                         len: last.end - first.start,
                     },
-                    weight: range_weight(pressure, first.start, last.end - first.start),
+                    bias: 0,
                 });
             }
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
+            spec.start(),
+        )
+    });
     specs
 }
 
@@ -363,15 +522,7 @@ fn sequence_project_specs(
             continue;
         };
 
-        push_sequence_projection(
-            prefix,
-            pressure,
-            sequence,
-            region,
-            Vec::new(),
-            0,
-            &mut specs,
-        );
+        push_sequence_projection(prefix, sequence, region, Vec::new(), 0, &mut specs);
 
         for keep in sequence_keep_sizes(sequence.items.len()) {
             for item_start in block_starts(sequence.items.len(), keep) {
@@ -379,7 +530,6 @@ fn sequence_project_specs(
                 let indices: Vec<_> = (item_start..item_end).collect();
                 push_sequence_projection(
                     prefix,
-                    pressure,
                     sequence,
                     region,
                     indices,
@@ -391,16 +541,16 @@ fn sequence_project_specs(
 
         if sequence.items.len() > 2 {
             let even: Vec<_> = (0..sequence.items.len()).step_by(2).collect();
-            push_sequence_projection(prefix, pressure, sequence, region, even, 64, &mut specs);
+            push_sequence_projection(prefix, sequence, region, even, 64, &mut specs);
             let odd: Vec<_> = (1..sequence.items.len()).step_by(2).collect();
-            push_sequence_projection(prefix, pressure, sequence, region, odd, 65, &mut specs);
+            push_sequence_projection(prefix, sequence, region, odd, 65, &mut specs);
         }
     }
     specs.sort_by_key(|spec| {
         (
             spec.target(),
-            spec.weight,
-            std::cmp::Reverse(spec.len()),
+            spec.bias + spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
             spec.start(),
         )
     });
@@ -428,7 +578,6 @@ fn sequence_replace_specs(
                 indices[target] = source;
                 push_sequence_projection(
                     prefix,
-                    pressure,
                     sequence,
                     region,
                     indices,
@@ -438,7 +587,7 @@ fn sequence_replace_specs(
             }
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.target()));
+    specs.sort_by_key(|spec| (spec_pressure(pressure, spec), spec.start(), spec.target()));
     specs
 }
 
@@ -471,7 +620,6 @@ fn sequence_region(prefix: &[u8], sequence: &SequenceSpan) -> Option<SequenceReg
 
 fn push_sequence_projection(
     prefix: &[u8],
-    pressure: &[u16],
     sequence: &SequenceSpan,
     region: SequenceRegion,
     indices: Vec<usize>,
@@ -503,7 +651,7 @@ fn push_sequence_projection(
             replace_len: region.len,
             items,
         },
-        weight: weight_bias + range_weight(pressure, region.start, region.len),
+        bias: weight_bias,
     });
 }
 
@@ -612,12 +760,19 @@ fn draw_length_specs(
                         target,
                         zero_until: Some(draw.end),
                     },
-                    weight: range_weight(pressure, draw.start, width),
+                    bias: 0,
                 });
             }
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            spec.start(),
+            spec.len(),
+            spec.target(),
+        )
+    });
     specs
 }
 
@@ -635,10 +790,16 @@ fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
                 len: trim,
                 adjust_first: true,
             },
-            weight: range_weight(pressure, start, trim),
+            bias: 0,
         });
     }
-    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
+            spec.start(),
+        )
+    });
     specs
 }
 
@@ -663,7 +824,7 @@ fn draw_delete_specs(
                 len: draw.len(),
                 adjust_first: true,
             },
-            weight: range_weight(pressure, draw.start, draw.len()),
+            bias: 0,
         });
     }
 
@@ -691,15 +852,15 @@ fn draw_delete_specs(
                     len: end - first.start,
                     adjust_first: true,
                 },
-                weight: range_weight(pressure, first.start, end - first.start),
+                bias: 0,
             });
         }
     }
 
     specs.sort_by_key(|spec| {
         (
-            spec.weight,
-            std::cmp::Reverse(spec.len()),
+            spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
             std::cmp::Reverse(spec.start()),
         )
     });
@@ -724,11 +885,17 @@ fn weighted_block_delete_specs(prefix: &[u8], pressure: &[u16]) -> Vec<Reduction
                     len,
                     adjust_first: true,
                 },
-                weight: range_weight(pressure, start, len),
+                bias: 0,
             });
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
+            spec.start(),
+        )
+    });
     specs
 }
 
@@ -746,11 +913,17 @@ fn block_zero_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
             }
             specs.push(ReductionSpec {
                 op: ReductionOp::ZeroRange { start, len },
-                weight: range_weight(pressure, start, len),
+                bias: 0,
             });
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            std::cmp::Reverse(spec.simplification()),
+            spec.start(),
+        )
+    });
     specs
 }
 
@@ -791,12 +964,19 @@ fn word_lower_specs(
                         target,
                         zero_until: None,
                     },
-                    weight: range_weight(pressure, start, width),
+                    bias: 0,
                 });
             }
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, spec.len(), spec.start(), spec.target()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            spec.len(),
+            spec.start(),
+            spec.target(),
+        )
+    });
     specs
 }
 
@@ -806,11 +986,11 @@ fn byte_lower_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
         for value in smaller_byte_targets(byte) {
             specs.push(ReductionSpec {
                 op: ReductionOp::SetByte { start, value },
-                weight: range_weight(pressure, start, 1),
+                bias: 0,
             });
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.target()));
+    specs.sort_by_key(|spec| (spec_pressure(pressure, spec), spec.start(), spec.target()));
     specs
 }
 
@@ -829,7 +1009,7 @@ fn repeated_value_specs(prefix: &[u8]) -> Vec<ReductionSpec> {
         .into_iter()
         .map(|value| ReductionSpec {
             op: ReductionOp::ZeroRepeated { value },
-            weight: 0,
+            bias: 0,
         })
         .collect()
 }
@@ -859,11 +1039,18 @@ fn dictionary_repair_specs(
                     len: value.len(),
                     dictionary_index,
                 },
-                weight: range_weight(pressure, start, value.len()),
+                bias: 0,
             });
         }
     }
-    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            spec.start(),
+            spec.len(),
+            spec.target(),
+        )
+    });
     specs
 }
 

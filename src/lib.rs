@@ -3,6 +3,9 @@
 //! Use [`curious`] to maximize coverage while discovering interesting paths, then fork a path with
 //! [`CaseRng::fork_case`] and feed it to [`cautious`] to minimize the code path that still matters to
 //! the harness.
+//!
+//! Replayable RNG trace storage lives in `dowsing-rng`; this crate layers coverage feedback and
+//! search scheduling on top.
 
 pub mod coverage;
 mod iter;
@@ -26,6 +29,6 @@ pub mod tuning {
 
 pub use backends::NoCoverage;
 pub use iter::{
-    Case, CaseCost, CaseCoverage, CaseRng, Cases, Cautious, ChildRng, Curious, ParallelCases,
-    RangeIter, cautious, curious,
+    Case, CaseCost, CaseCoverage, CaseRng, Cases, Cautious, Curious, ParallelCases, RangeIter,
+    cautious, curious,
 };

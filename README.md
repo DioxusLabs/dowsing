@@ -61,8 +61,9 @@ for mut rng in curious().with_coverage(NoCoverage).take(128) {
 ## How It Works
 
 `curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution
-finds useful coverage, `dowsing` stores the consumed RNG byte prefix and later mutates accepted
-prefixes to explore nearby inputs.
+finds useful coverage, `dowsing` stores the consumed RNG trace and later mutates accepted flattened
+prefixes to explore nearby inputs. Trace storage and replay are implemented in the workspace
+`dowsing-rng` crate; `dowsing::Case` is a reexport of that trace type for the coverage-guided API.
 
 `cautious()` starts from one or more forked cases. It does not generate unrelated fresh roots.
 Non-discarded variants are treated as still valid, so call `discard()` for cases that do not
@@ -120,9 +121,9 @@ fn sample_items<C: dowsing::coverage::CoverageCapture>(
 }
 ```
 
-`range` draws a length in the requested bounds and maps each element through a child RNG. The child
-records item spans while still behaving like an RNG, so generation can use `random`,
-`random_range`, and other `rand::Rng` methods.
+`range` draws a length in the requested bounds and maps each element through another `CaseRng`
+node. Range items share the same tracked byte stream as the parent while recording item spans, so
+generation can use `random`, `random_range`, nested `range` calls, and other `rand::Rng` methods.
 
 `cautious()` uses range structure to try length and item reductions before falling back to generic
 byte shrinking. Larger harnesses can tune the reducer budget with

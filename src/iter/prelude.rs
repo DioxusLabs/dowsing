@@ -2,6 +2,8 @@ use crate::{
     coverage::{CoverageCapture, CoverageId, CoverageSet},
     sancov::SancovCoverage,
 };
+pub(super) use dowsing_rng::SequenceSpan;
+pub use dowsing_rng::Trace as Case;
 use rand::{Rng, rngs::SmallRng};
 use std::{
     cmp::Ordering,
@@ -27,64 +29,15 @@ pub(super) enum Mode {
     Cautious,
 }
 
-/// Replayable RNG path produced by [`crate::CaseRng::fork_case`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Case {
-    pub(super) seed: u64,
-    pub(super) prefix: Vec<u8>,
-    pub(super) zero_tail: bool,
-    pub(super) draws: Vec<Range<usize>>,
-    pub(super) sequences: Vec<SequenceSpan>,
-}
-
-impl Case {
-    #[cfg(test)]
-    pub(crate) fn from_raw_parts(seed: u64, prefix: Vec<u8>, zero_tail: bool) -> Self {
-        Self {
-            seed,
-            prefix,
-            zero_tail,
-            draws: Vec::new(),
-            sequences: Vec::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_raw_parts_with_draws(
-        seed: u64,
-        prefix: Vec<u8>,
-        zero_tail: bool,
-        draws: impl IntoIterator<Item = (usize, usize)>,
-    ) -> Self {
-        Self {
-            seed,
-            prefix,
-            zero_tail,
-            draws: draws
-                .into_iter()
-                .map(|(start, len)| start..start.saturating_add(len))
-                .collect(),
-            sequences: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SequenceSpan {
-    pub(super) length_start: usize,
-    pub(super) length_len: usize,
-    pub(super) items: Vec<Range<usize>>,
-}
-
 /// Tuning knobs for [`cautious`] minimization.
 ///
 /// The defaults favor thorough reduction. Large or expensive harnesses can lower the reducer budget,
-/// cap generated candidates per pass, or disable havoc fallback after deterministic reductions are
+/// cap generated candidates per operation, or disable havoc fallback after deterministic reductions are
 /// exhausted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CautiousOptions {
     pub(crate) reducer_budget: usize,
-    pub(crate) pass_candidate_limit: usize,
+    pub(crate) operation_candidate_limit: usize,
     pub(crate) draw_limit: usize,
     pub(crate) range_limit: usize,
     pub(crate) range_reductions: bool,
@@ -96,7 +49,7 @@ impl CautiousOptions {
     pub const fn new() -> Self {
         Self {
             reducer_budget: 8192,
-            pass_candidate_limit: 8192,
+            operation_candidate_limit: 8192,
             draw_limit: 512,
             range_limit: 4096,
             range_reductions: true,
@@ -114,8 +67,8 @@ impl CautiousOptions {
         self.reducer_budget
     }
 
-    pub(super) const fn pass_candidate_limit(self) -> usize {
-        self.pass_candidate_limit
+    pub(super) const fn operation_candidate_limit(self) -> usize {
+        self.operation_candidate_limit
     }
 
     pub(super) const fn draw_limit(self) -> usize {
@@ -303,6 +256,7 @@ pub(super) struct State<Capture: CoverageCapture> {
 #[derive(Debug)]
 pub(super) struct Active {
     pub(super) seed: u64,
+    pub(super) case: Case,
     pub(super) trace: Vec<u8>,
     pub(super) draws: Vec<Range<usize>>,
     pub(super) sequences: Vec<SequenceSpan>,
@@ -351,10 +305,7 @@ pub(super) struct CautiousReducer {
     pub(super) best_prefix: Vec<u8>,
     pub(super) best_draws: Vec<Range<usize>>,
     pub(super) best_sequences: Vec<SequenceSpan>,
-    pub(super) pass_index: usize,
-    pub(super) cursor: usize,
-    pub(super) cached_pass: Option<ReducerPass>,
-    pub(super) cached_specs: Vec<ReductionSpec>,
+    pub(super) operation_states: Vec<ReductionOperationState>,
     pub(super) tried_prefixes: HashSet<PrefixFingerprint>,
     pub(super) range_pressure: Vec<u16>,
     pub(super) rejects: u64,
@@ -371,10 +322,7 @@ impl Default for CautiousReducer {
             best_prefix: Vec::new(),
             best_draws: Vec::new(),
             best_sequences: Vec::new(),
-            pass_index: 0,
-            cursor: 0,
-            cached_pass: None,
-            cached_specs: Vec::new(),
+            operation_states: Vec::new(),
             tried_prefixes: HashSet::new(),
             range_pressure: Vec::new(),
             rejects: 0,
@@ -393,7 +341,7 @@ pub(super) struct PrefixFingerprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ReductionId {
     pub(super) epoch: u64,
-    pub(super) pass: ReducerPass,
+    pub(super) operation: ReductionOperation,
     pub(super) cursor: usize,
     pub(super) start: usize,
     pub(super) len: usize,
@@ -401,8 +349,18 @@ pub(super) struct ReductionId {
     pub(super) fingerprint: PrefixFingerprint,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ReductionOperationState {
+    pub(super) operation: ReductionOperation,
+    pub(super) specs: Vec<ReductionSpec>,
+    pub(super) cursor: usize,
+    pub(super) rejects: u64,
+    pub(super) preserves: u64,
+    pub(super) drained: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum ReducerPass {
+pub(super) enum ReductionOperation {
     DrawLength,
     TailTrim,
     DrawDelete,
@@ -420,7 +378,7 @@ pub(super) enum ReducerPass {
 #[derive(Debug, Clone)]
 pub(super) struct ReductionSpec {
     pub(super) op: ReductionOp,
-    pub(super) weight: u64,
+    pub(super) bias: u64,
 }
 
 impl ReductionSpec {
@@ -466,6 +424,23 @@ impl ReductionSpec {
                 dictionary_index, ..
             } => *dictionary_index as u64,
             ReductionOp::DeleteRange { .. } | ReductionOp::ZeroRange { .. } => 0,
+        }
+    }
+
+    pub(super) fn simplification(&self) -> usize {
+        match &self.op {
+            ReductionOp::SetWord { width, .. } => *width,
+            ReductionOp::DeleteRange { len, .. }
+            | ReductionOp::DeleteSequenceItems { len, .. }
+            | ReductionOp::ZeroRange { len, .. }
+            | ReductionOp::ReplaceDictionary { len, .. } => *len,
+            ReductionOp::ProjectSequenceItems {
+                replace_len, items, ..
+            } => {
+                let replacement_len = items.iter().map(|(_, len)| *len).sum::<usize>();
+                replace_len.saturating_sub(replacement_len)
+            }
+            ReductionOp::SetByte { .. } | ReductionOp::ZeroRepeated { .. } => 1,
         }
     }
 }

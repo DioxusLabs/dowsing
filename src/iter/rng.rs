@@ -3,7 +3,7 @@ use super::{
     mutate::{corpus_energy, refresh_corpus_energies},
     prelude::{
         Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, MAX_PREFIX_LEN,
-        MinPathScore, Mode, SequenceSpan, State,
+        MinPathScore, Mode, State,
     },
     run::min_path_schedule_energy,
     shrink::{
@@ -15,27 +15,23 @@ use crate::{
     coverage::{CaptureStart, CoverageCapture, ExecutionFeedback},
     sancov::SancovCoverage,
 };
-use rand::{RngCore, rngs::SmallRng};
+use dowsing_rng::{RangeIter as SemanticRangeIter, SemanticRng, TraceHandle, TraceSnapshot};
+use rand::RngCore;
 use std::{
-    cell::RefCell,
-    ops::{Bound, Range, RangeBounds},
-    rc::Rc,
+    ops::{Range, RangeBounds},
     sync::{Arc, Mutex},
 };
 
 /// RNG yielded by [`crate::Curious`] and [`crate::Cautious`].
 pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
+    runtime: Arc<Mutex<CaseRuntime<Capture>>>,
+    semantic: SemanticRng,
+}
+
+struct CaseRuntime<Capture: CoverageCapture = SancovCoverage> {
     pub(super) shared: Arc<Mutex<State<Capture>>>,
-    pub(super) fallback: SmallRng,
-    pub(super) seed: u64,
-    pub(super) prefix: Vec<u8>,
-    pub(super) zero_tail: bool,
+    pub(super) trace: TraceHandle,
     pub(super) origin: CandidateOrigin,
-    pub(super) cursor: usize,
-    pub(super) bytes_consumed: usize,
-    pub(super) trace: Vec<u8>,
-    pub(super) draws: Vec<Range<usize>>,
-    pub(super) sequences: Vec<SequenceSpan>,
     pub(super) session: Option<Capture::Session>,
     pub(super) local_capture: Option<Capture>,
     pub(super) start_error: Option<String>,
@@ -43,37 +39,37 @@ pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
 }
 
 impl<Capture: CoverageCapture> CaseRng<Capture> {
+    pub(super) fn new(
+        shared: Arc<Mutex<State<Capture>>>,
+        case: Case,
+        origin: CandidateOrigin,
+        session: Option<Capture::Session>,
+        local_capture: Option<Capture>,
+    ) -> Self {
+        let semantic = SemanticRng::new(case);
+        let trace = semantic.handle();
+        Self {
+            runtime: Arc::new(Mutex::new(CaseRuntime {
+                shared,
+                trace,
+                origin,
+                session,
+                local_capture,
+                start_error: None,
+                finished: false,
+            })),
+            semantic,
+        }
+    }
+
     /// Seed backing this execution.
     pub fn seed(&self) -> u64 {
-        self.seed
+        self.semantic.seed()
     }
 
     /// Fork the consumed RNG path into a replayable case.
     pub fn fork_case(&self) -> Case {
-        Case {
-            seed: self.seed,
-            prefix: self.trace.clone(),
-            zero_tail: self.zero_tail,
-            draws: self.draws.clone(),
-            sequences: self.sequences.clone(),
-        }
-    }
-
-    fn length_below(&mut self, upper: usize) -> usize {
-        let upper = upper.max(1).min(u16::MAX as usize) as u16;
-        (self.next_u32() as u16 % upper) as usize
-    }
-
-    fn draw_length_in<R>(&mut self, range: R) -> usize
-    where
-        R: RangeBounds<usize>,
-    {
-        let (start, width) = normalize_range(range);
-        if width == 1 {
-            start
-        } else {
-            start + self.length_below(width)
-        }
+        self.semantic.fork_trace()
     }
 
     /// Generate a length in `range` and return a structured range iterator.
@@ -81,7 +77,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     where
         R: RangeBounds<usize>,
     {
-        RangeIter::new(Rc::new(RefCell::new(self)), range)
+        RangeIter::new(self, range)
     }
 
     /// Finish this execution immediately and return its coverage stats.
@@ -105,199 +101,84 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     pub fn discard(mut self) {
         let _ = self.finish(false, CaseCost::zero());
     }
+
+    fn finish(
+        &mut self,
+        record_coverage: bool,
+        case_cost: CaseCost,
+    ) -> Result<CaseCoverage, String> {
+        self.runtime
+            .lock()
+            .expect("case rng poisoned")
+            .finish(record_coverage, case_cost)
+    }
 }
 
 /// Range iterator returned by [`CaseRng::range`].
 pub struct RangeIter<'a, Capture: CoverageCapture = SancovCoverage> {
-    shared: Rc<RangeState<'a, Capture>>,
-    len: usize,
-    index: usize,
+    runtime: Arc<Mutex<CaseRuntime<Capture>>>,
+    inner: SemanticRangeIter<'a>,
 }
 
 impl<'a, Capture: CoverageCapture> RangeIter<'a, Capture> {
-    fn new<R>(rng: Rc<RefCell<&'a mut CaseRng<Capture>>>, range: R) -> Self
+    fn new<R>(rng: &'a mut CaseRng<Capture>, range: R) -> Self
     where
         R: RangeBounds<usize>,
     {
-        let (len, length_start, length_len) = {
-            let mut rng = rng.borrow_mut();
-            let length_start = rng.cursor;
-            let len = rng.draw_length_in(range);
-            let length_len = rng.cursor.saturating_sub(length_start);
-            (len, length_start, length_len)
-        };
-
-        Self {
-            shared: Rc::new(RangeState {
-                rng,
-                length_start,
-                length_len,
-                item_spans: RefCell::new(Vec::with_capacity(len)),
-            }),
-            len,
-            index: 0,
-        }
+        rng.runtime
+            .lock()
+            .expect("case rng poisoned")
+            .ensure_started();
+        let runtime = Arc::clone(&rng.runtime);
+        let inner = rng.semantic.range(range);
+        Self { runtime, inner }
     }
 }
 
 impl<'a, Capture: CoverageCapture> Iterator for RangeIter<'a, Capture> {
-    type Item = ChildRng<'a, Capture>;
+    type Item = CaseRng<Capture>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.len {
-            return None;
-        }
-
-        let position = self.index;
-        self.index += 1;
-        let item_start = self.shared.rng.borrow().cursor;
-        Some(ChildRng {
-            shared: Rc::clone(&self.shared),
-            position,
-            item_start,
+        self.inner.next().map(|semantic| CaseRng {
+            runtime: Arc::clone(&self.runtime),
+            semantic,
         })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.len.saturating_sub(self.index);
-        (remaining, Some(remaining))
+        self.inner.size_hint()
     }
 }
 
 impl<Capture: CoverageCapture> ExactSizeIterator for RangeIter<'_, Capture> {}
 
-struct RangeState<'a, Capture: CoverageCapture = SancovCoverage> {
-    rng: Rc<RefCell<&'a mut CaseRng<Capture>>>,
-    length_start: usize,
-    length_len: usize,
-    item_spans: RefCell<Vec<(usize, Range<usize>)>>,
-}
-
-impl<Capture: CoverageCapture> Drop for RangeState<'_, Capture> {
-    fn drop(&mut self) {
-        let item_spans = self.item_spans.get_mut();
-        if self.length_len > 0 && self.length_start < MAX_PREFIX_LEN && !item_spans.is_empty() {
-            item_spans.sort_by_key(|(position, _)| *position);
-            let items = item_spans.iter().map(|(_, span)| span.clone()).collect();
-            let mut rng = self.rng.borrow_mut();
-            rng.sequences.push(SequenceSpan {
-                length_start: self.length_start,
-                length_len: self.length_len.min(MAX_PREFIX_LEN - self.length_start),
-                items,
-            });
-        }
-    }
-}
-
-/// Child RNG for one generated element in a [`CaseRng::range`] sequence.
-pub struct ChildRng<'a, Capture: CoverageCapture = SancovCoverage> {
-    shared: Rc<RangeState<'a, Capture>>,
-    position: usize,
-    item_start: usize,
-}
-
-impl<Capture: CoverageCapture> RngCore for ChildRng<'_, Capture> {
-    fn next_u32(&mut self) -> u32 {
-        rand::rand_core::impls::next_u32_via_fill(self)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        rand::rand_core::impls::next_u64_via_fill(self)
-    }
-
-    fn fill_bytes(&mut self, dst: &mut [u8]) {
-        self.shared.rng.borrow_mut().fill_bytes(dst);
-    }
-}
-
-impl<Capture: CoverageCapture> Drop for ChildRng<'_, Capture> {
-    fn drop(&mut self) {
-        let rng = self.shared.rng.borrow_mut();
-        let item_len = rng.cursor.saturating_sub(self.item_start);
-        if item_len > 0 && self.item_start < MAX_PREFIX_LEN {
-            let len = item_len.min(MAX_PREFIX_LEN - self.item_start);
-            self.shared
-                .item_spans
-                .borrow_mut()
-                .push((self.position, self.item_start..self.item_start + len));
-        }
-    }
-}
-
-fn normalize_range(range: impl RangeBounds<usize>) -> (usize, usize) {
-    let start = match range.start_bound() {
-        Bound::Included(value) => *value,
-        Bound::Excluded(value) => value.saturating_add(1),
-        Bound::Unbounded => 0,
-    };
-    let end = match range.end_bound() {
-        Bound::Included(value) => value.saturating_add(1),
-        Bound::Excluded(value) => *value,
-        Bound::Unbounded => panic!("range requires a bounded upper limit"),
-    };
-    assert!(start < end, "range requires a non-empty range");
-    (start, end - start)
-}
-
 impl<Capture: CoverageCapture> RngCore for CaseRng<Capture> {
     fn next_u32(&mut self) -> u32 {
-        let start = self.cursor;
-        let bytes = self.traced_word_bytes();
-        self.record_draw(start, 4);
-        u32::from_le_bytes(bytes)
+        self.runtime
+            .lock()
+            .expect("case rng poisoned")
+            .ensure_started();
+        self.semantic.next_u32()
     }
 
     fn next_u64(&mut self) -> u64 {
-        let start = self.cursor;
-        let bytes = self.traced_word_bytes();
-        self.record_draw(start, 8);
-        u64::from_le_bytes(bytes)
+        self.runtime
+            .lock()
+            .expect("case rng poisoned")
+            .ensure_started();
+        self.semantic.next_u64()
     }
 
     fn fill_bytes(&mut self, dst: &mut [u8]) {
-        let start = self.cursor;
-        let len = dst.len();
-        for byte in dst {
-            *byte = self.next_byte();
-        }
-        self.record_draw(start, len);
+        self.runtime
+            .lock()
+            .expect("case rng poisoned")
+            .ensure_started();
+        self.semantic.fill_bytes(dst);
     }
 }
 
-impl<Capture: CoverageCapture> CaseRng<Capture> {
-    fn traced_word_bytes<const N: usize>(&mut self) -> [u8; N] {
-        let mut bytes = [0; N];
-        for byte in &mut bytes {
-            *byte = self.next_byte();
-        }
-        bytes
-    }
-
-    fn record_draw(&mut self, start: usize, len: usize) {
-        if len == 0 || start >= MAX_PREFIX_LEN {
-            return;
-        }
-        let len = len.min(MAX_PREFIX_LEN - start);
-        self.draws.push(start..start + len);
-    }
-
-    fn next_byte(&mut self) -> u8 {
-        self.ensure_started();
-        let byte = if let Some(byte) = self.prefix.get(self.cursor) {
-            *byte
-        } else if self.zero_tail {
-            0
-        } else {
-            let mut byte = [0];
-            self.fallback.fill_bytes(&mut byte);
-            byte[0]
-        };
-        self.cursor = self.cursor.saturating_add(1);
-        self.bytes_consumed = self.bytes_consumed.saturating_add(1);
-        self.trace.push(byte);
-        byte
-    }
-
+impl<Capture: CoverageCapture> CaseRuntime<Capture> {
     fn ensure_started(&mut self) {
         if self.finished || self.session.is_some() || self.start_error.is_some() {
             return;
@@ -338,15 +219,9 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         }
         self.ensure_started();
         self.finished = true;
+        let snapshot = self.trace.finish()?;
+        let active = active_from_snapshot(snapshot, self.origin.clone());
 
-        let active = Active {
-            seed: self.seed,
-            trace: std::mem::take(&mut self.trace),
-            draws: std::mem::take(&mut self.draws),
-            sequences: std::mem::take(&mut self.sequences),
-            bytes_consumed: self.bytes_consumed,
-            origin: self.origin.clone(),
-        };
         let session = self.session.take();
         if let Some(mut capture) = self.local_capture.take() {
             let outcome = finish_capture(
@@ -387,7 +262,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     }
 }
 
-impl<Capture> Drop for CaseRng<Capture>
+impl<Capture> Drop for CaseRuntime<Capture>
 where
     Capture: CoverageCapture,
 {
@@ -396,6 +271,30 @@ where
             let _ = self.finish(true, CaseCost::zero());
         }
     }
+}
+
+fn active_from_snapshot(snapshot: TraceSnapshot, origin: CandidateOrigin) -> Active {
+    Active {
+        seed: snapshot.seed,
+        case: snapshot.trace,
+        trace: snapshot.prefix,
+        draws: clip_draws(snapshot.draws),
+        sequences: snapshot.sequences,
+        bytes_consumed: snapshot.bytes_consumed,
+        origin,
+    }
+}
+
+fn clip_draws(draws: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    draws
+        .into_iter()
+        .filter_map(|draw| {
+            if draw.is_empty() || draw.start >= MAX_PREFIX_LEN {
+                return None;
+            }
+            Some(draw.start..draw.end.min(MAX_PREFIX_LEN))
+        })
+        .collect()
 }
 
 struct FinishedCapture {
@@ -532,7 +431,7 @@ where
             }
             Mode::Cautious => {}
         }
-        let mut corpus_prefix = active.trace.clone();
+        let mut corpus_prefix = active.case.flatten_prefix();
         if corpus_prefix.len() > MAX_PREFIX_LEN {
             corpus_prefix.truncate(MAX_PREFIX_LEN);
         }

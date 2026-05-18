@@ -14,4 +14,4 @@ pub use prelude::{
     Case, CaseCost, CaseCoverage, Cautious, CautiousOptions, Curious, SearchStats, cautious,
     curious,
 };
-pub use rng::{CaseRng, ChildRng, RangeIter};
+pub use rng::{CaseRng, RangeIter};

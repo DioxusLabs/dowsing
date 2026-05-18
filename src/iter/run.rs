@@ -1,8 +1,8 @@
 use super::{
     mutate::{choose_corpus_index, havoc_prefix, mutate_prefix, refresh_corpus_energies},
     prelude::{
-        CandidateOrigin, CaseCost, Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore, Mode,
-        State,
+        CandidateOrigin, Case, CaseCost, Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore,
+        Mode, State,
     },
     rng::CaseRng,
     shrink::{energy_refresh_interval, next_cautious_reduction},
@@ -42,23 +42,13 @@ where
         state.stats.mutated += u64::from(candidate.mutated);
         drop(state);
 
-        Some(CaseRng {
-            shared: Arc::clone(&self.shared),
-            fallback: SmallRng::seed_from_u64(candidate.seed),
-            seed: candidate.seed,
-            prefix: candidate.prefix,
-            zero_tail: candidate.zero_tail,
-            origin: candidate.origin,
-            cursor: 0,
-            bytes_consumed: 0,
-            trace: Vec::new(),
-            draws: Vec::new(),
-            sequences: Vec::new(),
-            session: Some(session),
-            local_capture: None,
-            start_error: None,
-            finished: false,
-        })
+        Some(CaseRng::new(
+            Arc::clone(&self.shared),
+            candidate.case,
+            candidate.origin,
+            Some(session),
+            None,
+        ))
     }
 }
 
@@ -120,23 +110,13 @@ where
         state.stats.mutated += u64::from(candidate.mutated);
     }
 
-    Some(CaseRng {
-        shared: Arc::clone(shared),
-        fallback: SmallRng::seed_from_u64(candidate.seed),
-        seed: candidate.seed,
-        prefix: candidate.prefix,
-        zero_tail: candidate.zero_tail,
-        origin: candidate.origin,
-        cursor: 0,
-        bytes_consumed: 0,
-        trace: Vec::new(),
-        draws: Vec::new(),
-        sequences: Vec::new(),
-        session: Some(session),
-        local_capture: Some(capture),
-        start_error: None,
-        finished: false,
-    })
+    Some(CaseRng::new(
+        Arc::clone(shared),
+        candidate.case,
+        candidate.origin,
+        Some(session),
+        Some(capture),
+    ))
 }
 
 fn start_capture_retry<Capture>(shared: &Arc<Mutex<State<Capture>>>) -> Option<Capture::Session>
@@ -182,10 +162,8 @@ where
 
 #[derive(Debug, Clone)]
 pub(super) struct Candidate {
-    pub(super) seed: u64,
-    pub(super) prefix: Vec<u8>,
+    pub(super) case: Case,
     pub(super) mutated: bool,
-    pub(super) zero_tail: bool,
     pub(super) origin: CandidateOrigin,
 }
 
@@ -216,10 +194,8 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
 ) -> Option<CandidatePlan> {
     if let Some(case) = state.pending_cases.pop_front() {
         return Some(CandidatePlan::Ready(Candidate {
-            seed: case.seed,
-            prefix: case.prefix,
+            case,
             mutated: false,
-            zero_tail: state.mode == Mode::Cautious || case.zero_tail,
             origin: CandidateOrigin::SeededCase,
         }));
     }
@@ -243,20 +219,16 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
     };
     if pull_fresh_root {
         return Some(CandidatePlan::Ready(Candidate {
-            seed: fallback,
-            prefix: Vec::new(),
+            case: Case::empty(fallback),
             mutated: false,
-            zero_tail: false,
             origin: CandidateOrigin::SeededCase,
         }));
     }
 
     let Some(index) = choose_corpus_index(state) else {
         return Some(CandidatePlan::Ready(Candidate {
-            seed: fallback,
-            prefix: Vec::new(),
+            case: Case::empty(fallback),
             mutated: false,
-            zero_tail: false,
             origin: CandidateOrigin::SeededCase,
         }));
     };
@@ -343,10 +315,8 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
             }
 
             Candidate {
-                seed: parent_seed ^ fallback.rotate_left(17),
-                prefix,
+                case: Case::from_flat_prefix(parent_seed ^ fallback.rotate_left(17), prefix),
                 mutated: true,
-                zero_tail: false,
                 origin: CandidateOrigin::CuriousMutation,
             }
         }
@@ -361,10 +331,8 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
             let mut rng = SmallRng::seed_from_u64(rng_seed);
             let prefix = havoc_prefix(&parent_prefix, &mut rng, depth, &dictionary);
             Candidate {
-                seed: parent_seed ^ fallback.rotate_left(17),
-                prefix,
+                case: Case::from_flat_prefix(parent_seed ^ fallback.rotate_left(17), prefix),
                 mutated: true,
-                zero_tail: true,
                 origin: CandidateOrigin::CautiousHavoc,
             }
         }

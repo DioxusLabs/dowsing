@@ -1,8 +1,14 @@
+[workspace]
+members = [".", "crates/dowsing-rng", "crates/dowsing-sys"]
+resolver = "3"
+
 [package]
 name = "dowsing"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dowsing-rng = { version = "0.1.0", path = "crates/dowsing-rng" }
+dowsing-sys = { version = "0.1.0", path = "crates/dowsing-sys" }
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = "1.10"
