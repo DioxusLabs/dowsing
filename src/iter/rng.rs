@@ -2,8 +2,8 @@ use super::{
     api::coverage_delta,
     mutate::{corpus_energy, refresh_corpus_energies},
     prelude::{
-        Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
-        MAX_PREFIX_LEN, MinPathScore, Mode, SequenceItemSpan, SequenceSpan, State,
+        Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, MAX_PREFIX_LEN,
+        MinPathScore, Mode, SequenceSpan, State,
     },
     run::min_path_schedule_energy,
     shrink::{
@@ -18,7 +18,7 @@ use crate::{
 use rand::{RngCore, rngs::SmallRng};
 use std::{
     cell::RefCell,
-    ops::{Bound, RangeBounds},
+    ops::{Bound, Range, RangeBounds},
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -34,7 +34,7 @@ pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
     pub(super) cursor: usize,
     pub(super) bytes_consumed: usize,
     pub(super) trace: Vec<u8>,
-    pub(super) draws: Vec<DrawSpan>,
+    pub(super) draws: Vec<Range<usize>>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) session: Option<Capture::Session>,
     pub(super) local_capture: Option<Capture>,
@@ -170,7 +170,7 @@ struct RangeState<'a, Capture: CoverageCapture = SancovCoverage> {
     rng: Rc<RefCell<&'a mut CaseRng<Capture>>>,
     length_start: usize,
     length_len: usize,
-    item_spans: RefCell<Vec<(usize, SequenceItemSpan)>>,
+    item_spans: RefCell<Vec<(usize, Range<usize>)>>,
 }
 
 impl<Capture: CoverageCapture> Drop for RangeState<'_, Capture> {
@@ -178,7 +178,7 @@ impl<Capture: CoverageCapture> Drop for RangeState<'_, Capture> {
         let item_spans = self.item_spans.get_mut();
         if self.length_len > 0 && self.length_start < MAX_PREFIX_LEN && !item_spans.is_empty() {
             item_spans.sort_by_key(|(position, _)| *position);
-            let items = item_spans.iter().map(|(_, span)| *span).collect();
+            let items = item_spans.iter().map(|(_, span)| span.clone()).collect();
             let mut rng = self.rng.borrow_mut();
             rng.sequences.push(SequenceSpan {
                 length_start: self.length_start,
@@ -216,13 +216,10 @@ impl<Capture: CoverageCapture> Drop for ChildRng<'_, Capture> {
         let item_len = rng.cursor.saturating_sub(self.item_start);
         if item_len > 0 && self.item_start < MAX_PREFIX_LEN {
             let len = item_len.min(MAX_PREFIX_LEN - self.item_start);
-            self.shared.item_spans.borrow_mut().push((
-                self.position,
-                SequenceItemSpan {
-                    start: self.item_start,
-                    len,
-                },
-            ));
+            self.shared
+                .item_spans
+                .borrow_mut()
+                .push((self.position, self.item_start..self.item_start + len));
         }
     }
 }
@@ -246,14 +243,14 @@ impl<Capture: CoverageCapture> RngCore for CaseRng<Capture> {
     fn next_u32(&mut self) -> u32 {
         let start = self.cursor;
         let bytes = self.traced_word_bytes();
-        self.record_draw(start, 4, DrawKind::Word);
+        self.record_draw(start, 4);
         u32::from_le_bytes(bytes)
     }
 
     fn next_u64(&mut self) -> u64 {
         let start = self.cursor;
         let bytes = self.traced_word_bytes();
-        self.record_draw(start, 8, DrawKind::Word);
+        self.record_draw(start, 8);
         u64::from_le_bytes(bytes)
     }
 
@@ -263,7 +260,7 @@ impl<Capture: CoverageCapture> RngCore for CaseRng<Capture> {
         for byte in dst {
             *byte = self.next_byte();
         }
-        self.record_draw(start, len, DrawKind::Bytes);
+        self.record_draw(start, len);
     }
 }
 
@@ -276,12 +273,12 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         bytes
     }
 
-    fn record_draw(&mut self, start: usize, len: usize, kind: DrawKind) {
+    fn record_draw(&mut self, start: usize, len: usize) {
         if len == 0 || start >= MAX_PREFIX_LEN {
             return;
         }
         let len = len.min(MAX_PREFIX_LEN - start);
-        self.draws.push(DrawSpan::new(start, len, kind));
+        self.draws.push(start..start + len);
     }
 
     fn next_byte(&mut self) -> u8 {

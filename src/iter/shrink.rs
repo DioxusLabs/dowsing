@@ -1,14 +1,14 @@
 use super::{
     prelude::{
         CAUTIOUS_ENERGY_REFRESH_INTERVAL, CURIOUS_ENERGY_REFRESH_INTERVAL, CandidateOrigin,
-        CautiousOptions, CautiousReducer, CorpusSeed, DrawSpan, MAX_CORPUS_LEN,
-        MAX_DICTIONARY_VALUES, MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore, Mode,
-        PrefixFingerprint, ReducerPass, ReductionId, ReductionOp, ReductionSpec, SequenceItemSpan,
-        SequenceSpan, State,
+        CautiousOptions, CautiousReducer, CorpusSeed, MAX_CORPUS_LEN, MAX_DICTIONARY_VALUES,
+        MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore, Mode, PrefixFingerprint,
+        ReducerPass, ReductionId, ReductionOp, ReductionSpec, SequenceSpan, State,
     },
     run::Candidate,
 };
 use crate::coverage::CoverageCapture;
+use std::ops::Range;
 
 const REDUCER_PASSES: [ReducerPass; 12] = [
     ReducerPass::SequenceDelete,
@@ -234,7 +234,7 @@ enum Feedback {
 
 struct ReductionContext<'a> {
     prefix: &'a [u8],
-    draws: &'a [DrawSpan],
+    draws: &'a [Range<usize>],
     sequences: &'a [SequenceSpan],
     dictionary: &'a [Vec<u8>],
     pressure: &'a [u16],
@@ -325,13 +325,11 @@ fn sequence_delete_specs(
                 if item_start >= item_end {
                     continue;
                 }
-                let first = sequence.items[item_start];
-                let last = sequence.items[item_end - 1];
-                if first.len == 0
-                    || last.len == 0
-                    || first.end() > prefix.len()
-                    || last.end() > prefix.len()
-                    || first.start >= last.end()
+                let first = &sequence.items[item_start];
+                let last = &sequence.items[item_end - 1];
+                if !valid_range(prefix, first)
+                    || !valid_range(prefix, last)
+                    || first.start >= last.end
                 {
                     continue;
                 }
@@ -342,9 +340,9 @@ fn sequence_delete_specs(
                         length_width: sequence.length_len,
                         target_len,
                         start: first.start,
-                        len: last.end() - first.start,
+                        len: last.end - first.start,
                     },
-                    weight: range_weight(pressure, first.start, last.end() - first.start),
+                    weight: range_weight(pressure, first.start, last.end - first.start),
                 });
             }
         }
@@ -459,20 +457,15 @@ fn sequence_region(prefix: &[u8], sequence: &SequenceSpan) -> Option<SequenceReg
         return None;
     }
 
-    let first = *sequence.items.first()?;
-    let last = *sequence.items.last()?;
-    if first.len == 0
-        || last.len == 0
-        || first.end() > prefix.len()
-        || last.end() > prefix.len()
-        || first.start >= last.end()
-    {
+    let first = sequence.items.first()?;
+    let last = sequence.items.last()?;
+    if !valid_range(prefix, first) || !valid_range(prefix, last) || first.start >= last.end {
         return None;
     }
 
     Some(SequenceRegion {
         start: first.start,
-        len: last.end() - first.start,
+        len: last.end - first.start,
     })
 }
 
@@ -492,13 +485,13 @@ fn push_sequence_projection(
 
     let mut items = Vec::with_capacity(indices.len());
     for index in indices {
-        let Some(item) = sequence.items.get(index).copied() else {
+        let Some(item) = sequence.items.get(index) else {
             return;
         };
-        if item.len == 0 || item.end() > prefix.len() {
+        if !valid_range(prefix, item) {
             return;
         }
-        items.push((item.start, item.len));
+        items.push((item.start, item.len()));
     }
 
     specs.push(ReductionSpec {
@@ -550,10 +543,10 @@ fn push_replacement_source(
     if source >= target || sources.contains(&source) {
         return;
     }
-    let Some(source_item) = sequence.items.get(source).copied() else {
+    let Some(source_item) = sequence.items.get(source) else {
         return;
     };
-    let Some(target_item) = sequence.items.get(target).copied() else {
+    let Some(target_item) = sequence.items.get(target) else {
         return;
     };
     if !item_replacement_simplifies(prefix, source_item, target_item) {
@@ -563,35 +556,30 @@ fn push_replacement_source(
 }
 
 fn simplest_prior_item(prefix: &[u8], sequence: &SequenceSpan, target: usize) -> Option<usize> {
-    let target_item = *sequence.items.get(target)?;
+    let target_item = sequence.items.get(target)?;
     (0..target)
         .filter(|index| {
             sequence
                 .items
                 .get(*index)
-                .copied()
                 .is_some_and(|source| item_replacement_simplifies(prefix, source, target_item))
         })
         .min_by_key(|index| {
-            let item = sequence.items[*index];
-            item_simplicity_key(&prefix[item.start..item.end()])
+            let item = &sequence.items[*index];
+            item_simplicity_key(&prefix[item.clone()])
         })
 }
 
 fn item_replacement_simplifies(
     prefix: &[u8],
-    source: SequenceItemSpan,
-    target: SequenceItemSpan,
+    source: &Range<usize>,
+    target: &Range<usize>,
 ) -> bool {
-    if source.len == 0
-        || target.len == 0
-        || source.end() > prefix.len()
-        || target.end() > prefix.len()
-    {
+    if !valid_range(prefix, source) || !valid_range(prefix, target) {
         return false;
     }
-    let source_bytes = &prefix[source.start..source.end()];
-    let target_bytes = &prefix[target.start..target.end()];
+    let source_bytes = &prefix[source.clone()];
+    let target_bytes = &prefix[target.clone()];
     item_simplicity_key(source_bytes) < item_simplicity_key(target_bytes)
 }
 
@@ -602,12 +590,12 @@ fn item_simplicity_key(bytes: &[u8]) -> (usize, usize, &[u8]) {
 
 fn draw_length_specs(
     prefix: &[u8],
-    draws: &[DrawSpan],
+    draws: &[Range<usize>],
     pressure: &[u16],
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
     let mut specs = Vec::new();
-    for draw in draws.iter().take(options.draw_limit()).copied() {
+    for draw in draws.iter().take(options.draw_limit()) {
         if !valid_draw(prefix, draw) {
             continue;
         }
@@ -622,7 +610,7 @@ fn draw_length_specs(
                         start: draw.start,
                         width,
                         target,
-                        zero_until: Some(draw.end()),
+                        zero_until: Some(draw.end),
                     },
                     weight: range_weight(pressure, draw.start, width),
                 });
@@ -656,7 +644,7 @@ fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
 
 fn draw_delete_specs(
     prefix: &[u8],
-    draws: &[DrawSpan],
+    draws: &[Range<usize>],
     pressure: &[u16],
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
@@ -665,17 +653,17 @@ fn draw_delete_specs(
     }
 
     let mut specs = Vec::new();
-    for draw in draws.iter().rev().take(options.draw_limit()).copied() {
+    for draw in draws.iter().rev().take(options.draw_limit()) {
         if draw.start == 0 || !valid_draw(prefix, draw) {
             continue;
         }
         specs.push(ReductionSpec {
             op: ReductionOp::DeleteRange {
                 start: draw.start,
-                len: draw.len,
+                len: draw.len(),
                 adjust_first: true,
             },
-            weight: range_weight(pressure, draw.start, draw.len),
+            weight: range_weight(pressure, draw.start, draw.len()),
         });
     }
 
@@ -684,16 +672,16 @@ fn draw_delete_specs(
             continue;
         }
         for chunk in draws.windows(window).rev() {
-            let Some(first) = chunk.first().copied() else {
+            let Some(first) = chunk.first() else {
                 continue;
             };
-            let Some(last) = chunk.last().copied() else {
+            let Some(last) = chunk.last() else {
                 continue;
             };
             if first.start == 0 || !valid_draw(prefix, first) || !valid_draw(prefix, last) {
                 continue;
             }
-            let end = last.end();
+            let end = last.end;
             if first.start >= end || end > prefix.len() {
                 continue;
             }
@@ -768,7 +756,7 @@ fn block_zero_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
 
 fn word_lower_specs(
     prefix: &[u8],
-    draws: &[DrawSpan],
+    draws: &[Range<usize>],
     pressure: &[u16],
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
@@ -779,8 +767,8 @@ fn word_lower_specs(
         }
 
         let mut starts = Vec::new();
-        for draw in draws.iter().take(options.draw_limit()).copied() {
-            if valid_draw(prefix, draw) && draw.len >= width && !starts.contains(&draw.start) {
+        for draw in draws.iter().take(options.draw_limit()) {
+            if valid_draw(prefix, draw) && draw.len() >= width && !starts.contains(&draw.start) {
                 starts.push(draw.start);
             }
         }
@@ -1051,14 +1039,19 @@ fn push_start(starts: &mut Vec<usize>, len: usize, start: usize) {
     starts.push(start);
 }
 
-fn valid_draw(prefix: &[u8], draw: DrawSpan) -> bool {
-    draw.len > 0 && draw.end() <= prefix.len()
+fn valid_range(prefix: &[u8], range: &Range<usize>) -> bool {
+    range.start < range.end && range.end <= prefix.len()
 }
 
-fn draw_widths(draw: DrawSpan) -> Vec<usize> {
+fn valid_draw(prefix: &[u8], draw: &Range<usize>) -> bool {
+    valid_range(prefix, draw)
+}
+
+fn draw_widths(draw: &Range<usize>) -> Vec<usize> {
     let mut widths = Vec::new();
-    for width in [draw.len.min(8), 4, 2, 1] {
-        if width > 0 && width <= draw.len && !widths.contains(&width) {
+    let len = draw.len();
+    for width in [len.min(8), 4, 2, 1] {
+        if width > 0 && width <= len && !widths.contains(&width) {
             widths.push(width);
         }
     }

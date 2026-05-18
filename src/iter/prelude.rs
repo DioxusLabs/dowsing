@@ -6,6 +6,7 @@ use rand::{Rng, rngs::SmallRng};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
+    ops::Range,
     sync::{Arc, Mutex},
 };
 
@@ -32,7 +33,7 @@ pub struct Case {
     pub(super) seed: u64,
     pub(super) prefix: Vec<u8>,
     pub(super) zero_tail: bool,
-    pub(super) draws: Vec<DrawSpan>,
+    pub(super) draws: Vec<Range<usize>>,
     pub(super) sequences: Vec<SequenceSpan>,
 }
 
@@ -53,7 +54,7 @@ impl Case {
         seed: u64,
         prefix: Vec<u8>,
         zero_tail: bool,
-        draws: impl IntoIterator<Item = (usize, usize, bool)>,
+        draws: impl IntoIterator<Item = (usize, usize)>,
     ) -> Self {
         Self {
             seed,
@@ -61,43 +62,10 @@ impl Case {
             zero_tail,
             draws: draws
                 .into_iter()
-                .map(|(start, len, word)| {
-                    DrawSpan::new(
-                        start,
-                        len,
-                        if word {
-                            DrawKind::Word
-                        } else {
-                            DrawKind::Bytes
-                        },
-                    )
-                })
+                .map(|(start, len)| start..start.saturating_add(len))
                 .collect(),
             sequences: Vec::new(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DrawKind {
-    Word,
-    Bytes,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DrawSpan {
-    pub(super) start: usize,
-    pub(super) len: usize,
-    pub(super) kind: DrawKind,
-}
-
-impl DrawSpan {
-    pub(super) fn new(start: usize, len: usize, kind: DrawKind) -> Self {
-        Self { start, len, kind }
-    }
-
-    pub(super) fn end(self) -> usize {
-        self.start.saturating_add(self.len)
     }
 }
 
@@ -105,19 +73,7 @@ impl DrawSpan {
 pub(super) struct SequenceSpan {
     pub(super) length_start: usize,
     pub(super) length_len: usize,
-    pub(super) items: Vec<SequenceItemSpan>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SequenceItemSpan {
-    pub(super) start: usize,
-    pub(super) len: usize,
-}
-
-impl SequenceItemSpan {
-    pub(super) fn end(self) -> usize {
-        self.start.saturating_add(self.len)
-    }
+    pub(super) items: Vec<Range<usize>>,
 }
 
 /// Tuning knobs for [`cautious`] minimization.
@@ -348,7 +304,7 @@ pub(super) struct State<Capture: CoverageCapture> {
 pub(super) struct Active {
     pub(super) seed: u64,
     pub(super) trace: Vec<u8>,
-    pub(super) draws: Vec<DrawSpan>,
+    pub(super) draws: Vec<Range<usize>>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) bytes_consumed: usize,
     pub(super) origin: CandidateOrigin,
@@ -358,7 +314,7 @@ pub(super) struct Active {
 pub(super) struct CorpusSeed {
     pub(super) seed: u64,
     pub(super) prefix: Vec<u8>,
-    pub(super) draws: Vec<DrawSpan>,
+    pub(super) draws: Vec<Range<usize>>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) coverage: Vec<CoverageId>,
     pub(super) removed: Vec<CoverageId>,
@@ -393,7 +349,7 @@ pub(super) struct CautiousReducer {
     pub(super) best_index: Option<usize>,
     pub(super) best_seed: u64,
     pub(super) best_prefix: Vec<u8>,
-    pub(super) best_draws: Vec<DrawSpan>,
+    pub(super) best_draws: Vec<Range<usize>>,
     pub(super) best_sequences: Vec<SequenceSpan>,
     pub(super) pass_index: usize,
     pub(super) cursor: usize,

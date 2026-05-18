@@ -847,7 +847,7 @@ fn cautious_promotes_equal_length_simpler_rng_traces() {
 fn cautious_draw_spans_prioritize_length_like_first_draw() {
     let mut prefix = 200_u32.to_le_bytes().to_vec();
     prefix.extend(std::iter::repeat_n(255, 32));
-    let draws = (0..9).map(|index| (index * 4, 4, true));
+    let draws = (0..9).map(|index| (index * 4, 4));
     let case = Case::from_raw_parts_with_draws(0, prefix, true, draws);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..8).map(|_| vec![1])))
