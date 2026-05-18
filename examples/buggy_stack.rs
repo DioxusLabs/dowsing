@@ -10,7 +10,7 @@
 //!
 //! `./target/debug/examples/buggy_stack`
 
-use iterator_fuzz::{cautious, curious};
+use dowsing::{cautious, curious};
 use rand::Rng;
 use std::collections::VecDeque;
 

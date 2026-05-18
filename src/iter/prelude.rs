@@ -1,4 +1,3 @@
-use super::no_coverage::NoCoverage;
 use crate::{
     coverage::{CoverageCapture, CoverageId, CoverageSet},
     sancov::SancovCoverage,
@@ -34,17 +33,10 @@ pub struct Case {
     pub(super) prefix: Vec<u8>,
     pub(super) zero_tail: bool,
     pub(super) draws: Vec<DrawSpan>,
-    pub(super) semantics: Vec<SemanticSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
 }
 
 impl Case {
-    /// Replay this case without recording coverage.
-    pub fn replay(self) -> crate::CaseRng<NoCoverage> {
-        let mut engine = Engine::new(NoCoverage, Mode::Curious).with_case(self);
-        engine.next().expect("seeded replay case should yield")
-    }
-
     #[cfg(test)]
     pub(crate) fn from_raw_parts(seed: u64, prefix: Vec<u8>, zero_tail: bool) -> Self {
         Self {
@@ -52,7 +44,6 @@ impl Case {
             prefix,
             zero_tail,
             draws: Vec::new(),
-            semantics: Vec::new(),
             sequences: Vec::new(),
         }
     }
@@ -82,7 +73,6 @@ impl Case {
                     )
                 })
                 .collect(),
-            semantics: Vec::new(),
             sequences: Vec::new(),
         }
     }
@@ -103,30 +93,6 @@ pub(super) struct DrawSpan {
 
 impl DrawSpan {
     pub(super) fn new(start: usize, len: usize, kind: DrawKind) -> Self {
-        Self { start, len, kind }
-    }
-
-    pub(super) fn end(self) -> usize {
-        self.start.saturating_add(self.len)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SemanticKind {
-    Length,
-    Item,
-    Variant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SemanticSpan {
-    pub(super) start: usize,
-    pub(super) len: usize,
-    pub(super) kind: SemanticKind,
-}
-
-impl SemanticSpan {
-    pub(super) fn new(start: usize, len: usize, kind: SemanticKind) -> Self {
         Self { start, len, kind }
     }
 
@@ -164,8 +130,8 @@ pub struct CautiousOptions {
     pub(crate) reducer_budget: usize,
     pub(crate) pass_candidate_limit: usize,
     pub(crate) draw_limit: usize,
-    pub(crate) semantic_span_limit: usize,
-    pub(crate) semantic_reductions: bool,
+    pub(crate) range_limit: usize,
+    pub(crate) range_reductions: bool,
     pub(crate) havoc: bool,
 }
 
@@ -176,50 +142,15 @@ impl CautiousOptions {
             reducer_budget: 8192,
             pass_candidate_limit: 8192,
             draw_limit: 512,
-            semantic_span_limit: 4096,
-            semantic_reductions: true,
+            range_limit: 4096,
+            range_reductions: true,
             havoc: true,
         }
-    }
-
-    /// Alias for [`Self::new`], matching builder-style configuration APIs.
-    pub const fn builder() -> Self {
-        Self::new()
     }
 
     /// Set the maximum internal reducer attempts spent to produce one yielded candidate.
     pub fn with_reducer_budget(mut self, budget: usize) -> Self {
         self.reducer_budget = budget.max(1);
-        self
-    }
-
-    /// Cap the number of candidate reductions retained for each deterministic reducer pass.
-    pub fn with_pass_candidate_limit(mut self, limit: usize) -> Self {
-        self.pass_candidate_limit = limit.max(1);
-        self
-    }
-
-    /// Cap how many recorded RNG draws each draw-aware pass inspects.
-    pub fn with_draw_limit(mut self, limit: usize) -> Self {
-        self.draw_limit = limit.max(1);
-        self
-    }
-
-    /// Cap how many semantic spans each semantic pass inspects.
-    pub fn with_semantic_span_limit(mut self, limit: usize) -> Self {
-        self.semantic_span_limit = limit.max(1);
-        self
-    }
-
-    /// Enable or disable semantic-span reducer passes.
-    pub const fn with_semantic_reductions(mut self, enabled: bool) -> Self {
-        self.semantic_reductions = enabled;
-        self
-    }
-
-    /// Enable or disable havoc fallback after deterministic reductions are exhausted.
-    pub const fn with_havoc(mut self, enabled: bool) -> Self {
-        self.havoc = enabled;
         self
     }
 
@@ -235,12 +166,12 @@ impl CautiousOptions {
         self.draw_limit
     }
 
-    pub(super) const fn semantic_span_limit(self) -> usize {
-        self.semantic_span_limit
+    pub(super) const fn range_limit(self) -> usize {
+        self.range_limit
     }
 
-    pub(super) const fn semantic_reductions(self) -> bool {
-        self.semantic_reductions
+    pub(super) const fn range_reductions(self) -> bool {
+        self.range_reductions
     }
 
     pub(super) const fn havoc(self) -> bool {
@@ -264,18 +195,15 @@ impl Default for CautiousOptions {
 pub struct CaseCost(usize);
 
 impl CaseCost {
-    /// Build the neutral cost used by [`crate::CaseRng::coverage`].
-    pub const fn zero() -> Self {
+    pub(crate) const fn zero() -> Self {
         Self(0)
     }
 
-    /// Build a cost from a domain-specific value. Lower is better.
-    pub const fn new(cost: usize) -> Self {
+    pub(crate) const fn new(cost: usize) -> Self {
         Self(cost)
     }
 
-    /// Return the raw cost value.
-    pub const fn get(self) -> usize {
+    pub(crate) const fn raw(self) -> usize {
         self.0
     }
 }
@@ -296,18 +224,7 @@ pub struct CaseCoverage {
 }
 
 impl CaseCoverage {
-    /// Build coverage stats with the neutral domain cost.
-    pub const fn new(feature_count: usize, hit_count_weight: u64, bytes_consumed: usize) -> Self {
-        Self::with_cost(
-            CaseCost::zero(),
-            feature_count,
-            hit_count_weight,
-            bytes_consumed,
-        )
-    }
-
-    /// Build coverage stats from all observed parts.
-    pub const fn with_cost(
+    pub(crate) const fn with_cost(
         case_cost: CaseCost,
         feature_count: usize,
         hit_count_weight: u64,
@@ -432,7 +349,6 @@ pub(super) struct Active {
     pub(super) seed: u64,
     pub(super) trace: Vec<u8>,
     pub(super) draws: Vec<DrawSpan>,
-    pub(super) semantics: Vec<SemanticSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) bytes_consumed: usize,
     pub(super) origin: CandidateOrigin,
@@ -443,7 +359,6 @@ pub(super) struct CorpusSeed {
     pub(super) seed: u64,
     pub(super) prefix: Vec<u8>,
     pub(super) draws: Vec<DrawSpan>,
-    pub(super) semantics: Vec<SemanticSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) coverage: Vec<CoverageId>,
     pub(super) removed: Vec<CoverageId>,
@@ -479,7 +394,6 @@ pub(super) struct CautiousReducer {
     pub(super) best_seed: u64,
     pub(super) best_prefix: Vec<u8>,
     pub(super) best_draws: Vec<DrawSpan>,
-    pub(super) best_semantics: Vec<SemanticSpan>,
     pub(super) best_sequences: Vec<SequenceSpan>,
     pub(super) pass_index: usize,
     pub(super) cursor: usize,
@@ -500,7 +414,6 @@ impl Default for CautiousReducer {
             best_seed: 0,
             best_prefix: Vec::new(),
             best_draws: Vec::new(),
-            best_semantics: Vec::new(),
             best_sequences: Vec::new(),
             pass_index: 0,
             cursor: 0,
@@ -546,9 +459,6 @@ pub(super) enum ReducerPass {
     SequenceDelete,
     SequenceProject,
     SequenceReplace,
-    SemanticLength,
-    SemanticDelete,
-    SemanticSimplify,
 }
 
 #[derive(Debug, Clone)]
@@ -778,23 +688,6 @@ pub struct SearchStats {
 }
 
 impl SearchStats {
-    /// Build stats from all counters.
-    pub const fn new(
-        generated: u64,
-        executed: u64,
-        accepted: u64,
-        coverage_ids: u64,
-        mutated: u64,
-    ) -> Self {
-        Self {
-            generated,
-            executed,
-            accepted,
-            coverage_ids,
-            mutated,
-        }
-    }
-
     /// Number of RNG cases yielded.
     pub const fn generated(self) -> u64 {
         self.generated

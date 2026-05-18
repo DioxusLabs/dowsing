@@ -1,4 +1,4 @@
-use iterator_fuzz::{NoCoverage, cautious, curious};
+use dowsing::{NoCoverage, cautious, curious};
 use rand::Rng;
 use std::{
     env,

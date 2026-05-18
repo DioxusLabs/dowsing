@@ -3,8 +3,7 @@ use super::{
     mutate::{corpus_energy, refresh_corpus_energies},
     prelude::{
         Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
-        MAX_PREFIX_LEN, MinPathScore, Mode, SemanticKind, SemanticSpan, SequenceItemSpan,
-        SequenceSpan, State,
+        MAX_PREFIX_LEN, MinPathScore, Mode, SequenceItemSpan, SequenceSpan, State,
     },
     run::min_path_schedule_energy,
     shrink::{
@@ -36,7 +35,6 @@ pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
     pub(super) bytes_consumed: usize,
     pub(super) trace: Vec<u8>,
     pub(super) draws: Vec<DrawSpan>,
-    pub(super) semantics: Vec<SemanticSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) token: Option<Capture::Token>,
     pub(super) local_capture: Option<Capture>,
@@ -57,30 +55,13 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             prefix: self.trace.clone(),
             zero_tail: self.zero_tail,
             draws: self.draws.clone(),
-            semantics: self.semantics.clone(),
             sequences: self.sequences.clone(),
         }
     }
 
-    fn mark_semantic<T>(&mut self, kind: SemanticKind, f: impl FnOnce(&mut Self) -> T) -> T {
-        let start = self.cursor;
-        let output = f(self);
-        let len = self.cursor.saturating_sub(start);
-        if len > 0 && start < MAX_PREFIX_LEN {
-            self.semantics.push(SemanticSpan::new(
-                start,
-                len.min(MAX_PREFIX_LEN - start),
-                kind,
-            ));
-        }
-        output
-    }
-
     fn length_below(&mut self, upper: usize) -> usize {
         let upper = upper.max(1).min(u16::MAX as usize) as u16;
-        self.mark_semantic(SemanticKind::Length, |rng| {
-            (rng.next_u32() as u16 % upper) as usize
-        })
+        (self.next_u32() as u16 % upper) as usize
     }
 
     fn draw_length_in<R>(&mut self, range: R) -> usize
@@ -95,15 +76,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         }
     }
 
-    /// Generate a variant index in `0..upper`.
-    pub fn variant(&mut self, upper: usize) -> usize {
-        let upper = upper.max(1).min(u16::MAX as usize) as u16;
-        self.mark_semantic(SemanticKind::Variant, |rng| {
-            (rng.next_u32() as u16 % upper) as usize
-        })
-    }
-
-    /// Generate a length in `range` and return a semantic range iterator.
+    /// Generate a length in `range` and return a structured range iterator.
     pub fn range<R>(&mut self, range: R) -> RangeIter<'_, Capture>
     where
         R: RangeBounds<usize>,
@@ -134,12 +107,11 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     }
 }
 
-/// Structured range iterator returned by [`CaseRng::range`].
+/// Range iterator returned by [`CaseRng::range`].
 pub struct RangeIter<'a, Capture: CoverageCapture = SancovCoverage> {
     shared: Rc<RangeState<'a, Capture>>,
     len: usize,
     index: usize,
-    order: Vec<usize>,
 }
 
 impl<'a, Capture: CoverageCapture> RangeIter<'a, Capture> {
@@ -164,39 +136,7 @@ impl<'a, Capture: CoverageCapture> RangeIter<'a, Capture> {
             }),
             len,
             index: 0,
-            order: Vec::new(),
         }
-    }
-
-    /// Yield this range's children in `order`.
-    ///
-    /// The order must be a permutation of `0..self.len()` and must be selected before iteration
-    /// starts. [`ChildRng::index`] returns the child index selected for the current yield.
-    pub fn reorder<I>(mut self, order: I) -> Self
-    where
-        I: IntoIterator<Item = usize>,
-    {
-        assert_eq!(
-            self.index, 0,
-            "range children must be reordered before iteration starts"
-        );
-
-        let order: Vec<_> = order.into_iter().collect();
-        assert_eq!(
-            order.len(),
-            self.len,
-            "range child order must include every generated child"
-        );
-
-        let mut seen = vec![false; self.len];
-        for index in order.iter().copied() {
-            assert!(index < self.len, "range child order index out of bounds");
-            assert!(!seen[index], "range child order contains a duplicate index");
-            seen[index] = true;
-        }
-
-        self.order = order;
-        self
     }
 }
 
@@ -209,12 +149,10 @@ impl<'a, Capture: CoverageCapture> Iterator for RangeIter<'a, Capture> {
         }
 
         let position = self.index;
-        let index = self.order.get(position).copied().unwrap_or(position);
         self.index += 1;
         let item_start = self.shared.rng.borrow().cursor;
         Some(ChildRng {
             shared: Rc::clone(&self.shared),
-            index,
             position,
             item_start,
         })
@@ -254,23 +192,8 @@ impl<Capture: CoverageCapture> Drop for RangeState<'_, Capture> {
 /// Child RNG for one generated element in a [`CaseRng::range`] sequence.
 pub struct ChildRng<'a, Capture: CoverageCapture = SancovCoverage> {
     shared: Rc<RangeState<'a, Capture>>,
-    index: usize,
     position: usize,
     item_start: usize,
-}
-
-impl<Capture: CoverageCapture> ChildRng<'_, Capture> {
-    /// Zero-based logical index of this generated child.
-    ///
-    /// This reflects any order selected with [`RangeIter::reorder`].
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    /// Generate a variant index in `0..upper`.
-    pub fn variant(&mut self, upper: usize) -> usize {
-        self.shared.rng.borrow_mut().variant(upper)
-    }
 }
 
 impl<Capture: CoverageCapture> RngCore for ChildRng<'_, Capture> {
@@ -289,7 +212,7 @@ impl<Capture: CoverageCapture> RngCore for ChildRng<'_, Capture> {
 
 impl<Capture: CoverageCapture> Drop for ChildRng<'_, Capture> {
     fn drop(&mut self) {
-        let mut rng = self.shared.rng.borrow_mut();
+        let rng = self.shared.rng.borrow_mut();
         let item_len = rng.cursor.saturating_sub(self.item_start);
         if item_len > 0 && self.item_start < MAX_PREFIX_LEN {
             let len = item_len.min(MAX_PREFIX_LEN - self.item_start);
@@ -300,8 +223,6 @@ impl<Capture: CoverageCapture> Drop for ChildRng<'_, Capture> {
                     len,
                 },
             ));
-            rng.semantics
-                .push(SemanticSpan::new(self.item_start, len, SemanticKind::Item));
         }
     }
 }
@@ -425,7 +346,6 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             seed: self.seed,
             trace: std::mem::take(&mut self.trace),
             draws: std::mem::take(&mut self.draws),
-            semantics: std::mem::take(&mut self.semantics),
             sequences: std::mem::take(&mut self.sequences),
             bytes_consumed: self.bytes_consumed,
             origin: self.origin.clone(),
@@ -623,7 +543,6 @@ where
             seed: active.seed,
             prefix: corpus_prefix,
             draws: active.draws,
-            semantics: active.semantics,
             sequences: active.sequences,
             coverage: coverage_ids,
             removed: removed_ids,

@@ -3,18 +3,15 @@ use super::{
         CAUTIOUS_ENERGY_REFRESH_INTERVAL, CURIOUS_ENERGY_REFRESH_INTERVAL, CandidateOrigin,
         CautiousOptions, CautiousReducer, CorpusSeed, DrawSpan, MAX_CORPUS_LEN,
         MAX_DICTIONARY_VALUES, MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore, Mode,
-        PrefixFingerprint, ReducerPass, ReductionId, ReductionOp, ReductionSpec, SemanticKind,
-        SemanticSpan, SequenceItemSpan, SequenceSpan, State,
+        PrefixFingerprint, ReducerPass, ReductionId, ReductionOp, ReductionSpec, SequenceItemSpan,
+        SequenceSpan, State,
     },
     run::Candidate,
 };
 use crate::coverage::CoverageCapture;
 
-const REDUCER_PASSES: [ReducerPass; 15] = [
+const REDUCER_PASSES: [ReducerPass; 12] = [
     ReducerPass::SequenceDelete,
-    ReducerPass::SemanticLength,
-    ReducerPass::SemanticDelete,
-    ReducerPass::SemanticSimplify,
     ReducerPass::DrawLength,
     ReducerPass::TailTrim,
     ReducerPass::DrawDelete,
@@ -88,7 +85,6 @@ impl CautiousReducer {
         self.best_seed = entry.seed;
         self.best_prefix = entry.prefix.clone();
         self.best_draws = entry.draws.clone();
-        self.best_semantics = entry.semantics.clone();
         self.best_sequences = entry.sequences.clone();
         self.pass_index = 0;
         self.cursor = 0;
@@ -126,7 +122,6 @@ impl CautiousReducer {
                     ReductionContext {
                         prefix: &self.best_prefix,
                         draws: &self.best_draws,
-                        semantics: &self.best_semantics,
                         sequences: &self.best_sequences,
                         dictionary,
                         pressure: &self.range_pressure,
@@ -240,7 +235,6 @@ enum Feedback {
 struct ReductionContext<'a> {
     prefix: &'a [u8],
     draws: &'a [DrawSpan],
-    semantics: &'a [SemanticSpan],
     sequences: &'a [SequenceSpan],
     dictionary: &'a [Vec<u8>],
     pressure: &'a [u16],
@@ -249,16 +243,14 @@ struct ReductionContext<'a> {
 
 fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<ReductionSpec> {
     let mut specs = match pass {
-        ReducerPass::SequenceDelete if context.options.semantic_reductions() => {
-            sequence_delete_specs(
-                context.prefix,
-                context.sequences,
-                context.pressure,
-                context.options,
-            )
-        }
+        ReducerPass::SequenceDelete if context.options.range_reductions() => sequence_delete_specs(
+            context.prefix,
+            context.sequences,
+            context.pressure,
+            context.options,
+        ),
         ReducerPass::SequenceDelete => Vec::new(),
-        ReducerPass::SequenceProject if context.options.semantic_reductions() => {
+        ReducerPass::SequenceProject if context.options.range_reductions() => {
             sequence_project_specs(
                 context.prefix,
                 context.sequences,
@@ -266,7 +258,7 @@ fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<Redu
                 context.options,
             )
         }
-        ReducerPass::SequenceReplace if context.options.semantic_reductions() => {
+        ReducerPass::SequenceReplace if context.options.range_reductions() => {
             sequence_replace_specs(
                 context.prefix,
                 context.sequences,
@@ -275,33 +267,6 @@ fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<Redu
             )
         }
         ReducerPass::SequenceProject | ReducerPass::SequenceReplace => Vec::new(),
-        ReducerPass::SemanticLength if context.options.semantic_reductions() => {
-            semantic_length_specs(
-                context.prefix,
-                context.semantics,
-                context.pressure,
-                context.options,
-            )
-        }
-        ReducerPass::SemanticDelete if context.options.semantic_reductions() => {
-            semantic_delete_specs(
-                context.prefix,
-                context.semantics,
-                context.pressure,
-                context.options,
-            )
-        }
-        ReducerPass::SemanticSimplify if context.options.semantic_reductions() => {
-            semantic_simplify_specs(
-                context.prefix,
-                context.semantics,
-                context.pressure,
-                context.options,
-            )
-        }
-        ReducerPass::SemanticLength
-        | ReducerPass::SemanticDelete
-        | ReducerPass::SemanticSimplify => Vec::new(),
         ReducerPass::DrawLength => draw_length_specs(
             context.prefix,
             context.draws,
@@ -342,7 +307,7 @@ fn sequence_delete_specs(
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
     let mut specs = Vec::new();
-    for sequence in sequences.iter().take(options.semantic_span_limit()) {
+    for sequence in sequences.iter().take(options.range_limit()) {
         if sequence.length_len == 0
             || sequence.length_start >= prefix.len()
             || sequence.length_start.saturating_add(sequence.length_len) > prefix.len()
@@ -395,7 +360,7 @@ fn sequence_project_specs(
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
     let mut specs = Vec::new();
-    for sequence in sequences.iter().take(options.semantic_span_limit()) {
+    for sequence in sequences.iter().take(options.range_limit()) {
         let Some(region) = sequence_region(prefix, sequence) else {
             continue;
         };
@@ -451,7 +416,7 @@ fn sequence_replace_specs(
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
     let mut specs = Vec::new();
-    for sequence in sequences.iter().take(options.semantic_span_limit()) {
+    for sequence in sequences.iter().take(options.range_limit()) {
         let Some(region) = sequence_region(prefix, sequence) else {
             continue;
         };
@@ -633,143 +598,6 @@ fn item_replacement_simplifies(
 fn item_simplicity_key(bytes: &[u8]) -> (usize, usize, &[u8]) {
     let nonzero = bytes.iter().filter(|byte| **byte != 0).count();
     (bytes.len(), nonzero, bytes)
-}
-
-fn semantic_length_specs(
-    prefix: &[u8],
-    semantics: &[SemanticSpan],
-    pressure: &[u16],
-    options: CautiousOptions,
-) -> Vec<ReductionSpec> {
-    let mut specs = Vec::new();
-    for span in semantics
-        .iter()
-        .copied()
-        .filter(|span| span.kind == SemanticKind::Length)
-        .take(options.semantic_span_limit())
-    {
-        if !valid_semantic_span(prefix, span) {
-            continue;
-        }
-        for width in semantic_widths(span) {
-            if span.start + width > prefix.len() {
-                continue;
-            }
-            let current = read_le_word(&prefix[span.start..span.start + width]);
-            for target in small_length_targets(current, width) {
-                specs.push(ReductionSpec {
-                    op: ReductionOp::SetWord {
-                        start: span.start,
-                        width,
-                        target,
-                        zero_until: Some(span.end()),
-                    },
-                    weight: range_weight(pressure, span.start, width),
-                });
-            }
-        }
-    }
-    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
-    specs
-}
-
-fn semantic_delete_specs(
-    prefix: &[u8],
-    semantics: &[SemanticSpan],
-    pressure: &[u16],
-    options: CautiousOptions,
-) -> Vec<ReductionSpec> {
-    let mut specs = Vec::new();
-    for span in semantics
-        .iter()
-        .rev()
-        .copied()
-        .take(options.semantic_span_limit())
-    {
-        if !valid_semantic_span(prefix, span) || span.len >= prefix.len() {
-            continue;
-        }
-        if span.kind != SemanticKind::Item {
-            continue;
-        }
-        specs.push(ReductionSpec {
-            op: ReductionOp::DeleteRange {
-                start: span.start,
-                len: span.len,
-                adjust_first: false,
-            },
-            weight: semantic_weight(span.kind) + range_weight(pressure, span.start, span.len),
-        });
-    }
-    specs.sort_by_key(|spec| {
-        (
-            spec.weight,
-            std::cmp::Reverse(spec.len()),
-            std::cmp::Reverse(spec.start()),
-        )
-    });
-    specs
-}
-
-fn semantic_simplify_specs(
-    prefix: &[u8],
-    semantics: &[SemanticSpan],
-    pressure: &[u16],
-    options: CautiousOptions,
-) -> Vec<ReductionSpec> {
-    let mut specs = Vec::new();
-    for span in semantics
-        .iter()
-        .copied()
-        .filter(|span| span.kind != SemanticKind::Item)
-        .take(options.semantic_span_limit())
-    {
-        if !valid_semantic_span(prefix, span) {
-            continue;
-        }
-
-        if prefix[span.start..span.end()].iter().any(|byte| *byte != 0) {
-            specs.push(ReductionSpec {
-                op: ReductionOp::ZeroRange {
-                    start: span.start,
-                    len: span.len,
-                },
-                weight: semantic_weight(span.kind) + range_weight(pressure, span.start, span.len),
-            });
-        }
-
-        for width in semantic_widths(span) {
-            if span.start + width > prefix.len() {
-                continue;
-            }
-            let current = read_le_word(&prefix[span.start..span.start + width]);
-            for target in smaller_word_targets(current, width) {
-                specs.push(ReductionSpec {
-                    op: ReductionOp::SetWord {
-                        start: span.start,
-                        width,
-                        target,
-                        zero_until: None,
-                    },
-                    weight: semantic_weight(span.kind) + range_weight(pressure, span.start, width),
-                });
-            }
-        }
-
-        for start in semantic_byte_starts(span) {
-            let Some(byte) = prefix.get(start).copied() else {
-                continue;
-            };
-            for value in smaller_byte_targets(byte) {
-                specs.push(ReductionSpec {
-                    op: ReductionOp::SetByte { start, value },
-                    weight: semantic_weight(span.kind) + range_weight(pressure, start, 1),
-                });
-            }
-        }
-    }
-    specs.sort_by_key(|spec| (spec.weight, spec.start(), spec.len(), spec.target()));
-    specs
 }
 
 fn draw_length_specs(
@@ -1225,38 +1053,6 @@ fn push_start(starts: &mut Vec<usize>, len: usize, start: usize) {
 
 fn valid_draw(prefix: &[u8], draw: DrawSpan) -> bool {
     draw.len > 0 && draw.end() <= prefix.len()
-}
-
-fn valid_semantic_span(prefix: &[u8], span: SemanticSpan) -> bool {
-    span.len > 0 && span.end() <= prefix.len()
-}
-
-fn semantic_widths(span: SemanticSpan) -> Vec<usize> {
-    let mut widths = Vec::new();
-    for width in [span.len.min(8), 4, 2, 1] {
-        if width > 0 && width <= span.len && !widths.contains(&width) {
-            widths.push(width);
-        }
-    }
-    widths
-}
-
-fn semantic_byte_starts(span: SemanticSpan) -> Vec<usize> {
-    let mut starts = vec![span.start];
-    if span.len <= 8 {
-        for start in span.start + 1..span.end() {
-            starts.push(start);
-        }
-    }
-    starts
-}
-
-fn semantic_weight(kind: SemanticKind) -> u64 {
-    match kind {
-        SemanticKind::Length => 0,
-        SemanticKind::Item => 8,
-        SemanticKind::Variant => 16,
-    }
 }
 
 fn draw_widths(draw: DrawSpan) -> Vec<usize> {

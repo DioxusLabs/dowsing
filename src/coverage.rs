@@ -159,7 +159,7 @@ impl From<CoverageSet> for ExecutionFeedback {
     }
 }
 
-pub(crate) const CAPTURE_BUSY: &str = "__iterator_fuzz_capture_busy";
+pub(crate) const CAPTURE_BUSY: &str = "__dowsing_capture_busy";
 
 /// Starts and finishes coverage capture for one RNG case.
 pub trait CoverageCapture {

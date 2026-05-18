@@ -53,7 +53,6 @@ where
             bytes_consumed: 0,
             trace: Vec::new(),
             draws: Vec::new(),
-            semantics: Vec::new(),
             sequences: Vec::new(),
             token: Some(token),
             local_capture: None,
@@ -132,7 +131,6 @@ where
         bytes_consumed: 0,
         trace: Vec::new(),
         draws: Vec::new(),
-        semantics: Vec::new(),
         sequences: Vec::new(),
         token: Some(token),
         local_capture: Some(capture),
@@ -421,5 +419,5 @@ pub(super) fn min_path_schedule_energy(
 }
 
 fn case_cost_quality(best: CaseCost, candidate: CaseCost) -> f64 {
-    (best.get().saturating_add(1) as f64 / candidate.get().saturating_add(1) as f64).min(1.0)
+    (best.raw().saturating_add(1) as f64 / candidate.raw().saturating_add(1) as f64).min(1.0)
 }

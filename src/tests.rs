@@ -2,7 +2,6 @@ use crate::*;
 use crate::{
     backends::SancovCoverage,
     coverage::{CoverageCapture, CoverageId, ExecutionFeedback, ParallelCoverageCapture},
-    tuning::CautiousOptions,
 };
 use rand::{Rng, RngCore};
 use std::{
@@ -259,7 +258,7 @@ fn fuzzing_style_assert_panic_still_finishes_capture_in_default_mode() {
 }
 
 #[test]
-fn variant_discard_consumes_and_excludes_coverage() {
+fn rng_discard_consumes_and_excludes_coverage() {
     let capture = ScriptedCapture::new([[1], [2]]);
     let finished = capture.finished();
     let discarded = capture.discarded();
@@ -280,7 +279,7 @@ fn variant_discard_consumes_and_excludes_coverage() {
 }
 
 #[test]
-fn variant_coverage_consumes_and_reports_feature_and_byte_counts() {
+fn rng_coverage_consumes_and_reports_feature_and_byte_counts() {
     let capture = ScriptedCapture::new([vec![1, 2, 3]]);
     let finished = capture.finished();
     let mut curious = curious().with_coverage(capture);
@@ -292,7 +291,9 @@ fn variant_coverage_consumes_and_reports_feature_and_byte_counts() {
         rng.coverage().expect("finish coverage")
     };
 
-    assert_eq!(coverage, CaseCoverage::new(3, 3, 5));
+    assert_eq!(coverage.feature_count(), 3);
+    assert_eq!(coverage.hit_count_weight(), 3);
+    assert_eq!(coverage.bytes_consumed(), 5);
     assert_eq!(*finished.borrow(), [0]);
 
     let stats = curious.stats();
@@ -311,7 +312,8 @@ fn fork_case_replays_consumed_rng_path() {
         (rng.fork_case(), bytes)
     };
 
-    let mut rng = case.replay();
+    let mut replay = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut rng = replay.next().expect("replay rng");
     let replayed = [rng.random::<u8>(), rng.random::<u8>(), rng.random::<u8>()];
 
     assert_eq!(replayed, original);
@@ -685,27 +687,23 @@ fn cautious_minimizes_case_cost_before_coverage_features() {
         let mut rng = cautious.next().expect("first rng");
         let mut bytes = [0; 4];
         rng.fill_bytes(&mut bytes);
-        let coverage = rng
-            .coverage_with_cost(CaseCost::new(1))
-            .expect("finish first case");
-        assert_eq!(coverage.case_cost(), CaseCost::new(1));
+        let coverage = rng.coverage_with_cost(1).expect("finish first case");
+        assert_eq!(coverage.case_cost(), 1.into());
     }
     {
         let mut rng = cautious.next().expect("second rng");
         let mut bytes = [0; 1];
         rng.fill_bytes(&mut bytes);
-        rng.coverage_with_cost(CaseCost::new(2))
-            .expect("finish second case");
+        rng.coverage_with_cost(2).expect("finish second case");
     }
 
-    assert_eq!(cautious.test_best_case_cost(), Some(CaseCost::new(1)));
+    assert_eq!(cautious.test_best_case_cost(), Some(1.into()));
     assert_eq!(cautious.test_best_path_score(), Some((3, 3, 4)));
 }
 
 #[test]
 fn case_cost_orders_lower_values_first() {
-    assert!(CaseCost::new(2) < CaseCost::new(3));
-    assert_eq!(CaseCost::new(2).get(), 2);
+    assert!(CaseCost::from(2) < CaseCost::from(3));
 }
 
 #[test]
@@ -943,7 +941,7 @@ fn sample_modulo_len_payload(rng: &mut impl Rng) -> usize {
     len
 }
 
-fn sample_semantic_len_payload<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) -> usize {
+fn sample_range_len_payload<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) -> usize {
     rng.range(0..64)
         .map(|mut item| {
             let _ = item.random::<u8>();
@@ -962,46 +960,19 @@ fn sample_byte_sequence<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) ->
 }
 
 #[test]
-fn structured_range_yields_rng_like_children() {
+fn range_yields_rng_like_children() {
     let mut cases = curious().with_coverage(NoCoverage);
     let mut rng = cases.next().expect("case rng");
     let values = {
         let mut items = rng.range(1..=3);
         let mut values = Vec::new();
         while let Some(mut item) = items.next() {
-            let index = item.index();
-            values.push((index, item.variant(4), item.random::<u8>()));
+            values.push((item.random_range(0..4), item.random::<u8>()));
         }
         values
     };
 
     assert!((1..=3).contains(&values.len()));
-    assert!(
-        values
-            .iter()
-            .enumerate()
-            .all(|(index, (item_index, _, _))| *item_index == index)
-    );
-    rng.discard();
-}
-
-#[test]
-fn structured_range_can_reorder_children() {
-    let mut cases = curious().with_coverage(NoCoverage);
-    let mut rng = cases.next().expect("case rng");
-    let items = rng.range(1..=4);
-    let len = items.len();
-    let observed: Vec<_> = items
-        .reorder((0..len).rev())
-        .map(|mut item| {
-            let child = item.index();
-            let _ = item.random::<u8>();
-            child
-        })
-        .collect();
-
-    let expected: Vec<_> = (0..len).rev().collect();
-    assert_eq!(observed, expected);
     rng.discard();
 }
 
@@ -1033,7 +1004,7 @@ fn cautious_minimizes_word_modulo_length_prefix() {
 }
 
 #[test]
-fn cautious_uses_semantic_length_before_generic_byte_shrinks() {
+fn cautious_uses_range_length_before_generic_byte_shrinks() {
     let mut prefix = 20_u32.to_le_bytes().to_vec();
     prefix.extend(std::iter::repeat_n(255, 20));
     let case = Case::from_raw_parts(0, prefix, true);
@@ -1043,12 +1014,12 @@ fn cautious_uses_semantic_length_before_generic_byte_shrinks() {
 
     {
         let mut rng = cautious.next().expect("seed rng");
-        assert_eq!(sample_semantic_len_payload(&mut rng), 20);
+        assert_eq!(sample_range_len_payload(&mut rng), 20);
         rng.coverage().expect("finish seed coverage");
     }
 
-    let mut rng = cautious.next().expect("semantic length reduction");
-    assert_eq!(sample_semantic_len_payload(&mut rng), 0);
+    let mut rng = cautious.next().expect("range length reduction");
+    assert_eq!(sample_range_len_payload(&mut rng), 0);
     rng.discard();
 }
 
@@ -1079,7 +1050,6 @@ fn cautious_sequence_projection_can_keep_non_contiguous_items() {
     let case = Case::from_raw_parts(0, prefix, true);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
-        .with_options(CautiousOptions::builder().with_pass_candidate_limit(16))
         .with_case(case);
 
     {
@@ -1167,22 +1137,6 @@ fn cautious_sequence_replace_reuses_simpler_prior_items() {
         found,
         "sequence replacement should reuse simpler earlier item bytes"
     );
-}
-
-#[test]
-fn cautious_havoc_can_be_disabled() {
-    let case = Case::from_raw_parts(0, Vec::new(), true);
-    let mut cautious = cautious()
-        .with_coverage(ScriptedCapture::new([vec![1]]))
-        .with_options(CautiousOptions::builder().with_havoc(false))
-        .with_case(case);
-
-    {
-        let rng = cautious.next().expect("seed rng");
-        rng.coverage().expect("finish seed coverage");
-    }
-
-    assert!(cautious.next().is_none());
 }
 
 #[test]
@@ -1446,9 +1400,10 @@ fn default_sancov_parallel_iterator_requires_trace_pc_guard() {
 
 #[test]
 fn llvm_coverage_fuzzing_style_workflow_runs_when_instrumented() {
-    let Ok(mut curious) = curious().llvm_coverage() else {
+    let Ok(coverage) = backends::LlvmCoverage::new() else {
         return;
     };
+    let mut curious = curious().with_coverage(coverage);
 
     curious
         .by_ref()

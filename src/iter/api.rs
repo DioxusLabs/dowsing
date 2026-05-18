@@ -1,7 +1,6 @@
 #[cfg(test)]
 use super::prelude::MinPathScore;
 use super::{
-    no_coverage::NoCoverage,
     prelude::{
         Case, Cautious, CautiousOptions, CautiousReducer, Curious, DEFAULT_CAUTIOUS_MUTATE_DEPTH,
         DEFAULT_MUTATE_DEPTH, DEFAULT_SEED_RATIO, EnergyIndex, Engine, Mode, SearchStats, State,
@@ -13,7 +12,6 @@ use super::{
 use crate::coverage::CoverageId;
 use crate::{
     coverage::{CoverageCapture, CoverageSet, ParallelCoverageCapture},
-    llvm::LlvmCoverage,
     sancov::SancovCoverage,
 };
 use rand::{SeedableRng, rngs::SmallRng};
@@ -566,34 +564,6 @@ where
         shared: engine.shared,
         capture,
         limit,
-    }
-}
-
-impl Curious<NoCoverage> {
-    /// Use LLVM counters from the current instrumented process as the coverage signal.
-    pub fn llvm_coverage(self) -> Result<Curious<LlvmCoverage>, String> {
-        Ok(self.with_coverage(LlvmCoverage::new()?))
-    }
-}
-
-impl Curious<SancovCoverage> {
-    /// Use LLVM source-profile counters instead of SanitizerCoverage feedback.
-    pub fn llvm_coverage(self) -> Result<Curious<LlvmCoverage>, String> {
-        Ok(self.with_coverage(LlvmCoverage::new()?))
-    }
-}
-
-impl Cautious<NoCoverage> {
-    /// Use LLVM counters from the current instrumented process as the coverage signal.
-    pub fn llvm_coverage(self) -> Result<Cautious<LlvmCoverage>, String> {
-        Ok(self.with_coverage(LlvmCoverage::new()?))
-    }
-}
-
-impl Cautious<SancovCoverage> {
-    /// Use LLVM source-profile counters instead of SanitizerCoverage feedback.
-    pub fn llvm_coverage(self) -> Result<Cautious<LlvmCoverage>, String> {
-        Ok(self.with_coverage(LlvmCoverage::new()?))
     }
 }
 

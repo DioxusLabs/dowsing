@@ -10,7 +10,7 @@
 //!
 //! `ITERATOR_FUZZ_BENCH=1 ./target/release/examples/buggy_stack_bench`
 
-use iterator_fuzz::{cautious, curious};
+use dowsing::{cautious, curious};
 use rand::Rng;
 use rayon::prelude::*;
 use std::{
@@ -273,13 +273,13 @@ fn main() {
 struct FoundBug {
     discovery_seed: u64,
     bench_stats: BenchStats,
-    coverage: iterator_fuzz::CaseCoverage,
+    coverage: dowsing::CaseCoverage,
     ops: Vec<Op>,
     failure: String,
 }
 
 fn run_discovery_case(
-    mut rng: iterator_fuzz::CaseRng,
+    mut rng: dowsing::CaseRng,
     minimization_cases: usize,
     trace_best: bool,
 ) -> Option<FoundBug> {

@@ -98,13 +98,13 @@ Failing variants can report a harness-level cost:
 let coverage = variant
     .coverage_with_cost(input.len())
     .expect("finish minimization coverage");
-# assert_eq!(coverage.case_cost().get(), input.len());
+# assert_eq!(coverage.case_cost(), input.len().into());
 ```
 
 Use `coverage_with_cost` for stable value-level preferences such as operation count, input length,
 or AST node count. Use `discard()` for variants that do not reproduce the target behavior at all.
 
-## Structured Generation
+## Range Generation
 
 Generators can use typed structure builders around the bytes they draw from a `CaseRng`:
 
@@ -121,23 +121,12 @@ fn sample_items<C: dowsing::coverage::CoverageCapture>(
 ```
 
 `range` draws a length in the requested bounds and maps each element through a child RNG. The child
-records item spans while still behaving like an RNG, so generation can use `random` and `variant`.
+records item spans while still behaving like an RNG, so generation can use `random`,
+`random_range`, and other `rand::Rng` methods.
 
-Ranges can also choose a child order before generation:
-
-```rust
-let items = rng.range(0..64);
-let len = items.len();
-let reversed: Vec<u8> = items
-    .reorder((0..len).rev())
-    .map(|mut item| item.random())
-    .collect();
-```
-
-`cautious()` uses this structure to try length, item, and variant reductions before
-falling back to generic byte shrinking. Larger harnesses can tune this with
-`tuning::CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget,
-candidate caps, draw/span limits, semantic reductions, and havoc fallback.
+`cautious()` uses range structure to try length and item reductions before falling back to generic
+byte shrinking. Larger harnesses can tune the reducer budget with
+`tuning::CautiousOptions::new().with_reducer_budget(...)` and `cautious().with_options(...)`.
 
 ## Parallel Search
 
