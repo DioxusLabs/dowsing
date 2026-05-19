@@ -1,4 +1,5 @@
-use super::RngByteMutation;
+use super::{RngTraceMutation, edit_trace_bytes};
+use dowsing_rng::Trace;
 
 #[derive(Debug, Clone)]
 pub(crate) struct MinByte {
@@ -6,12 +7,10 @@ pub(crate) struct MinByte {
     pub(super) value: u8,
 }
 
-impl RngByteMutation for MinByte {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        let Some(byte) = prefix.get_mut(self.index) else {
-            return false;
-        };
-        *byte = (*byte).min(self.value);
-        true
+impl RngTraceMutation for MinByte {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+        edit_trace_bytes(trace, self.index, 1, |bytes| {
+            bytes[0] = bytes[0].min(self.value);
+        })
     }
 }

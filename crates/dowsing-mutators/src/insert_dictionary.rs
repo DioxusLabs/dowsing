@@ -1,4 +1,5 @@
-use super::RngByteMutation;
+use super::{RngTraceMutation, replace_trace_span};
+use dowsing_rng::Trace;
 
 #[derive(Debug, Clone)]
 pub(crate) struct InsertDictionary {
@@ -6,15 +7,11 @@ pub(crate) struct InsertDictionary {
     pub(super) dictionary_index: usize,
 }
 
-impl RngByteMutation for InsertDictionary {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, dictionary: &[Vec<u8>]) -> bool {
+impl RngTraceMutation for InsertDictionary {
+    fn apply_trace(&self, trace: &mut Trace, dictionary: &[Vec<u8>]) -> bool {
         let Some(bytes) = dictionary.get(self.dictionary_index) else {
             return false;
         };
-        if self.index > prefix.len() {
-            return false;
-        }
-        prefix.splice(self.index..self.index, bytes.iter().copied());
-        true
+        replace_trace_span(trace, self.index, 0, bytes)
     }
 }

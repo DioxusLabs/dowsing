@@ -14,6 +14,86 @@ use std::{
     rc::Rc,
 };
 
+fn case_from_bytes(seed: u64, bytes: Vec<u8>) -> Case {
+    Case {
+        seed,
+        root: TraceNode {
+            events: if bytes.is_empty() {
+                Vec::new()
+            } else {
+                vec![TraceEvent::Draw {
+                    bytes,
+                    affinity: ByteAffinity::Any,
+                }]
+            },
+        },
+    }
+}
+
+fn case_from_sequence(seed: u64, len: u32, bytes: impl IntoIterator<Item = u8>) -> Case {
+    case_from_sequence_with_tail(seed, len, bytes, Vec::new())
+}
+
+fn case_from_sequence_with_tail(
+    seed: u64,
+    len: u32,
+    bytes: impl IntoIterator<Item = u8>,
+    tail: Vec<u8>,
+) -> Case {
+    let mut events = vec![TraceEvent::Range {
+        length: len.to_le_bytes().to_vec(),
+        children: bytes
+            .into_iter()
+            .map(|byte| TraceNode {
+                events: vec![TraceEvent::Draw {
+                    bytes: vec![byte],
+                    affinity: ByteAffinity::Any,
+                }],
+            })
+            .collect(),
+    }];
+    if !tail.is_empty() {
+        events.push(TraceEvent::Draw {
+            bytes: tail,
+            affinity: ByteAffinity::Any,
+        });
+    }
+    Case {
+        seed,
+        root: TraceNode { events },
+    }
+}
+
+fn case_from_nested_sequence(
+    seed: u64,
+    outer_len: u32,
+    inner_len: u32,
+    bytes: impl IntoIterator<Item = u8>,
+) -> Case {
+    Case {
+        seed,
+        root: TraceNode {
+            events: vec![TraceEvent::Range {
+                length: outer_len.to_le_bytes().to_vec(),
+                children: vec![TraceNode {
+                    events: vec![TraceEvent::Range {
+                        length: inner_len.to_le_bytes().to_vec(),
+                        children: bytes
+                            .into_iter()
+                            .map(|byte| TraceNode {
+                                events: vec![TraceEvent::Draw {
+                                    bytes: vec![byte],
+                                    affinity: ByteAffinity::Any,
+                                }],
+                            })
+                            .collect(),
+                    }],
+                }],
+            }],
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TestCapture {
     next_id: u64,
@@ -441,7 +521,7 @@ fn cautious_with_case_replays_word_rng_path() {
 #[test]
 fn replay_past_case_tree_falls_back_to_rng_not_zero() {
     let seed = 7;
-    let case = Case::from_flat_prefix(seed, vec![42]);
+    let case = case_from_bytes(seed, vec![42]);
     let mut replay = cautious().with_coverage(NoCoverage).with_case(case);
     let mut rng = replay.next().expect("cautious replay rng");
     let mut bytes = [0; 2];
@@ -456,11 +536,9 @@ fn replay_past_case_tree_falls_back_to_rng_not_zero() {
 
 #[test]
 fn tree_case_replays_range_children() {
-    let mut prefix = 2_u32.to_le_bytes().to_vec();
-    prefix.extend([10, 20]);
     let mut source = cautious()
         .with_coverage(NoCoverage)
-        .with_case(Case::from_flat_prefix(11, prefix));
+        .with_case(case_from_sequence(11, 2, [10, 20]));
     let case = {
         let mut rng = source.next().expect("source rng");
         assert_eq!(sample_byte_sequence(&mut rng), [10, 20]);
@@ -620,7 +698,7 @@ fn cautious_havoc_keeps_generating_byte_variants() {
 
 #[test]
 fn cautious_best_neighbors_try_structural_shrinks_before_byte_budget_is_exhausted() {
-    let case = Case::from_flat_prefix(0, vec![255; 80]);
+    let case = case_from_bytes(0, vec![255; 80]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..16).map(|_| vec![1])))
         .with_case(case);
@@ -648,7 +726,7 @@ fn cautious_best_neighbors_try_structural_shrinks_before_byte_budget_is_exhauste
 
 #[test]
 fn cautious_best_neighbors_try_small_word_targets() {
-    let case = Case::from_flat_prefix(0, vec![44, 1, 0, 0]);
+    let case = case_from_bytes(0, vec![44, 1, 0, 0]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
         .with_case(case);
@@ -768,8 +846,8 @@ fn cautious_minimizes_feature_count_before_rng_bytes() {
 
 #[test]
 fn cautious_minimizes_case_cost_before_coverage_features() {
-    let larger_coverage = Case::from_flat_prefix(0, vec![1, 2, 3, 4]);
-    let smaller_coverage = Case::from_flat_prefix(0, vec![1]);
+    let larger_coverage = case_from_bytes(0, vec![1, 2, 3, 4]);
+    let smaller_coverage = case_from_bytes(0, vec![1]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new([vec![1, 2, 3], vec![1]]))
         .with_cases([larger_coverage, smaller_coverage]);
@@ -799,8 +877,8 @@ fn case_cost_orders_lower_values_first() {
 
 #[test]
 fn cautious_minimizes_hit_count_weight_before_rng_bytes() {
-    let first = Case::from_flat_prefix(0, vec![1]);
-    let second = Case::from_flat_prefix(0, vec![1, 2, 3, 4]);
+    let first = case_from_bytes(0, vec![1]);
+    let second = case_from_bytes(0, vec![1, 2, 3, 4]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new([vec![1], vec![1]]).with_hit_count_weights([10, 1]))
         .with_case(first)
@@ -852,7 +930,7 @@ fn cautious_uses_rng_bytes_as_feature_count_tie_breaker() {
 
 #[test]
 fn cautious_promotes_equal_length_simpler_rng_traces() {
-    let case = Case::from_flat_prefix(0, vec![255; 32]);
+    let case = case_from_bytes(0, vec![255; 32]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new([vec![1], vec![1]]))
         .with_case(case);
@@ -883,7 +961,7 @@ fn cautious_promotes_equal_length_simpler_rng_traces() {
 fn cautious_draw_spans_interleave_after_rejected_length_shrink() {
     let mut prefix = 200_u32.to_le_bytes().to_vec();
     prefix.extend(std::iter::repeat_n(255, 32));
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_bytes(0, prefix);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..8).map(|_| vec![1])))
         .with_case(case);
@@ -914,7 +992,7 @@ fn cautious_draw_spans_interleave_after_rejected_length_shrink() {
 
 #[test]
 fn cautious_discard_updates_reducer_feedback_and_keeps_shrinking() {
-    let case = Case::from_flat_prefix(0, vec![10, 11, 12, 13]);
+    let case = case_from_bytes(0, vec![10, 11, 12, 13]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..16).map(|_| vec![1])))
         .with_case(case);
@@ -951,8 +1029,8 @@ fn cautious_discard_updates_reducer_feedback_and_keeps_shrinking() {
 
 #[test]
 fn cautious_shortlex_promotes_equal_score_lexicographically_smaller_trace() {
-    let larger = Case::from_flat_prefix(0, vec![2]);
-    let smaller = Case::from_flat_prefix(0, vec![1]);
+    let larger = case_from_bytes(0, vec![2]);
+    let smaller = case_from_bytes(0, vec![1]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new([vec![1], vec![1]]))
         .with_cases([larger, smaller]);
@@ -971,7 +1049,7 @@ fn cautious_shortlex_promotes_equal_score_lexicographically_smaller_trace() {
 
 #[test]
 fn cautious_block_zero_operation_can_zero_whole_trace() {
-    let case = Case::from_flat_prefix(0, vec![5, 6, 7, 8]);
+    let case = case_from_bytes(0, vec![5, 6, 7, 8]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..128).map(|_| vec![1])))
         .with_case(case);
@@ -1000,7 +1078,7 @@ fn cautious_block_zero_operation_can_zero_whole_trace() {
 
 #[test]
 fn cautious_dictionary_repair_operation_uses_feedback_dictionary() {
-    let case = Case::from_flat_prefix(0, vec![9, 9, 9]);
+    let case = case_from_bytes(0, vec![9, 9, 9]);
     let mut cautious = cautious()
         .with_coverage(
             ScriptedCapture::new((0..512).map(|_| vec![1])).with_dictionary([vec![7, 0, 7]]),
@@ -1083,11 +1161,11 @@ fn signed_value_cost(value: i32) -> usize {
     }
 }
 
-fn sample_range_from_prefix<T, R>(prefix: &[u8], range: R) -> T
+fn sample_range_from_bytes<T, R>(prefix: &[u8], range: R) -> T
 where
     R: ShrinkRange<T>,
 {
-    let case = Case::from_flat_prefix(0, prefix.to_vec());
+    let case = case_from_bytes(0, prefix.to_vec());
     let mut replay = cautious().with_coverage(NoCoverage).with_case(case);
     let mut rng = replay.next().expect("range replay rng");
     rng.random_range(range)
@@ -1097,35 +1175,35 @@ where
 fn random_range_signed_ranges_shrink_toward_zero() {
     let expected = [0, 1, -1, 2, -2, 3, -3];
     for (rank, expected) in expected.into_iter().enumerate() {
-        let value: i32 = sample_range_from_prefix(&[rank as u8], -3..=3);
+        let value: i32 = sample_range_from_bytes(&[rank as u8], -3..=3);
         assert_eq!(value, expected);
     }
 }
 
 #[test]
 fn random_range_positive_and_negative_ranges_shrink_from_simplest_bound() {
-    let positive: i32 = sample_range_from_prefix(&[0], 10..15);
+    let positive: i32 = sample_range_from_bytes(&[0], 10..15);
     assert_eq!(positive, 10);
-    let positive: i32 = sample_range_from_prefix(&[4], 10..15);
+    let positive: i32 = sample_range_from_bytes(&[4], 10..15);
     assert_eq!(positive, 14);
 
-    let negative: i32 = sample_range_from_prefix(&[0], -5..=-1);
+    let negative: i32 = sample_range_from_bytes(&[0], -5..=-1);
     assert_eq!(negative, -1);
-    let negative: i32 = sample_range_from_prefix(&[4], -5..=-1);
+    let negative: i32 = sample_range_from_bytes(&[4], -5..=-1);
     assert_eq!(negative, -5);
 }
 
 #[test]
 fn random_range_unsigned_prefix_ranges_start_at_zero() {
-    let exclusive: u32 = sample_range_from_prefix(&[4], ..5u32);
+    let exclusive: u32 = sample_range_from_bytes(&[4], ..5u32);
     assert_eq!(exclusive, 4);
-    let inclusive: u32 = sample_range_from_prefix(&[5], ..=5u32);
+    let inclusive: u32 = sample_range_from_bytes(&[5], ..=5u32);
     assert_eq!(inclusive, 5);
 }
 
 #[test]
 fn case_rng_random_range_is_inherent_even_with_rand_rng_in_scope() {
-    let case = Case::from_flat_prefix(0, vec![0, 0]);
+    let case = case_from_bytes(0, vec![0, 0]);
     let mut replay = cautious().with_coverage(NoCoverage).with_case(case);
     let mut rng = replay.next().expect("range replay rng");
 
@@ -1140,12 +1218,12 @@ fn case_rng_random_range_is_inherent_even_with_rand_rng_in_scope() {
 #[test]
 fn random_range_empty_ranges_panic() {
     let exclusive = catch_unwind(AssertUnwindSafe(|| {
-        let _: u32 = sample_range_from_prefix(&[0], 5u32..5u32);
+        let _: u32 = sample_range_from_bytes(&[0], 5u32..5u32);
     }));
     assert!(exclusive.is_err());
 
     let inclusive = catch_unwind(AssertUnwindSafe(|| {
-        let _: i32 = sample_range_from_prefix(&[0], 5..=4);
+        let _: i32 = sample_range_from_bytes(&[0], 5..=4);
     }));
     assert!(inclusive.is_err());
 }
@@ -1175,7 +1253,7 @@ fn deletion_cost((values, index): &(Vec<i32>, usize)) -> usize {
 
 #[test]
 fn cautious_shrinks_duplicate_values_to_zero_with_random_range() {
-    let case = Case::from_flat_prefix(0, vec![0, 0, 0, 0, 1, 1, 0]);
+    let case = case_from_sequence_with_tail(0, 2, [1, 1], vec![0]);
     let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
     let mut best = None;
 
@@ -1215,7 +1293,7 @@ fn equal_scalar_group_cost(values: &[i32]) -> usize {
 
 #[test]
 fn cautious_shrinks_equal_scalar_group_with_random_range() {
-    let case = Case::from_flat_prefix(0, vec![15, 0, 15, 0, 15, 0, 15, 0]);
+    let case = case_from_bytes(0, vec![15, 0, 15, 0, 15, 0, 15, 0]);
     let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
     let mut best = None;
 
@@ -1285,7 +1363,7 @@ fn shrink_difference_pair(
 
 #[test]
 fn cautious_shrinks_common_offset_pair_with_random_range() {
-    let case = Case::from_flat_prefix(0, vec![4, 3, 3, 3]);
+    let case = case_from_bytes(0, vec![4, 3, 3, 3]);
 
     assert_eq!(
         shrink_difference_pair(case, difference_one_fails, 4096),
@@ -1295,7 +1373,7 @@ fn cautious_shrinks_common_offset_pair_with_random_range() {
 
 #[test]
 fn cautious_shrinks_small_difference_after_common_offset_with_random_range() {
-    let case = Case::from_flat_prefix(0, vec![4, 3, 3, 3]);
+    let case = case_from_bytes(0, vec![4, 3, 3, 3]);
 
     assert_eq!(
         shrink_difference_pair(case, difference_small_fails, 32),
@@ -1317,7 +1395,7 @@ fn common_offset_group_cost(values: &[i32]) -> usize {
 
 #[test]
 fn cautious_shrinks_common_offset_group_with_random_range() {
-    let case = Case::from_flat_prefix(0, vec![22, 0, 21, 0, 20, 0]);
+    let case = case_from_bytes(0, vec![22, 0, 21, 0, 20, 0]);
     let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
     let mut best = None;
 
@@ -1453,7 +1531,7 @@ fn child_discard_discards_whole_case_once() {
 fn cautious_minimizes_word_modulo_length_prefix() {
     let mut prefix = vec![63, 0, 0, 0];
     prefix.extend(std::iter::repeat_n(0, 63));
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_bytes(0, prefix);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..128).map(|_| vec![1])))
         .with_case(case);
@@ -1478,9 +1556,7 @@ fn cautious_minimizes_word_modulo_length_prefix() {
 
 #[test]
 fn cautious_uses_range_length_before_generic_byte_shrinks() {
-    let mut prefix = 20_u32.to_le_bytes().to_vec();
-    prefix.extend(std::iter::repeat_n(255, 20));
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_sequence(0, 20, std::iter::repeat_n(255, 20));
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..4).map(|_| vec![1])))
         .with_case(case);
@@ -1498,9 +1574,7 @@ fn cautious_uses_range_length_before_generic_byte_shrinks() {
 
 #[test]
 fn cautious_sequence_delete_lowers_length_and_removes_item_bytes() {
-    let mut prefix = 3_u32.to_le_bytes().to_vec();
-    prefix.extend([10, 20, 30]);
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_sequence(0, 3, [10, 20, 30]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..4).map(|_| vec![1])))
         .with_case(case);
@@ -1518,9 +1592,7 @@ fn cautious_sequence_delete_lowers_length_and_removes_item_bytes() {
 
 #[test]
 fn cautious_sequence_projection_can_keep_non_contiguous_items() {
-    let mut prefix = 4_u32.to_le_bytes().to_vec();
-    prefix.extend([10, 20, 30, 40]);
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_sequence(0, 4, [10, 20, 30, 40]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
         .with_case(case);
@@ -1550,9 +1622,7 @@ fn cautious_sequence_projection_can_keep_non_contiguous_items() {
 
 #[test]
 fn cautious_sequence_projection_can_move_later_item_to_front() {
-    let mut prefix = 3_u32.to_le_bytes().to_vec();
-    prefix.extend([10, 20, 30]);
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_sequence(0, 3, [10, 20, 30]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
         .with_case(case);
@@ -1582,9 +1652,7 @@ fn cautious_sequence_projection_can_move_later_item_to_front() {
 
 #[test]
 fn cautious_sequence_replace_reuses_simpler_prior_items() {
-    let mut prefix = 3_u32.to_le_bytes().to_vec();
-    prefix.extend([1, 99, 99]);
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_sequence(0, 3, [1, 99, 99]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..128).map(|_| vec![1])))
         .with_case(case);
@@ -1614,10 +1682,7 @@ fn cautious_sequence_replace_reuses_simpler_prior_items() {
 
 #[test]
 fn cautious_uses_nested_range_sequence_spans() {
-    let mut prefix = 1_u32.to_le_bytes().to_vec();
-    prefix.extend(3_u32.to_le_bytes());
-    prefix.extend([10, 20, 30]);
-    let case = Case::from_flat_prefix(0, prefix);
+    let case = case_from_nested_sequence(0, 1, 3, [10, 20, 30]);
     let mut cautious = cautious()
         .with_coverage(ScriptedCapture::new((0..64).map(|_| vec![1])))
         .with_case(case);
@@ -1660,7 +1725,7 @@ fn fuzzing_style_reuses_and_mutates_successful_rng_prefixes() {
     assert_eq!(stats.mutated(), 3);
     assert_ne!(
         samples[0], samples[1],
-        "after the first accepted case, subsequent samples should come from mutated RNG prefixes"
+        "after the first accepted case, subsequent samples should come from mutated RNG traces"
     );
 }
 
@@ -1719,7 +1784,7 @@ fn mutate_depth_stacks_prefix_mutations() {
     assert_eq!(shallow_samples[0], deep_samples[0]);
     assert_ne!(
         shallow_samples[1], deep_samples[1],
-        "stacking more prefix mutations should change the generated neighbourhood"
+        "stacking more trace-byte mutations should change the generated neighbourhood"
     );
 }
 
@@ -1774,8 +1839,14 @@ struct FixedPrefixSource {
 
 impl CandidateSource for FixedPrefixSource {
     fn next_candidate(&mut self, context: &mut MutationContext<'_>) -> Option<MutationCandidate> {
-        assert_eq!(context.parent_prefix().first(), Some(&9));
-        Some(MutationCandidate::from_prefix(self.prefix.clone()).with_mutation::<Self>())
+        assert_eq!(context.parent().flatten_prefix().first(), Some(&9));
+        Some(
+            MutationCandidate::from_case(case_from_bytes(
+                context.fallback_seed(),
+                self.prefix.clone(),
+            ))
+            .with_mutation::<Self>(),
+        )
     }
 
     fn record_feedback(&mut self, feedback: SourceFeedback) {
@@ -1795,7 +1866,7 @@ fn optimizer_accepts_custom_candidate_sources() {
     };
     let mut optimizer = optimize(goals::MaximizeCoverage)
         .with_coverage(ScriptedCapture::new([[1], [2]]))
-        .with_case(Case::from_flat_prefix(11, vec![9]))
+        .with_case(case_from_bytes(11, vec![9]))
         .with_fresh_roots(false)
         .with_mutations([MutationSource::custom(source)]);
 

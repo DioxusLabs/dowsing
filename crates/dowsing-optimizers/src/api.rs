@@ -281,7 +281,7 @@ impl<Capture: CoverageCapture> Curious<Capture> {
         }
     }
 
-    /// Set how many byte-prefix mutations are stacked in havoc-style candidate generation.
+    /// Set how many trace-byte mutations are stacked in havoc-style candidate generation.
     pub fn with_mutate_depth(self, depth: usize) -> Self {
         Self {
             engine: self.engine.with_mutate_depth(depth),

@@ -1,6 +1,5 @@
 use super::{
-    RngByteMutation, RngTreeMutation, apply_to_sequence_range, child_spans, nonempty_extent,
-    write_le_word,
+    RngTraceMutation, apply_to_sequence_range, child_spans, nonempty_extent, write_le_word,
 };
 use dowsing_rng::{Trace, TraceNode};
 
@@ -14,35 +13,8 @@ pub(crate) struct ProjectSequenceItems {
     pub(super) items: Vec<(usize, usize)>,
 }
 
-impl RngByteMutation for ProjectSequenceItems {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        if self.length_width == 0
-            || self.length_start.saturating_add(self.length_width) > prefix.len()
-            || self.replace_start.saturating_add(self.replace_len) > prefix.len()
-        {
-            return false;
-        }
-        let mut replacement = Vec::new();
-        for (start, len) in &self.items {
-            if *len == 0 || start.saturating_add(*len) > prefix.len() {
-                return false;
-            }
-            replacement.extend_from_slice(&prefix[*start..*start + *len]);
-        }
-        write_le_word(
-            &mut prefix[self.length_start..self.length_start + self.length_width],
-            self.target_len as u64,
-        );
-        prefix.splice(
-            self.replace_start..self.replace_start + self.replace_len,
-            replacement,
-        );
-        true
-    }
-}
-
-impl RngTreeMutation for ProjectSequenceItems {
-    fn apply_tree(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+impl RngTraceMutation for ProjectSequenceItems {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
         apply_to_sequence_range(
             trace,
             self.length_start,

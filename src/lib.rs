@@ -33,8 +33,8 @@ pub mod tuning {
 
 pub use backends::NoCoverage;
 pub use dowsing_core::{
-    BuiltInMutationSource, CandidateSource, Case, MutationCandidate, MutationContext,
-    MutationSource, SourceFeedback,
+    BuiltInMutationSource, ByteAffinity, CandidateSource, Case, MutationCandidate, MutationContext,
+    MutationSource, SourceFeedback, TraceEvent, TraceNode,
 };
 pub use dowsing_mutators::mutations;
 pub use dowsing_optimizers::{

@@ -171,7 +171,7 @@ impl CautiousReducer {
                 state.drained = true;
             }
 
-            let Some((mut case, mut prefix)) = spec.op.materialize(
+            let Some((case, prefix)) = spec.op.materialize(
                 self.best_seed,
                 &self.best_case,
                 &self.best_prefix,
@@ -180,8 +180,7 @@ impl CautiousReducer {
                 continue;
             };
             if prefix.len() > MAX_PREFIX_LEN {
-                prefix.truncate(MAX_PREFIX_LEN);
-                case = super::prelude::Case::from_flat_prefix(self.best_seed, prefix.clone());
+                continue;
             }
             if prefix == self.best_prefix {
                 continue;

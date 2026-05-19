@@ -1,4 +1,5 @@
-use super::RngByteMutation;
+use super::{RngTraceMutation, edit_trace_bytes};
+use dowsing_rng::Trace;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ZeroRange {
@@ -6,12 +7,11 @@ pub(crate) struct ZeroRange {
     pub(super) len: usize,
 }
 
-impl RngByteMutation for ZeroRange {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        if self.len == 0 || self.start.saturating_add(self.len) > prefix.len() {
+impl RngTraceMutation for ZeroRange {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+        if self.len == 0 {
             return false;
         }
-        prefix[self.start..self.start + self.len].fill(0);
-        true
+        edit_trace_bytes(trace, self.start, self.len, |bytes| bytes.fill(0))
     }
 }

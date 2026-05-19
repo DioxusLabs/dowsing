@@ -1,4 +1,7 @@
-use super::{RngByteMutation, shrink_first_by, subtract_first};
+use super::{
+    RngTraceMutation, edit_all_trace_bytes, replace_trace_span, shrink_first_by, subtract_first,
+};
+use dowsing_rng::Trace;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FirstByteAdjustment {
@@ -14,16 +17,22 @@ pub(crate) struct DeleteRange {
     pub(super) first_byte: FirstByteAdjustment,
 }
 
-impl RngByteMutation for DeleteRange {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        if self.len == 0 || self.start.saturating_add(self.len) > prefix.len() {
+impl RngTraceMutation for DeleteRange {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+        if self.len == 0 {
             return false;
         }
-        prefix.drain(self.start..self.start + self.len);
+        if !replace_trace_span(trace, self.start, self.len, &[]) {
+            return false;
+        }
         match self.first_byte {
             FirstByteAdjustment::None => {}
-            FirstByteAdjustment::ByDeletedLen => shrink_first_by(prefix, self.len),
-            FirstByteAdjustment::ByValue(amount) => subtract_first(prefix, amount),
+            FirstByteAdjustment::ByDeletedLen => {
+                return edit_all_trace_bytes(trace, |bytes| shrink_first_by(bytes, self.len));
+            }
+            FirstByteAdjustment::ByValue(amount) => {
+                return edit_all_trace_bytes(trace, |bytes| subtract_first(bytes, amount));
+            }
         }
         true
     }

@@ -69,7 +69,7 @@ for mut rng in optimize(goals::MaximizeCoverage)
 
 `optimize(goal)` drives a set of candidate sources toward the chosen goal. The coverage goal keeps
 executions that find useful coverage, stores the consumed RNG trace, and later mutates accepted
-flattened prefixes to explore nearby inputs. Trace storage and replay are implemented in the
+trace bytes to explore nearby inputs. Trace storage and replay are implemented in the
 workspace `dowsing-rng` crate; `dowsing::Case` is a reexport of that trace type for the
 coverage-guided API.
 
@@ -98,9 +98,9 @@ let search = optimize(goals::MaximizeCoverage).with_mutations([
 ]);
 ```
 
-Custom sources implement `CandidateSource` and return `MutationCandidate::from_prefix(...)` or
-`MutationCandidate::from_case(...)`. Built-in sources include coverage havoc, minimizing havoc, and
-semantic reductions over ranges, scalar draws, and byte spans.
+Custom sources implement `CandidateSource` and return `MutationCandidate::from_case(...)`.
+Built-in sources include coverage havoc, minimizing havoc, and semantic reductions over ranges,
+scalar draws, and byte spans.
 
 ## Domain Costs
 

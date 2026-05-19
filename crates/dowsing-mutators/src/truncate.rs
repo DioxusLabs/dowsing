@@ -1,4 +1,5 @@
-use super::{RngByteMutation, subtract_first};
+use super::{RngTraceMutation, edit_all_trace_bytes, replace_trace_span, subtract_first};
+use dowsing_rng::Trace;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Truncate {
@@ -6,14 +7,17 @@ pub(crate) struct Truncate {
     pub(super) leading_sub: Option<u8>,
 }
 
-impl RngByteMutation for Truncate {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        if self.len > prefix.len() {
+impl RngTraceMutation for Truncate {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+        let trace_len = trace.flatten_prefix().len();
+        if self.len > trace_len {
             return false;
         }
-        prefix.truncate(self.len);
+        if !replace_trace_span(trace, self.len, trace_len - self.len, &[]) {
+            return false;
+        }
         if let Some(amount) = self.leading_sub {
-            subtract_first(prefix, amount);
+            return edit_all_trace_bytes(trace, |bytes| subtract_first(bytes, amount));
         }
         true
     }

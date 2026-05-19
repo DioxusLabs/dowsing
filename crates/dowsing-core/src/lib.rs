@@ -1,7 +1,8 @@
 //! Shared contracts and data types for dowsing crates.
 
 use dowsing_rng::Trace;
-use rand::{Rng, rngs::SmallRng};
+pub use dowsing_rng::{ByteAffinity, TraceEvent, TraceNode};
+use rand::rngs::SmallRng;
 use rustc_hash::FxHashMap;
 use std::{
     any::{Any, TypeId},
@@ -262,57 +263,30 @@ impl CoverageCapture for NoCoverage {
 
 impl ParallelCoverageCapture for NoCoverage {}
 
-/// Byte-prefix mutation.
-pub trait RngByteMutation: fmt::Debug + RngByteMutationClone + Send + Any {
-    /// Apply this mutation to a flattened RNG prefix.
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, dictionary: &[Vec<u8>]) -> bool;
+/// Mutation over a replay trace.
+pub trait RngTraceMutation: fmt::Debug + RngTraceMutationClone + Send + Any {
+    /// Apply this mutation to a replay trace.
+    fn apply_trace(&self, trace: &mut Case, dictionary: &[Vec<u8>]) -> bool;
 }
 
-/// Clone support for boxed byte mutations.
-pub trait RngByteMutationClone {
+/// Clone support for boxed trace mutations.
+pub trait RngTraceMutationClone {
     /// Clone this mutation into a boxed trait object.
-    fn clone_byte_box(&self) -> Box<dyn RngByteMutation>;
+    fn clone_trace_box(&self) -> Box<dyn RngTraceMutation>;
 }
 
-impl<T> RngByteMutationClone for T
+impl<T> RngTraceMutationClone for T
 where
-    T: 'static + RngByteMutation + Clone,
+    T: 'static + RngTraceMutation + Clone,
 {
-    fn clone_byte_box(&self) -> Box<dyn RngByteMutation> {
+    fn clone_trace_box(&self) -> Box<dyn RngTraceMutation> {
         Box::new(self.clone())
     }
 }
 
-impl Clone for Box<dyn RngByteMutation> {
+impl Clone for Box<dyn RngTraceMutation> {
     fn clone(&self) -> Self {
-        self.clone_byte_box()
-    }
-}
-
-/// Structured trace mutation with a byte-prefix fallback.
-pub trait RngTreeMutation: RngByteMutation + RngTreeMutationClone + Send {
-    /// Apply this mutation to a structured RNG trace.
-    fn apply_tree(&self, trace: &mut Case, dictionary: &[Vec<u8>]) -> bool;
-}
-
-/// Clone support for boxed tree mutations.
-pub trait RngTreeMutationClone {
-    /// Clone this mutation into a boxed trait object.
-    fn clone_tree_box(&self) -> Box<dyn RngTreeMutation>;
-}
-
-impl<T> RngTreeMutationClone for T
-where
-    T: 'static + RngTreeMutation + Clone,
-{
-    fn clone_tree_box(&self) -> Box<dyn RngTreeMutation> {
-        Box::new(self.clone())
-    }
-}
-
-impl Clone for Box<dyn RngTreeMutation> {
-    fn clone(&self) -> Self {
-        self.clone_tree_box()
+        self.clone_trace_box()
     }
 }
 
@@ -390,12 +364,12 @@ pub struct ReductionOp {
 
 /// Materializes a deterministic reduction candidate.
 pub trait RngReductionMutation: fmt::Debug + RngReductionMutationClone + Send {
-    /// Build a reduced trace and flattened prefix.
+    /// Build a reduced trace and flattened trace bytes.
     fn materialize(
         &self,
         seed: u64,
         base_case: &Case,
-        base_prefix: &[u8],
+        base_bytes: &[u8],
         dictionary: &[Vec<u8>],
     ) -> Option<(Case, Vec<u8>)>;
 }
@@ -422,48 +396,25 @@ impl Clone for Box<dyn RngReductionMutation> {
 }
 
 #[derive(Debug, Clone)]
-struct ByteReductionMutation {
-    mutator: Box<dyn RngByteMutation>,
+struct TraceReductionMutation {
+    mutator: Box<dyn RngTraceMutation>,
 }
 
-#[derive(Debug, Clone)]
-struct TreeReductionMutation {
-    mutator: Box<dyn RngTreeMutation>,
-}
-
-impl RngReductionMutation for ByteReductionMutation {
-    fn materialize(
-        &self,
-        seed: u64,
-        _base_case: &Case,
-        base_prefix: &[u8],
-        dictionary: &[Vec<u8>],
-    ) -> Option<(Case, Vec<u8>)> {
-        materialize_bytes(seed, base_prefix, dictionary, self.mutator.as_ref())
-    }
-}
-
-impl RngReductionMutation for TreeReductionMutation {
+impl RngReductionMutation for TraceReductionMutation {
     fn materialize(
         &self,
         seed: u64,
         base_case: &Case,
-        base_prefix: &[u8],
+        _base_bytes: &[u8],
         dictionary: &[Vec<u8>],
     ) -> Option<(Case, Vec<u8>)> {
-        let mut case = base_case.clone();
-        if self.mutator.apply_tree(&mut case, dictionary) {
-            let prefix = case.flatten_prefix();
-            Some((case, prefix))
-        } else {
-            materialize_bytes(seed, base_prefix, dictionary, self.mutator.as_ref())
-        }
+        materialize_trace(seed, base_case, dictionary, self.mutator.as_ref())
     }
 }
 
 impl ReductionOp {
-    /// Build a byte-prefix reduction operation.
-    pub fn byte<Mutation>(
+    /// Build a trace reduction operation.
+    pub fn trace<Mutation>(
         start: usize,
         len: usize,
         target: u64,
@@ -471,7 +422,7 @@ impl ReductionOp {
         mutator: Mutation,
     ) -> Self
     where
-        Mutation: RngByteMutation + Clone + 'static,
+        Mutation: RngTraceMutation + Clone + 'static,
     {
         Self {
             start,
@@ -479,41 +430,18 @@ impl ReductionOp {
             target,
             simplification,
             type_id: TypeId::of::<Mutation>(),
-            mutator: Box::new(ByteReductionMutation {
+            mutator: Box::new(TraceReductionMutation {
                 mutator: Box::new(mutator),
             }),
         }
     }
 
-    /// Build a structured trace reduction operation.
-    pub fn tree<Mutation>(
-        start: usize,
-        len: usize,
-        target: u64,
-        simplification: usize,
-        mutator: Mutation,
-    ) -> Self
-    where
-        Mutation: RngTreeMutation + Clone + 'static,
-    {
-        Self {
-            start,
-            len,
-            target,
-            simplification,
-            type_id: TypeId::of::<Mutation>(),
-            mutator: Box::new(TreeReductionMutation {
-                mutator: Box::new(mutator),
-            }),
-        }
-    }
-
-    /// Mutated prefix start.
+    /// Mutated flattened-byte start.
     pub fn start(&self) -> usize {
         self.start
     }
 
-    /// Mutated prefix length.
+    /// Mutated flattened-byte length.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -538,25 +466,27 @@ impl ReductionOp {
         &self,
         seed: u64,
         base_case: &Case,
-        base_prefix: &[u8],
+        base_bytes: &[u8],
         dictionary: &[Vec<u8>],
     ) -> Option<(Case, Vec<u8>)> {
         self.mutator
-            .materialize(seed, base_case, base_prefix, dictionary)
+            .materialize(seed, base_case, base_bytes, dictionary)
     }
 }
 
-fn materialize_bytes(
+fn materialize_trace(
     seed: u64,
-    base_prefix: &[u8],
+    base_case: &Case,
     dictionary: &[Vec<u8>],
-    mutation: &dyn RngByteMutation,
+    mutation: &dyn RngTraceMutation,
 ) -> Option<(Case, Vec<u8>)> {
-    let mut prefix = base_prefix.to_vec();
-    if !mutation.apply_bytes(&mut prefix, dictionary) {
+    let mut case = base_case.clone();
+    case.seed = seed;
+    if !mutation.apply_trace(&mut case, dictionary) {
         return None;
     }
-    Some((Case::from_flat_prefix(seed, prefix.clone()), prefix))
+    let prefix = case.flatten_prefix();
+    Some((case, prefix))
 }
 
 /// Built-in mutation source kinds understood by the default optimizer.
@@ -573,7 +503,6 @@ pub enum BuiltInMutationSource {
 /// Context passed to custom candidate sources.
 pub struct MutationContext<'a> {
     parent: &'a Case,
-    parent_prefix: &'a [u8],
     draws: &'a [dowsing_rng::DrawSpan],
     scalars: &'a [dowsing_rng::ScalarSpan],
     sequences: &'a [dowsing_rng::SequenceSpan],
@@ -587,7 +516,6 @@ impl<'a> MutationContext<'a> {
     /// Build a candidate source context.
     pub fn new(
         parent: &'a Case,
-        parent_prefix: &'a [u8],
         draws: &'a [dowsing_rng::DrawSpan],
         scalars: &'a [dowsing_rng::ScalarSpan],
         sequences: &'a [dowsing_rng::SequenceSpan],
@@ -597,7 +525,6 @@ impl<'a> MutationContext<'a> {
     ) -> Self {
         Self {
             parent,
-            parent_prefix,
             draws,
             scalars,
             sequences,
@@ -611,11 +538,6 @@ impl<'a> MutationContext<'a> {
     /// Parent replay case selected from the corpus.
     pub fn parent(&self) -> &Case {
         self.parent
-    }
-
-    /// Flattened parent bytes.
-    pub fn parent_prefix(&self) -> &[u8] {
-        self.parent_prefix
     }
 
     /// Semantic byte draws recorded by the parent.
@@ -657,26 +579,15 @@ impl<'a> MutationContext<'a> {
 /// Candidate emitted by a custom candidate source.
 #[derive(Debug, Clone)]
 pub struct MutationCandidate {
-    case: Option<Case>,
-    prefix: Option<Vec<u8>>,
+    case: Case,
     mutations: Vec<TypeId>,
 }
 
 impl MutationCandidate {
-    /// Build a candidate from a mutated flattened prefix.
-    pub fn from_prefix(prefix: Vec<u8>) -> Self {
-        Self {
-            case: None,
-            prefix: Some(prefix),
-            mutations: Vec::new(),
-        }
-    }
-
     /// Build a candidate from a full replay case.
     pub fn from_case(case: Case) -> Self {
         Self {
-            case: Some(case),
-            prefix: None,
+            case,
             mutations: Vec::new(),
         }
     }
@@ -694,25 +605,8 @@ impl MutationCandidate {
     }
 
     /// Materialize this candidate into a replay case and mutation IDs.
-    pub fn materialize(
-        mut self,
-        parent_seed: u64,
-        fallback: u64,
-        rng: &mut SmallRng,
-    ) -> (Case, Vec<TypeId>) {
-        let case = if let Some(case) = self.case.take() {
-            case
-        } else {
-            let mut prefix = self.prefix.take().unwrap_or_default();
-            if prefix.is_empty() {
-                prefix.push(rng.random());
-            }
-            if prefix.len() > MAX_PREFIX_LEN {
-                prefix.truncate(MAX_PREFIX_LEN);
-            }
-            Case::from_flat_prefix(parent_seed ^ fallback.rotate_left(17), prefix)
-        };
-        (case, self.mutations)
+    pub fn materialize(self) -> (Case, Vec<TypeId>) {
+        (self.case, self.mutations)
     }
 }
 

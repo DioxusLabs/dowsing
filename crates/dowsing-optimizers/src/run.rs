@@ -4,8 +4,7 @@ use super::{
         select_goal_corpus_index,
     },
     prelude::{
-        CandidateOrigin, Case, Cautious, Curious, Engine, MAX_PREFIX_LEN, MutationWeights, State,
-        StateCore,
+        CandidateOrigin, Case, Cautious, Curious, Engine, MutationWeights, State, StateCore,
     },
     rng::CaseRng,
     shrink::next_cautious_reduction,
@@ -14,7 +13,7 @@ use dowsing_core::{
     BuiltInMutationSource, CandidateSource, CaptureStart, CoverageCapture, MutationContext,
     MutationSourceKind, ParallelCoverageCapture,
 };
-use dowsing_mutators::{havoc_prefix, mutate_prefix};
+use dowsing_mutators::{havoc_trace, mutate_trace};
 use parking_lot::Mutex;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 use std::sync::Arc;
@@ -180,9 +179,8 @@ enum CandidatePlan {
     Ready(Candidate),
     BuiltInMutation {
         source: BuiltInMutationSource,
-        parent_seed: u64,
-        parent_prefix: Vec<u8>,
-        crossover_prefix: Option<Vec<u8>>,
+        parent_case: Case,
+        crossover_case: Option<Case>,
         dictionary: Arc<Vec<Vec<u8>>>,
         mutation_weights: MutationWeights,
         fallback: u64,
@@ -272,28 +270,27 @@ fn choose_havoc_source_plan(
     source: BuiltInMutationSource,
 ) -> Option<CandidatePlan> {
     let index = scheduled_corpus_index(state)?;
-    let (parent_seed, parent_prefix) = {
+    let (parent_seed, parent_case) = {
         let parent = &state.corpus[index];
-        (parent.seed, parent.prefix.clone())
+        (parent.seed, parent.case.clone())
     };
-    let crossover_prefix =
-        if source == BuiltInMutationSource::CoverageHavoc && state.corpus.len() > 1 {
-            let other_index = state.scheduler.random_range(0..state.corpus.len());
-            Some(state.corpus[other_index].prefix.clone())
-        } else {
-            None
-        };
+    let crossover_case = if source == BuiltInMutationSource::CoverageHavoc && state.corpus.len() > 1
+    {
+        let other_index = state.scheduler.random_range(0..state.corpus.len());
+        Some(state.corpus[other_index].case.clone())
+    } else {
+        None
+    };
     record_mutation_schedule(state);
     let fallback = next_fallback_seed(state);
     let rng_seed = state.scheduler.random();
     Some(CandidatePlan::BuiltInMutation {
         source,
-        parent_seed,
-        parent_prefix,
-        crossover_prefix,
+        parent_case,
+        crossover_case,
         dictionary: Arc::clone(&state.dictionary),
         mutation_weights: state.mutation_weights.clone(),
-        fallback,
+        fallback: parent_seed ^ fallback.rotate_left(17),
         rng_seed,
         depth: state.mutate_depth.max(1),
     })
@@ -305,12 +302,10 @@ fn choose_custom_source_plan(
     source: &mut Box<dyn CandidateSource>,
 ) -> Option<CandidatePlan> {
     let index = scheduled_corpus_index(state)?;
-    let (parent_case, parent_seed, parent_prefix, draws, scalars, sequences) = {
+    let (parent_case, draws, scalars, sequences) = {
         let parent = &state.corpus[index];
         (
             parent.case.clone(),
-            parent.seed,
-            parent.prefix.clone(),
             parent.draws.clone(),
             parent.scalars.clone(),
             parent.sequences.clone(),
@@ -322,7 +317,6 @@ fn choose_custom_source_plan(
     let mut rng = SmallRng::seed_from_u64(rng_seed);
     let mut context = MutationContext::new(
         &parent_case,
-        &parent_prefix,
         &draws,
         &scalars,
         &sequences,
@@ -333,7 +327,7 @@ fn choose_custom_source_plan(
     let candidate = source.next_candidate(&mut context)?;
     record_mutation_schedule(state);
     state.next = state.next.wrapping_add(1);
-    let (case, mutations) = candidate.materialize(parent_seed, fallback, &mut rng);
+    let (case, mutations) = candidate.materialize();
     Some(CandidatePlan::Ready(Candidate {
         case,
         mutated: true,
@@ -349,9 +343,8 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
         CandidatePlan::Ready(candidate) => candidate,
         CandidatePlan::BuiltInMutation {
             source,
-            parent_seed,
-            parent_prefix,
-            crossover_prefix,
+            mut parent_case,
+            crossover_case,
             dictionary,
             mutation_weights,
             fallback,
@@ -361,13 +354,12 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
             let mut rng = SmallRng::seed_from_u64(rng_seed);
             match source {
                 BuiltInMutationSource::CoverageHavoc => {
-                    let mut prefix = parent_prefix;
                     let mut kinds = Vec::new();
                     for _ in 0..depth {
-                        if let Some(kind) = mutate_prefix(
-                            &mut prefix,
+                        if let Some(kind) = mutate_trace(
+                            &mut parent_case,
                             &mut rng,
-                            crossover_prefix.as_deref(),
+                            crossover_case.as_ref(),
                             &dictionary,
                             fallback,
                             &mutation_weights,
@@ -375,35 +367,25 @@ fn materialize_candidate(plan: CandidatePlan) -> Candidate {
                             kinds.push(kind);
                         }
                     }
-                    if prefix.is_empty() {
-                        prefix.push(rng.random());
-                    }
-                    if prefix.len() > MAX_PREFIX_LEN {
-                        prefix.truncate(MAX_PREFIX_LEN);
-                    }
+                    parent_case.seed = fallback;
 
                     Candidate {
-                        case: Case::from_flat_prefix(
-                            parent_seed ^ fallback.rotate_left(17),
-                            prefix,
-                        ),
+                        case: parent_case,
                         mutated: true,
                         origin: CandidateOrigin::CuriousMutation(kinds),
                     }
                 }
                 BuiltInMutationSource::MinimizingHavoc => {
-                    let (prefix, kinds) = havoc_prefix(
-                        &parent_prefix,
+                    let (mut case, kinds) = havoc_trace(
+                        &parent_case,
                         &mut rng,
                         depth,
                         &dictionary,
                         &mutation_weights,
                     );
+                    case.seed = fallback;
                     Candidate {
-                        case: Case::from_flat_prefix(
-                            parent_seed ^ fallback.rotate_left(17),
-                            prefix,
-                        ),
+                        case,
                         mutated: true,
                         origin: CandidateOrigin::CautiousHavoc(kinds),
                     }

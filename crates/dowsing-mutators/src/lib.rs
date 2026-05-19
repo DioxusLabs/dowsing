@@ -1,15 +1,19 @@
 mod add_byte;
+mod copy_part;
 mod delete_range;
 mod delete_sequence_items;
 mod drain_prefix;
 mod fill_range;
 mod insert_bytes;
 mod insert_dictionary;
+mod insert_repeated_bytes;
 mod min_byte;
 mod project_sequence_items;
+mod replace_bytes;
 mod replace_dictionary;
 mod set_byte;
 mod set_word;
+mod shuffle_bytes;
 mod sub_byte;
 mod truncate;
 mod xor_bit;
@@ -19,21 +23,23 @@ mod zero_repeated;
 pub mod havoc;
 
 use add_byte::AddByte;
+use copy_part::{CopyPart, CopyPartMode};
 use delete_range::{DeleteRange, FirstByteAdjustment};
 use delete_sequence_items::DeleteSequenceItems;
-use dowsing_core::{
-    BuiltInMutationSource, MutationSource, ReductionOp, RngByteMutation, RngTreeMutation,
-};
-use dowsing_rng::{Trace, TraceEvent, TraceNode};
+use dowsing_core::{BuiltInMutationSource, MutationSource, ReductionOp, RngTraceMutation};
+use dowsing_rng::{ByteAffinity, Trace, TraceEvent, TraceNode};
 use drain_prefix::DrainPrefix;
 use fill_range::FillRange;
 use insert_bytes::InsertBytes;
 use insert_dictionary::InsertDictionary;
+use insert_repeated_bytes::InsertRepeatedBytes;
 use min_byte::MinByte;
 use project_sequence_items::ProjectSequenceItems;
+use replace_bytes::ReplaceBytes;
 use replace_dictionary::{ReplaceDictionary, ReplaceMode};
 use set_byte::SetByte;
 use set_word::SetWord;
+use shuffle_bytes::ShuffleBytes;
 use std::ops::Range;
 use sub_byte::SubByte;
 use truncate::Truncate;
@@ -41,7 +47,13 @@ use xor_bit::XorBit;
 use zero_range::ZeroRange;
 use zero_repeated::ZeroRepeated;
 
-pub use havoc::{havoc_prefix, mutate_prefix, test_dictionary_mutation};
+pub use havoc::{havoc_trace, mutate_trace, test_dictionary_mutation};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WordEndian {
+    Little,
+    Big,
+}
 
 /// Built-in mutation source constructors.
 pub mod mutations {
@@ -75,26 +87,28 @@ struct SetScalarRanks {
     writes: Vec<ScalarRankWrite>,
 }
 
-impl RngByteMutation for SetScalarRanks {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
+impl RngTraceMutation for SetScalarRanks {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
         if self.writes.is_empty() {
             return false;
         }
+        let prefix_len = trace.flatten_prefix().len();
         for write in &self.writes {
             if write.width == 0
                 || write.width > 16
-                || write.start.saturating_add(write.width) > prefix.len()
+                || write.start.saturating_add(write.width) > prefix_len
             {
                 return false;
             }
         }
-        for write in &self.writes {
-            write_le_u128(
-                &mut prefix[write.start..write.start + write.width],
-                write.value,
-            );
-        }
-        true
+        edit_all_trace_bytes(trace, |prefix| {
+            for write in &self.writes {
+                write_le_u128(
+                    &mut prefix[write.start..write.start + write.width],
+                    write.value,
+                );
+            }
+        })
     }
 }
 
@@ -109,7 +123,7 @@ pub mod reductions {
         target: u64,
         zero_until: Option<usize>,
     ) -> ReductionOp {
-        ReductionOp::byte(
+        ReductionOp::trace(
             start,
             width,
             target,
@@ -118,6 +132,7 @@ pub mod reductions {
                 start,
                 width,
                 value: target,
+                endian: WordEndian::Little,
                 zero_until,
             },
         )
@@ -141,7 +156,7 @@ pub mod reductions {
                 }
             })
             .collect();
-        ReductionOp::byte(
+        ReductionOp::trace(
             start,
             end.saturating_sub(start),
             target,
@@ -150,9 +165,9 @@ pub mod reductions {
         )
     }
 
-    /// Delete a byte range from the prefix.
+    /// Delete a span from flattened trace bytes.
     pub fn delete_range(start: usize, len: usize, adjust_first: bool) -> ReductionOp {
-        ReductionOp::byte(
+        ReductionOp::trace(
             start,
             len,
             0,
@@ -169,14 +184,14 @@ pub mod reductions {
         )
     }
 
-    /// Zero a byte range.
+    /// Zero a span in flattened trace bytes.
     pub fn zero_range(start: usize, len: usize) -> ReductionOp {
-        ReductionOp::byte(start, len, 0, len, ZeroRange { start, len })
+        ReductionOp::trace(start, len, 0, len, ZeroRange { start, len })
     }
 
     /// Set one byte.
     pub fn set_byte(start: usize, value: u8) -> ReductionOp {
-        ReductionOp::byte(
+        ReductionOp::trace(
             start,
             1,
             value as u64,
@@ -190,12 +205,12 @@ pub mod reductions {
 
     /// Zero repeated occurrences of `value`.
     pub fn zero_repeated(value: u8) -> ReductionOp {
-        ReductionOp::byte(0, 0, value as u64, 1, ZeroRepeated { value })
+        ReductionOp::trace(0, 0, value as u64, 1, ZeroRepeated { value })
     }
 
-    /// Replace a byte range with a dictionary value.
+    /// Replace a span in flattened trace bytes with a dictionary value.
     pub fn replace_dictionary(start: usize, len: usize, dictionary_index: usize) -> ReductionOp {
-        ReductionOp::byte(
+        ReductionOp::trace(
             start,
             len,
             dictionary_index as u64,
@@ -217,7 +232,7 @@ pub mod reductions {
         start: usize,
         len: usize,
     ) -> ReductionOp {
-        ReductionOp::tree(
+        ReductionOp::trace(
             start,
             len,
             target_len as u64,
@@ -242,7 +257,7 @@ pub mod reductions {
         items: Vec<(usize, usize)>,
     ) -> ReductionOp {
         let replacement_len = items.iter().map(|(_, len)| *len).sum::<usize>();
-        ReductionOp::tree(
+        ReductionOp::trace(
             replace_start,
             replace_len,
             target_len as u64,
@@ -259,31 +274,35 @@ pub mod reductions {
     }
 }
 
-pub fn set_byte(index: usize, value: u8) -> Box<dyn RngByteMutation> {
+pub fn set_byte(index: usize, value: u8) -> Box<dyn RngTraceMutation> {
     Box::new(SetByte { index, value })
 }
 
-pub fn xor_bit(index: usize, bit: u8) -> Box<dyn RngByteMutation> {
+pub fn xor_bit(index: usize, bit: u8) -> Box<dyn RngTraceMutation> {
     Box::new(XorBit { index, bit })
 }
 
-pub fn add_byte(index: usize, amount: u8) -> Box<dyn RngByteMutation> {
+pub fn add_byte(index: usize, amount: u8) -> Box<dyn RngTraceMutation> {
     Box::new(AddByte { index, amount })
 }
 
-pub fn sub_byte(index: usize, amount: u8) -> Box<dyn RngByteMutation> {
+pub fn sub_byte(index: usize, amount: u8) -> Box<dyn RngTraceMutation> {
     Box::new(SubByte { index, amount })
 }
 
-pub fn min_byte(index: usize, value: u8) -> Box<dyn RngByteMutation> {
+pub fn min_byte(index: usize, value: u8) -> Box<dyn RngTraceMutation> {
     Box::new(MinByte { index, value })
 }
 
-pub fn insert_bytes(index: usize, bytes: Vec<u8>) -> Box<dyn RngByteMutation> {
+pub fn insert_bytes(index: usize, bytes: Vec<u8>) -> Box<dyn RngTraceMutation> {
     Box::new(InsertBytes { index, bytes })
 }
 
-pub fn insert_dictionary(index: usize, dictionary_index: usize) -> Box<dyn RngByteMutation> {
+pub fn insert_repeated_bytes(index: usize, byte: u8, len: usize) -> Box<dyn RngTraceMutation> {
+    Box::new(InsertRepeatedBytes { index, byte, len })
+}
+
+pub fn insert_dictionary(index: usize, dictionary_index: usize) -> Box<dyn RngTraceMutation> {
     Box::new(InsertDictionary {
         index,
         dictionary_index,
@@ -294,7 +313,7 @@ pub fn replace_dictionary(
     start: usize,
     len: usize,
     dictionary_index: usize,
-) -> Box<dyn RngByteMutation> {
+) -> Box<dyn RngTraceMutation> {
     Box::new(ReplaceDictionary {
         start,
         len,
@@ -303,7 +322,46 @@ pub fn replace_dictionary(
     })
 }
 
-pub fn delete_range(start: usize, len: usize, leading_sub: Option<u8>) -> Box<dyn RngByteMutation> {
+pub fn replace_dictionary_exact(
+    start: usize,
+    len: usize,
+    dictionary_index: usize,
+) -> Box<dyn RngTraceMutation> {
+    Box::new(ReplaceDictionary {
+        start,
+        len,
+        dictionary_index,
+        mode: ReplaceMode::Exact,
+    })
+}
+
+pub fn replace_bytes(start: usize, len: usize, bytes: Vec<u8>) -> Box<dyn RngTraceMutation> {
+    Box::new(ReplaceBytes { start, len, bytes })
+}
+
+pub fn copy_part(
+    source: usize,
+    target: usize,
+    len: usize,
+    insert: bool,
+) -> Box<dyn RngTraceMutation> {
+    Box::new(CopyPart {
+        source,
+        target,
+        len,
+        mode: if insert {
+            CopyPartMode::Insert
+        } else {
+            CopyPartMode::Overwrite
+        },
+    })
+}
+
+pub fn delete_range(
+    start: usize,
+    len: usize,
+    leading_sub: Option<u8>,
+) -> Box<dyn RngTraceMutation> {
     Box::new(DeleteRange {
         start,
         len,
@@ -313,23 +371,41 @@ pub fn delete_range(start: usize, len: usize, leading_sub: Option<u8>) -> Box<dy
     })
 }
 
-pub fn drain_prefix(keep_from: usize) -> Box<dyn RngByteMutation> {
+pub fn drain_prefix(keep_from: usize) -> Box<dyn RngTraceMutation> {
     Box::new(DrainPrefix { keep_from })
 }
 
-pub fn truncate(len: usize, leading_sub: Option<u8>) -> Box<dyn RngByteMutation> {
+pub fn truncate(len: usize, leading_sub: Option<u8>) -> Box<dyn RngTraceMutation> {
     Box::new(Truncate { len, leading_sub })
 }
 
-pub fn fill_range(start: usize, bytes: Vec<u8>) -> Box<dyn RngByteMutation> {
+pub fn fill_range(start: usize, bytes: Vec<u8>) -> Box<dyn RngTraceMutation> {
     Box::new(FillRange { start, bytes })
 }
 
-pub fn set_word(start: usize, width: usize, value: u64) -> Box<dyn RngByteMutation> {
+pub fn shuffle_bytes(start: usize, bytes: Vec<u8>) -> Box<dyn RngTraceMutation> {
+    Box::new(ShuffleBytes { start, bytes })
+}
+
+pub fn set_word(start: usize, width: usize, value: u64) -> Box<dyn RngTraceMutation> {
+    set_word_endian(start, width, value, false)
+}
+
+pub fn set_word_endian(
+    start: usize,
+    width: usize,
+    value: u64,
+    big_endian: bool,
+) -> Box<dyn RngTraceMutation> {
     Box::new(SetWord {
         start,
         width,
         value,
+        endian: if big_endian {
+            WordEndian::Big
+        } else {
+            WordEndian::Little
+        },
         zero_until: None,
     })
 }
@@ -348,10 +424,112 @@ fn apply_to_sequence_range(
         length_width,
         &mut mutate,
     ) {
-        trace.flat = None;
         true
     } else {
         false
+    }
+}
+
+fn edit_trace_bytes(
+    trace: &mut Trace,
+    start: usize,
+    len: usize,
+    edit: impl FnOnce(&mut [u8]),
+) -> bool {
+    let mut bytes = trace.flatten_prefix();
+    if start.saturating_add(len) > bytes.len() {
+        return false;
+    }
+    edit(&mut bytes[start..start + len]);
+    write_trace_bytes(trace, &bytes)
+}
+
+fn edit_all_trace_bytes(trace: &mut Trace, edit: impl FnOnce(&mut [u8])) -> bool {
+    let mut bytes = trace.flatten_prefix();
+    edit(&mut bytes);
+    write_trace_bytes(trace, &bytes)
+}
+
+fn replace_trace_span(trace: &mut Trace, start: usize, len: usize, replacement: &[u8]) -> bool {
+    let trace_len = trace.flatten_prefix().len();
+    if start.saturating_add(len) > trace_len {
+        return false;
+    }
+    if trace_len == 0 && start == 0 && len == 0 {
+        if replacement.is_empty() {
+            return true;
+        }
+        trace.root.events.push(TraceEvent::Draw {
+            bytes: replacement.to_vec(),
+            affinity: ByteAffinity::Any,
+        });
+        return true;
+    }
+
+    let mut cursor = 0;
+    splice_draw_span_in_node(&mut trace.root, &mut cursor, start, len, replacement)
+}
+
+fn splice_draw_span_in_node(
+    node: &mut TraceNode,
+    cursor: &mut usize,
+    start: usize,
+    len: usize,
+    replacement: &[u8],
+) -> bool {
+    let end = start.saturating_add(len);
+    for event in &mut node.events {
+        match event {
+            TraceEvent::Draw { bytes, .. } => {
+                let event_start = *cursor;
+                let event_end = event_start.saturating_add(bytes.len());
+                if start >= event_start && end <= event_end {
+                    let local_start = start - event_start;
+                    let local_end = local_start + len;
+                    bytes.splice(local_start..local_end, replacement.iter().copied());
+                    return true;
+                }
+                *cursor = event_end;
+            }
+            TraceEvent::Range { length, children } => {
+                *cursor = (*cursor).saturating_add(length.len());
+                for child in children {
+                    if splice_draw_span_in_node(child, cursor, start, len, replacement) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn write_trace_bytes(trace: &mut Trace, bytes: &[u8]) -> bool {
+    if trace.flatten_prefix().len() != bytes.len() {
+        return false;
+    }
+    let mut cursor = 0;
+    write_trace_node_bytes(&mut trace.root, bytes, &mut cursor);
+    cursor == bytes.len()
+}
+
+fn write_trace_node_bytes(node: &mut TraceNode, bytes: &[u8], cursor: &mut usize) {
+    for event in &mut node.events {
+        match event {
+            TraceEvent::Draw { bytes: draw, .. } => {
+                let end = (*cursor).saturating_add(draw.len());
+                draw.copy_from_slice(&bytes[*cursor..end]);
+                *cursor = end;
+            }
+            TraceEvent::Range { length, children } => {
+                let end = (*cursor).saturating_add(length.len());
+                length.copy_from_slice(&bytes[*cursor..end]);
+                *cursor = end;
+                for child in children {
+                    write_trace_node_bytes(child, bytes, cursor);
+                }
+            }
+        }
     }
 }
 
@@ -438,6 +616,13 @@ fn write_le_word(bytes: &mut [u8], mut word: u64) {
     }
 }
 
+fn write_be_word(bytes: &mut [u8], mut word: u64) {
+    for byte in bytes.iter_mut().rev() {
+        *byte = word as u8;
+        word >>= 8;
+    }
+}
+
 fn write_le_u128(bytes: &mut [u8], mut word: u128) {
     for byte in bytes {
         *byte = word as u8;
@@ -492,6 +677,57 @@ mod tests {
     }
 
     #[test]
+    fn byte_mutators_cover_repeated_shuffle_copy_replace_and_endian_word() {
+        let mut prefix = vec![1, 2];
+        assert!(apply_to_prefix(
+            insert_repeated_bytes(1, 255, 4),
+            &mut prefix,
+            &[]
+        ));
+        assert_eq!(prefix, [1, 255, 255, 255, 255, 2]);
+
+        let mut prefix = vec![1, 2, 3, 4];
+        assert!(apply_to_prefix(
+            shuffle_bytes(1, vec![3, 2]),
+            &mut prefix,
+            &[]
+        ));
+        assert_eq!(prefix, [1, 3, 2, 4]);
+
+        let mut prefix = vec![1, 2, 3];
+        assert!(apply_to_prefix(copy_part(0, 3, 2, true), &mut prefix, &[]));
+        assert_eq!(prefix, [1, 2, 3, 1, 2]);
+
+        let mut prefix = vec![1, 2, 3, 4];
+        assert!(apply_to_prefix(copy_part(0, 2, 2, false), &mut prefix, &[]));
+        assert_eq!(prefix, [1, 2, 1, 2]);
+
+        let mut prefix = vec![1, 2, 3, 4];
+        assert!(apply_to_prefix(
+            replace_bytes(1, 2, vec![9]),
+            &mut prefix,
+            &[]
+        ));
+        assert_eq!(prefix, [1, 9, 4]);
+
+        let mut prefix = vec![0, 0, 0, 0];
+        assert!(apply_to_prefix(
+            set_word_endian(1, 2, 0x1234, true),
+            &mut prefix,
+            &[]
+        ));
+        assert_eq!(prefix, [0, 0x12, 0x34, 0]);
+
+        let mut prefix = vec![0, 0, 0];
+        assert!(apply_to_prefix(
+            replace_dictionary_exact(1, 2, 0),
+            &mut prefix,
+            &[vec![7, 8]]
+        ));
+        assert_eq!(prefix, [0, 7, 8]);
+    }
+
+    #[test]
     fn tree_delete_sequence_items_updates_length_and_children() {
         let mut trace = range_trace(3, [10, 20, 30]);
         let mutation = DeleteSequenceItems {
@@ -502,8 +738,7 @@ mod tests {
             len: 3,
         };
 
-        assert!(mutation.apply_tree(&mut trace, &[]));
-        assert_eq!(trace.flat, None);
+        assert!(mutation.apply_trace(&mut trace, &[]));
         assert_eq!(trace.flatten_prefix(), 0_u32.to_le_bytes());
         assert_range_children(&trace, 0, []);
     }
@@ -520,7 +755,7 @@ mod tests {
             items: vec![(4, 1), (6, 1)],
         };
 
-        assert!(mutation.apply_tree(&mut trace, &[]));
+        assert!(mutation.apply_trace(&mut trace, &[]));
         let mut expected = 2_u32.to_le_bytes().to_vec();
         expected.extend([10, 30]);
         assert_eq!(trace.flatten_prefix(), expected);
@@ -539,7 +774,7 @@ mod tests {
             items: vec![(4, 1), (4, 1), (6, 1)],
         };
 
-        assert!(mutation.apply_tree(&mut trace, &[]));
+        assert!(mutation.apply_trace(&mut trace, &[]));
         let mut expected = 3_u32.to_le_bytes().to_vec();
         expected.extend([1, 1, 30]);
         assert_eq!(trace.flatten_prefix(), expected);
@@ -561,7 +796,6 @@ mod tests {
                     }],
                 }],
             },
-            flat: None,
         };
         let mutation = DeleteSequenceItems {
             length_start: 4,
@@ -571,7 +805,7 @@ mod tests {
             len: 3,
         };
 
-        assert!(mutation.apply_tree(&mut trace, &[]));
+        assert!(mutation.apply_trace(&mut trace, &[]));
         let mut expected = 1_u32.to_le_bytes().to_vec();
         expected.extend(0_u32.to_le_bytes());
         assert_eq!(trace.flatten_prefix(), expected);
@@ -586,7 +820,6 @@ mod tests {
                     children: bytes.into_iter().map(draw_node).collect(),
                 }],
             },
-            flat: Some(vec![255]),
         }
     }
 
@@ -614,5 +847,30 @@ mod tests {
                 }]
             );
         }
+    }
+
+    fn apply_to_prefix(
+        mutation: Box<dyn RngTraceMutation>,
+        prefix: &mut Vec<u8>,
+        dictionary: &[Vec<u8>],
+    ) -> bool {
+        let mut trace = Trace {
+            seed: 0,
+            root: TraceNode {
+                events: if prefix.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![TraceEvent::Draw {
+                        bytes: prefix.clone(),
+                        affinity: ByteAffinity::Any,
+                    }]
+                },
+            },
+        };
+        if !mutation.apply_trace(&mut trace, dictionary) {
+            return false;
+        }
+        *prefix = trace.flatten_prefix();
+        true
     }
 }

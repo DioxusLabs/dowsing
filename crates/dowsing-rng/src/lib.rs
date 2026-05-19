@@ -23,11 +23,6 @@ pub struct Trace {
     pub seed: u64,
     /// Structured tree of semantic RNG events.
     pub root: TraceNode,
-    /// Legacy flat-prefix replay bytes.
-    ///
-    /// When this is `Some`, replay consumes this byte prefix instead of walking `root`.
-    /// Code that mutates `root` directly must set this to `None`.
-    pub flat: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -146,7 +141,6 @@ pub struct SemanticRng {
 struct SemanticRuntime {
     fallback: SmallRng,
     seed: u64,
-    flat_replay: Option<Vec<u8>>,
     cursor: usize,
     bytes_consumed: usize,
     prefix: Vec<u8>,
@@ -194,7 +188,7 @@ enum RuntimeEvent {
 enum ReplaySource<'a> {
     NodeDraw,
     RangeLength(&'a [u8]),
-    FlatOnly,
+    FallbackOnly,
 }
 
 /// Range iterator returned by [`SemanticRng::range`].
@@ -214,25 +208,6 @@ impl Trace {
         Self {
             seed,
             root: TraceNode::default(),
-            flat: None,
-        }
-    }
-
-    /// Build a legacy flat-prefix trace backed by `seed`.
-    pub fn from_flat_prefix(seed: u64, prefix: Vec<u8>) -> Self {
-        Self {
-            seed,
-            root: TraceNode {
-                events: if prefix.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![TraceEvent::Draw {
-                        bytes: prefix.clone(),
-                        affinity: ByteAffinity::Any,
-                    }]
-                },
-            },
-            flat: Some(prefix),
         }
     }
 
@@ -243,9 +218,6 @@ impl Trace {
 
     /// Return the flattened byte prefix represented by this trace.
     pub fn flatten_prefix(&self) -> Vec<u8> {
-        if let Some(prefix) = &self.flat {
-            return prefix.clone();
-        }
         let mut prefix = Vec::new();
         flatten_node(&self.root, &mut prefix);
         prefix
@@ -260,11 +232,7 @@ impl Trace {
     }
 
     fn from_root(seed: u64, root: TraceNode) -> Self {
-        Self {
-            seed,
-            root,
-            flat: None,
-        }
+        Self { seed, root }
     }
 
     #[cfg(test)]
@@ -289,7 +257,6 @@ impl Trace {
                         .collect(),
                 }],
             },
-            flat: None,
         }
     }
 
@@ -325,7 +292,6 @@ impl Trace {
         Self {
             seed,
             root: TraceNode { events },
-            flat: None,
         }
     }
 }
@@ -334,18 +300,12 @@ impl SemanticRng {
     /// Create an RNG that records and replays `trace`.
     pub fn new(trace: Trace) -> Self {
         let seed = trace.seed;
-        let flat_replay = trace.flat;
-        let replay = if flat_replay.is_some() {
-            ReplayCursor::default()
-        } else {
-            ReplayCursor::new(trace.root)
-        };
+        let replay = ReplayCursor::new(trace.root);
         Self {
             handle: TraceHandle {
                 runtime: Arc::new(Mutex::new(SemanticRuntime {
                     fallback: SmallRng::seed_from_u64(seed),
                     seed,
-                    flat_replay,
                     cursor: 0,
                     bytes_consumed: 0,
                     prefix: Vec::new(),
@@ -536,7 +496,7 @@ impl SemanticRuntime {
                     4,
                     false,
                     ByteAffinity::Zero,
-                    ReplaySource::FlatOnly,
+                    ReplaySource::FallbackOnly,
                 )
             };
             let value = u32::from_le_bytes(to_word_bytes(&length));
@@ -678,23 +638,10 @@ impl SemanticRuntime {
         replay_source: &ReplaySource<'_>,
     ) -> Option<u8> {
         match replay_source {
-            ReplaySource::NodeDraw => self.next_flat_replay_byte().or_else(|| {
-                if self.flat_replay.is_some() {
-                    None
-                } else {
-                    self.next_tree_draw_byte(node_id)
-                }
-            }),
+            ReplaySource::NodeDraw => self.next_tree_draw_byte(node_id),
             ReplaySource::RangeLength(bytes) => bytes.get(offset).copied(),
-            ReplaySource::FlatOnly => self.next_flat_replay_byte(),
+            ReplaySource::FallbackOnly => None,
         }
-    }
-
-    fn next_flat_replay_byte(&self) -> Option<u8> {
-        self.flat_replay
-            .as_ref()
-            .and_then(|prefix| prefix.get(self.cursor))
-            .copied()
     }
 
     fn fallback_byte(&mut self) -> u8 {
@@ -731,9 +678,6 @@ impl SemanticRuntime {
     }
 
     fn take_replay_range(&mut self, node_id: usize) -> Option<(Vec<u8>, Vec<TraceNode>)> {
-        if self.flat_replay.is_some() {
-            return None;
-        }
         loop {
             let event = {
                 let replay = &self.nodes.get(node_id)?.replay;
@@ -953,9 +897,9 @@ mod tests {
     }
 
     #[test]
-    fn flat_replay_past_trace_falls_back_to_rng_not_zero() {
+    fn draw_replay_past_trace_falls_back_to_rng_not_zero() {
         let seed = 7;
-        let trace = Trace::from_flat_prefix(seed, vec![42]);
+        let trace = trace_from_draw(seed, vec![42]);
         let mut rng = SemanticRng::new(trace);
         let mut bytes = [0; 2];
         rng.fill_bytes(&mut bytes);
@@ -1065,10 +1009,12 @@ mod tests {
     }
 
     #[test]
-    fn finish_returns_flat_prefix_draws_and_sequence_spans() {
-        let mut prefix = 2_u32.to_le_bytes().to_vec();
-        prefix.extend([10, 20]);
-        let mut rng = SemanticRng::new(Trace::from_flat_prefix(0, prefix));
+    fn finish_returns_trace_bytes_draws_and_sequence_spans() {
+        let mut rng = SemanticRng::new(Trace::from_range(
+            0,
+            2_u32.to_le_bytes(),
+            vec![vec![10], vec![20]],
+        ));
         assert_eq!(sample_byte_sequence(&mut rng), [10, 20]);
 
         let snapshot = rng.finish().expect("finish semantic rng");
@@ -1097,5 +1043,21 @@ mod tests {
                 byte[0]
             })
             .collect()
+    }
+
+    fn trace_from_draw(seed: u64, bytes: Vec<u8>) -> Trace {
+        Trace {
+            seed,
+            root: super::TraceNode {
+                events: if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![super::TraceEvent::Draw {
+                        bytes,
+                        affinity: ByteAffinity::Any,
+                    }]
+                },
+            },
+        }
     }
 }

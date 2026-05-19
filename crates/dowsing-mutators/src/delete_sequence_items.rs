@@ -1,6 +1,4 @@
-use super::{
-    RngByteMutation, RngTreeMutation, apply_to_sequence_range, child_spans, write_le_word,
-};
+use super::{RngTraceMutation, apply_to_sequence_range, child_spans, write_le_word};
 use dowsing_rng::{Trace, TraceNode};
 
 #[derive(Debug, Clone)]
@@ -12,26 +10,8 @@ pub(crate) struct DeleteSequenceItems {
     pub(super) len: usize,
 }
 
-impl RngByteMutation for DeleteSequenceItems {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        if self.length_width == 0
-            || self.length_start.saturating_add(self.length_width) > prefix.len()
-            || self.len == 0
-            || self.start.saturating_add(self.len) > prefix.len()
-        {
-            return false;
-        }
-        write_le_word(
-            &mut prefix[self.length_start..self.length_start + self.length_width],
-            self.target_len as u64,
-        );
-        prefix.drain(self.start..self.start + self.len);
-        true
-    }
-}
-
-impl RngTreeMutation for DeleteSequenceItems {
-    fn apply_tree(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+impl RngTraceMutation for DeleteSequenceItems {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
         apply_to_sequence_range(
             trace,
             self.length_start,

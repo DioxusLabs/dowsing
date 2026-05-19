@@ -1,16 +1,13 @@
-use super::RngByteMutation;
+use super::{RngTraceMutation, replace_trace_span};
+use dowsing_rng::Trace;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DrainPrefix {
     pub(super) keep_from: usize,
 }
 
-impl RngByteMutation for DrainPrefix {
-    fn apply_bytes(&self, prefix: &mut Vec<u8>, _dictionary: &[Vec<u8>]) -> bool {
-        if self.keep_from > prefix.len() {
-            return false;
-        }
-        prefix.drain(0..self.keep_from);
-        true
+impl RngTraceMutation for DrainPrefix {
+    fn apply_trace(&self, trace: &mut Trace, _dictionary: &[Vec<u8>]) -> bool {
+        replace_trace_span(trace, 0, self.keep_from, &[])
     }
 }
