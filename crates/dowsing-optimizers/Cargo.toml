@@ -1,0 +1,13 @@
+[package]
+name = "dowsing-optimizers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dowsing-core = { version = "0.1.0", path = "../dowsing-core" }
+dowsing-mutators = { version = "0.1.0", path = "../dowsing-mutators" }
+dowsing-rng = { version = "0.1.0", path = "../dowsing-rng" }
+parking_lot = "0.12"
+rand = { version = "0.9", features = ["small_rng"] }
+rayon = "1.10"
+rustc-hash = "2"

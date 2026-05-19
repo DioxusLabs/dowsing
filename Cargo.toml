@@ -1,5 +1,12 @@
 [workspace]
-members = [".", "crates/dowsing-rng", "crates/dowsing-sys"]
+members = [
+    ".",
+    "crates/dowsing-core",
+    "crates/dowsing-mutators",
+    "crates/dowsing-optimizers",
+    "crates/dowsing-rng",
+    "crates/dowsing-sys",
+]
 resolver = "3"
 
 [package]
@@ -8,9 +15,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dowsing-rng = { version = "0.1.0", path = "crates/dowsing-rng" }
+dowsing-core = { version = "0.1.0", path = "crates/dowsing-core" }
+dowsing-mutators = { version = "0.1.0", path = "crates/dowsing-mutators" }
+dowsing-optimizers = { version = "0.1.0", path = "crates/dowsing-optimizers" }
 dowsing-sys = { version = "0.1.0", path = "crates/dowsing-sys" }
-parking_lot = "0.12"
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = "1.10"
-rustc-hash = "2"

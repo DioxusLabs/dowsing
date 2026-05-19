@@ -1,0 +1,9 @@
+[package]
+name = "dowsing-mutators"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dowsing-core = { version = "0.1.0", path = "../dowsing-core" }
+dowsing-rng = { version = "0.1.0", path = "../dowsing-rng" }
+rand = { version = "0.9", features = ["small_rng"] }
