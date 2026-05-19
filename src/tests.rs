@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use crate::*;
 use crate::{
     backends::SancovCoverage,
@@ -1073,6 +1075,272 @@ fn sample_from_case_rng<Capture: CoverageCapture>(rng: &mut CaseRng<Capture>) ->
     rng.random()
 }
 
+fn signed_value_cost(value: i32) -> usize {
+    if value >= 0 {
+        value as usize * 2
+    } else {
+        value.unsigned_abs() as usize * 2 + 1
+    }
+}
+
+fn sample_range_from_prefix<T, R>(prefix: &[u8], range: R) -> T
+where
+    R: ShrinkRange<T>,
+{
+    let case = Case::from_flat_prefix(0, prefix.to_vec());
+    let mut replay = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut rng = replay.next().expect("range replay rng");
+    rng.random_range(range)
+}
+
+#[test]
+fn random_range_signed_ranges_shrink_toward_zero() {
+    let expected = [0, 1, -1, 2, -2, 3, -3];
+    for (rank, expected) in expected.into_iter().enumerate() {
+        let value: i32 = sample_range_from_prefix(&[rank as u8], -3..=3);
+        assert_eq!(value, expected);
+    }
+}
+
+#[test]
+fn random_range_positive_and_negative_ranges_shrink_from_simplest_bound() {
+    let positive: i32 = sample_range_from_prefix(&[0], 10..15);
+    assert_eq!(positive, 10);
+    let positive: i32 = sample_range_from_prefix(&[4], 10..15);
+    assert_eq!(positive, 14);
+
+    let negative: i32 = sample_range_from_prefix(&[0], -5..=-1);
+    assert_eq!(negative, -1);
+    let negative: i32 = sample_range_from_prefix(&[4], -5..=-1);
+    assert_eq!(negative, -5);
+}
+
+#[test]
+fn random_range_unsigned_prefix_ranges_start_at_zero() {
+    let exclusive: u32 = sample_range_from_prefix(&[4], ..5u32);
+    assert_eq!(exclusive, 4);
+    let inclusive: u32 = sample_range_from_prefix(&[5], ..=5u32);
+    assert_eq!(inclusive, 5);
+}
+
+#[test]
+fn case_rng_random_range_is_inherent_even_with_rand_rng_in_scope() {
+    let case = Case::from_flat_prefix(0, vec![0, 0]);
+    let mut replay = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut rng = replay.next().expect("range replay rng");
+
+    let value: i32 = rng.random_range(-10..=10);
+    let size = rng.random_range(0..=20);
+    let values = Vec::<u8>::with_capacity(size);
+
+    assert_eq!(value, 0);
+    assert_eq!(values.capacity(), 0);
+}
+
+#[test]
+fn random_range_empty_ranges_panic() {
+    let exclusive = catch_unwind(AssertUnwindSafe(|| {
+        let _: u32 = sample_range_from_prefix(&[0], 5u32..5u32);
+    }));
+    assert!(exclusive.is_err());
+
+    let inclusive = catch_unwind(AssertUnwindSafe(|| {
+        let _: i32 = sample_range_from_prefix(&[0], 5..=4);
+    }));
+    assert!(inclusive.is_err());
+}
+
+fn sample_deletion_case(rng: &mut CaseRng<NoCoverage>) -> (Vec<i32>, usize) {
+    let values: Vec<_> = rng
+        .range(2..=8)
+        .map(|mut item| item.random_range(-100..=100))
+        .collect();
+    let index = rng.random_range(0..values.len());
+    (values, index)
+}
+
+fn deletion_fails((values, index): &(Vec<i32>, usize)) -> bool {
+    let removed = values[*index];
+    values
+        .iter()
+        .enumerate()
+        .any(|(candidate, value)| candidate != *index && *value == removed)
+}
+
+fn deletion_cost((values, index): &(Vec<i32>, usize)) -> usize {
+    values.len() * 1_000_000
+        + index * 10_000
+        + values.iter().copied().map(signed_value_cost).sum::<usize>()
+}
+
+#[test]
+fn cautious_shrinks_duplicate_values_to_zero_with_random_range() {
+    let case = Case::from_flat_prefix(0, vec![0, 0, 0, 0, 1, 1, 0]);
+    let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut best = None;
+
+    for _ in 0..512 {
+        let Some(mut rng) = cautious.next() else {
+            break;
+        };
+        let sample = sample_deletion_case(&mut rng);
+        if deletion_fails(&sample) {
+            let cost = deletion_cost(&sample);
+            rng.coverage_with_cost(cost)
+                .expect("finish deletion shrink candidate");
+            if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
+                best = Some((cost, sample));
+            }
+        } else {
+            rng.discard();
+        }
+    }
+
+    assert_eq!(best.map(|(_, sample)| sample), Some((vec![0, 0], 0)));
+}
+
+fn sample_equal_scalar_group(rng: &mut CaseRng<NoCoverage>) -> Vec<i32> {
+    (0..4).map(|_| rng.random_range(1..=1000)).collect()
+}
+
+fn equal_scalar_group_fails(values: &[i32]) -> bool {
+    values
+        .first()
+        .is_some_and(|first| *first >= 10 && values.iter().all(|value| value == first))
+}
+
+fn equal_scalar_group_cost(values: &[i32]) -> usize {
+    values.iter().copied().map(|value| value as usize).sum()
+}
+
+#[test]
+fn cautious_shrinks_equal_scalar_group_with_random_range() {
+    let case = Case::from_flat_prefix(0, vec![15, 0, 15, 0, 15, 0, 15, 0]);
+    let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut best = None;
+
+    for _ in 0..2048 {
+        let Some(mut rng) = cautious.next() else {
+            break;
+        };
+        let sample = sample_equal_scalar_group(&mut rng);
+        if equal_scalar_group_fails(&sample) {
+            let cost = equal_scalar_group_cost(&sample);
+            rng.coverage_with_cost(cost)
+                .expect("finish equal scalar group shrink candidate");
+            if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
+                best = Some((cost, sample));
+            }
+        } else {
+            rng.discard();
+        }
+    }
+
+    assert_eq!(best.map(|(_, sample)| sample), Some(vec![10, 10, 10, 10]));
+}
+
+fn sample_difference_pair(rng: &mut CaseRng<NoCoverage>) -> (i32, i32) {
+    (rng.random_range(1..=1000), rng.random_range(1..=1000))
+}
+
+fn difference_one_fails((left, right): &(i32, i32)) -> bool {
+    *left >= 10 && (left - right).abs() == 1
+}
+
+fn difference_small_fails((left, right): &(i32, i32)) -> bool {
+    *left >= 10 && (1..=4).contains(&(left - right).abs())
+}
+
+fn difference_pair_cost((left, right): &(i32, i32)) -> usize {
+    signed_value_cost(*left) * 1_000 + signed_value_cost(*right)
+}
+
+fn shrink_difference_pair(
+    case: Case,
+    fails: impl Fn(&(i32, i32)) -> bool,
+    limit: usize,
+) -> Option<(i32, i32)> {
+    let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut best = None;
+
+    for _ in 0..limit {
+        let Some(mut rng) = cautious.next() else {
+            break;
+        };
+        let sample = sample_difference_pair(&mut rng);
+        if fails(&sample) {
+            let cost = difference_pair_cost(&sample);
+            rng.coverage_with_cost(cost)
+                .expect("finish difference shrink candidate");
+            if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
+                best = Some((cost, sample));
+            }
+        } else {
+            rng.discard();
+        }
+    }
+
+    best.map(|(_, sample)| sample)
+}
+
+#[test]
+fn cautious_shrinks_common_offset_pair_with_random_range() {
+    let case = Case::from_flat_prefix(0, vec![4, 3, 3, 3]);
+
+    assert_eq!(
+        shrink_difference_pair(case, difference_one_fails, 4096),
+        Some((10, 9))
+    );
+}
+
+#[test]
+fn cautious_shrinks_small_difference_after_common_offset_with_random_range() {
+    let case = Case::from_flat_prefix(0, vec![4, 3, 3, 3]);
+
+    assert_eq!(
+        shrink_difference_pair(case, difference_small_fails, 32),
+        Some((10, 6))
+    );
+}
+
+fn sample_common_offset_group(rng: &mut CaseRng<NoCoverage>) -> Vec<i32> {
+    (0..3).map(|_| rng.random_range(1..=1000)).collect()
+}
+
+fn common_offset_group_fails(values: &[i32]) -> bool {
+    values.len() == 3 && values[0] >= 10 && values[1] == values[0] - 1 && values[2] == values[1] - 1
+}
+
+fn common_offset_group_cost(values: &[i32]) -> usize {
+    values.iter().copied().map(signed_value_cost).sum::<usize>()
+}
+
+#[test]
+fn cautious_shrinks_common_offset_group_with_random_range() {
+    let case = Case::from_flat_prefix(0, vec![22, 0, 21, 0, 20, 0]);
+    let mut cautious = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut best = None;
+
+    for _ in 0..4096 {
+        let Some(mut rng) = cautious.next() else {
+            break;
+        };
+        let sample = sample_common_offset_group(&mut rng);
+        if common_offset_group_fails(&sample) {
+            let cost = common_offset_group_cost(&sample);
+            rng.coverage_with_cost(cost)
+                .expect("finish common offset group shrink candidate");
+            if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
+                best = Some((cost, sample));
+            }
+        } else {
+            rng.discard();
+        }
+    }
+
+    assert_eq!(best.map(|(_, sample)| sample), Some(vec![10, 9, 8]));
+}
+
 #[test]
 fn range_yields_rng_like_children() {
     let mut cases = curious().with_coverage(NoCoverage);
@@ -1496,6 +1764,51 @@ fn fresh_root_cadence_keeps_exploring_unmutated_roots() {
     assert_eq!(stats.generated(), 9);
     assert_eq!(stats.accepted(), 9);
     assert_eq!(stats.mutated(), 7);
+}
+
+#[derive(Debug, Clone)]
+struct FixedPrefixSource {
+    prefix: Vec<u8>,
+    feedback: std::sync::Arc<std::sync::Mutex<Vec<SourceFeedback>>>,
+}
+
+impl CandidateSource for FixedPrefixSource {
+    fn next_candidate(&mut self, context: &mut MutationContext<'_>) -> Option<MutationCandidate> {
+        assert_eq!(context.parent_prefix().first(), Some(&9));
+        Some(MutationCandidate::from_prefix(self.prefix.clone()).with_mutation::<Self>())
+    }
+
+    fn record_feedback(&mut self, feedback: SourceFeedback) {
+        self.feedback
+            .lock()
+            .expect("feedback poisoned")
+            .push(feedback);
+    }
+}
+
+#[test]
+fn optimizer_accepts_custom_candidate_sources() {
+    let feedback = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = FixedPrefixSource {
+        prefix: vec![13],
+        feedback: std::sync::Arc::clone(&feedback),
+    };
+    let mut optimizer = optimize(goals::MaximizeCoverage)
+        .with_coverage(ScriptedCapture::new([[1], [2]]))
+        .with_case(Case::from_flat_prefix(11, vec![9]))
+        .with_fresh_roots(false)
+        .with_mutations([MutationSource::custom(source)]);
+
+    assert_eq!(sample_byte(optimizer.next().expect("seed case")), 9);
+    assert_eq!(sample_byte(optimizer.next().expect("custom candidate")), 13);
+
+    let stats = optimizer.stats();
+    assert_eq!(stats.generated(), 2);
+    assert_eq!(stats.mutated(), 1);
+    assert_eq!(
+        *feedback.lock().expect("feedback poisoned"),
+        [SourceFeedback::Accepted]
+    );
 }
 
 #[test]

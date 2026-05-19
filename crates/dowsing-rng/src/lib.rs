@@ -6,26 +6,48 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+/// How reducers should interpret the bytes backing a semantic draw.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ByteAffinity {
+    /// Bytes have no known semantic direction beyond their raw value.
+    #[default]
+    Any,
+    /// The semantic value represented by these bytes gets simpler as the bytes approach zero.
+    Zero,
+}
+
 /// Replayable RNG trace produced by [`SemanticRng::fork_trace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
-    seed: u64,
-    root: TraceNode,
-    flat: Option<Vec<u8>>,
+    /// Seed backing this trace's fallback RNG.
+    pub seed: u64,
+    /// Structured tree of semantic RNG events.
+    pub root: TraceNode,
+    /// Legacy flat-prefix replay bytes.
+    ///
+    /// When this is `Some`, replay consumes this byte prefix instead of walking `root`.
+    /// Code that mutates `root` directly must set this to `None`.
+    pub flat: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TraceNode {
-    events: Vec<TraceEvent>,
+pub struct TraceNode {
+    /// Ordered events recorded in this semantic RNG node.
+    pub events: Vec<TraceEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TraceEvent {
+pub enum TraceEvent {
     Draw {
+        /// Bytes drawn directly from this RNG node.
         bytes: Vec<u8>,
+        /// Semantic preference for byte-level reduction.
+        affinity: ByteAffinity,
     },
     Range {
+        /// Little-endian bytes used to choose the range length.
         length: Vec<u8>,
+        /// Structured child RNG nodes produced by this range.
         children: Vec<TraceNode>,
     },
 }
@@ -38,13 +60,71 @@ pub struct SequenceSpan {
     pub items: Vec<Range<usize>>,
 }
 
+/// Span metadata for one semantic draw in a flattened trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrawSpan {
+    pub start: usize,
+    pub end: usize,
+    pub affinity: ByteAffinity,
+}
+
+impl DrawSpan {
+    pub fn new(start: usize, len: usize, affinity: ByteAffinity) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(len),
+            affinity,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+
+    pub fn range(&self) -> Range<usize> {
+        self.start..self.end
+    }
+}
+
+/// Span metadata for one scalar value encoded as little-endian rank bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarSpan {
+    pub start: usize,
+    pub end: usize,
+    /// Rank-space size. A value of `0` means the full native byte width is valid.
+    pub span: u128,
+}
+
+impl ScalarSpan {
+    pub fn new(start: usize, len: usize, span: u128) -> Self {
+        Self {
+            start,
+            end: start.saturating_add(len),
+            span,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start >= self.end
+    }
+}
+
 /// Snapshot of a semantic RNG execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceSnapshot {
     pub seed: u64,
     pub trace: Trace,
     pub prefix: Vec<u8>,
-    pub draws: Vec<Range<usize>>,
+    pub draws: Vec<DrawSpan>,
+    pub scalars: Vec<ScalarSpan>,
     pub sequences: Vec<SequenceSpan>,
     pub bytes_consumed: usize,
 }
@@ -70,7 +150,8 @@ struct SemanticRuntime {
     cursor: usize,
     bytes_consumed: usize,
     prefix: Vec<u8>,
-    draws: Vec<Range<usize>>,
+    draws: Vec<DrawSpan>,
+    scalars: Vec<ScalarSpan>,
     finished: bool,
     nodes: Vec<RngNode>,
     ranges: Vec<RangeNode>,
@@ -100,8 +181,14 @@ struct ReplayCursor {
 
 #[derive(Debug)]
 enum RuntimeEvent {
-    Draw(Vec<u8>),
-    Range { length: Vec<u8>, range_id: usize },
+    Draw {
+        bytes: Vec<u8>,
+        affinity: ByteAffinity,
+    },
+    Range {
+        length: Vec<u8>,
+        range_id: usize,
+    },
 }
 
 enum ReplaySource<'a> {
@@ -141,6 +228,7 @@ impl Trace {
                 } else {
                     vec![TraceEvent::Draw {
                         bytes: prefix.clone(),
+                        affinity: ByteAffinity::Any,
                     }]
                 },
             },
@@ -192,7 +280,10 @@ impl Trace {
                             events: if bytes.is_empty() {
                                 Vec::new()
                             } else {
-                                vec![TraceEvent::Draw { bytes }]
+                                vec![TraceEvent::Draw {
+                                    bytes,
+                                    affinity: ByteAffinity::Any,
+                                }]
                             },
                         })
                         .collect(),
@@ -217,13 +308,19 @@ impl Trace {
                     events: if bytes.is_empty() {
                         Vec::new()
                     } else {
-                        vec![TraceEvent::Draw { bytes }]
+                        vec![TraceEvent::Draw {
+                            bytes,
+                            affinity: ByteAffinity::Any,
+                        }]
                     },
                 })
                 .collect(),
         }];
         if !tail.is_empty() {
-            events.push(TraceEvent::Draw { bytes: tail });
+            events.push(TraceEvent::Draw {
+                bytes: tail,
+                affinity: ByteAffinity::Any,
+            });
         }
         Self {
             seed,
@@ -253,6 +350,7 @@ impl SemanticRng {
                     bytes_consumed: 0,
                     prefix: Vec::new(),
                     draws: Vec::new(),
+                    scalars: Vec::new(),
                     finished: false,
                     nodes: vec![RngNode {
                         parent: None,
@@ -303,6 +401,16 @@ impl SemanticRng {
             index: 0,
             _borrow: std::marker::PhantomData,
         }
+    }
+
+    /// Fill `dst` while recording a byte affinity for reducers.
+    pub fn fill_bytes_with_affinity(&mut self, dst: &mut [u8], affinity: ByteAffinity) -> DrawSpan {
+        lock_runtime(&self.handle.runtime).fill_bytes_with_affinity(self.node_id, dst, affinity)
+    }
+
+    /// Record a scalar value backed by a previous draw.
+    pub fn record_scalar(&mut self, draw: DrawSpan, span: u128) {
+        lock_runtime(&self.handle.runtime).record_scalar(draw, span);
     }
 }
 
@@ -398,6 +506,7 @@ impl SemanticRuntime {
             trace: trace.clone(),
             prefix: self.prefix.clone(),
             draws: self.draws.clone(),
+            scalars: self.scalars.clone(),
             sequences: trace.sequence_spans(),
             bytes_consumed: self.bytes_consumed,
         })
@@ -414,9 +523,21 @@ impl SemanticRuntime {
             (start, Vec::new())
         } else {
             let length = if let Some((replay_length, _)) = &replay_range {
-                self.draw_vec_from(node_id, 4, false, ReplaySource::RangeLength(replay_length))
+                self.draw_vec_from(
+                    node_id,
+                    4,
+                    false,
+                    ByteAffinity::Zero,
+                    ReplaySource::RangeLength(replay_length),
+                )
             } else {
-                self.draw_vec_from(node_id, 4, false, ReplaySource::FlatOnly)
+                self.draw_vec_from(
+                    node_id,
+                    4,
+                    false,
+                    ByteAffinity::Zero,
+                    ReplaySource::FlatOnly,
+                )
             };
             let value = u32::from_le_bytes(to_word_bytes(&length));
             (
@@ -474,24 +595,50 @@ impl SemanticRuntime {
     }
 
     fn fill_bytes(&mut self, node_id: usize, dst: &mut [u8]) {
-        let bytes = self.draw_vec(node_id, dst.len(), true);
+        let bytes = self.draw_vec(node_id, dst.len(), true, ByteAffinity::Any);
         dst.copy_from_slice(&bytes);
     }
 
-    fn record_draw(&mut self, start: usize, len: usize) {
+    fn fill_bytes_with_affinity(
+        &mut self,
+        node_id: usize,
+        dst: &mut [u8],
+        affinity: ByteAffinity,
+    ) -> DrawSpan {
+        let start = self.cursor;
+        let bytes = self.draw_vec(node_id, dst.len(), true, affinity);
+        dst.copy_from_slice(&bytes);
+        DrawSpan::new(start, dst.len(), affinity)
+    }
+
+    fn record_scalar(&mut self, draw: DrawSpan, span: u128) {
+        if draw.is_empty() {
+            return;
+        }
+        self.scalars
+            .push(ScalarSpan::new(draw.start, draw.len(), span));
+    }
+
+    fn record_draw(&mut self, start: usize, len: usize, affinity: ByteAffinity) {
         if len == 0 {
             return;
         }
-        self.draws.push(start..start + len);
+        self.draws.push(DrawSpan::new(start, len, affinity));
     }
 
     fn draw_array<const N: usize>(&mut self, node_id: usize, record_event: bool) -> [u8; N] {
-        let bytes = self.draw_vec(node_id, N, record_event);
+        let bytes = self.draw_vec(node_id, N, record_event, ByteAffinity::Any);
         bytes.try_into().expect("fixed draw length mismatch")
     }
 
-    fn draw_vec(&mut self, node_id: usize, len: usize, record_event: bool) -> Vec<u8> {
-        self.draw_vec_from(node_id, len, record_event, ReplaySource::NodeDraw)
+    fn draw_vec(
+        &mut self,
+        node_id: usize,
+        len: usize,
+        record_event: bool,
+        affinity: ByteAffinity,
+    ) -> Vec<u8> {
+        self.draw_vec_from(node_id, len, record_event, affinity, ReplaySource::NodeDraw)
     }
 
     fn draw_vec_from(
@@ -499,6 +646,7 @@ impl SemanticRuntime {
         node_id: usize,
         len: usize,
         record_event: bool,
+        affinity: ByteAffinity,
         replay_source: ReplaySource<'_>,
     ) -> Vec<u8> {
         self.assert_node_available(node_id);
@@ -513,11 +661,12 @@ impl SemanticRuntime {
             self.prefix.push(byte);
             bytes.push(byte);
         }
-        self.record_draw(start, len);
+        self.record_draw(start, len, affinity);
         if record_event && !bytes.is_empty() {
-            self.nodes[node_id]
-                .events
-                .push(RuntimeEvent::Draw(bytes.clone()));
+            self.nodes[node_id].events.push(RuntimeEvent::Draw {
+                bytes: bytes.clone(),
+                affinity,
+            });
         }
         bytes
     }
@@ -562,7 +711,7 @@ impl SemanticRuntime {
                 node.events.get(replay.event_index).cloned()?
             };
             match event {
-                TraceEvent::Draw { bytes } => {
+                TraceEvent::Draw { bytes, .. } => {
                     let replay = &mut self.nodes[node_id].replay;
                     if replay.draw_offset < bytes.len() {
                         let byte = bytes[replay.draw_offset];
@@ -595,7 +744,7 @@ impl SemanticRuntime {
                 node.events.get(replay.event_index).cloned()?
             };
             match event {
-                TraceEvent::Draw { bytes } if bytes.is_empty() => {
+                TraceEvent::Draw { bytes, .. } if bytes.is_empty() => {
                     self.nodes[node_id].replay.event_index += 1;
                 }
                 TraceEvent::Draw { .. } => return None,
@@ -662,9 +811,10 @@ impl SemanticRuntime {
         let mut events = Vec::with_capacity(node.events.len());
         for event in &node.events {
             match event {
-                RuntimeEvent::Draw(bytes) => {
+                RuntimeEvent::Draw { bytes, affinity } => {
                     events.push(TraceEvent::Draw {
                         bytes: bytes.clone(),
+                        affinity: *affinity,
                     });
                 }
                 RuntimeEvent::Range { length, range_id } => {
@@ -718,7 +868,7 @@ fn lock_runtime(runtime: &Mutex<SemanticRuntime>) -> MutexGuard<'_, SemanticRunt
 fn flatten_node(node: &TraceNode, prefix: &mut Vec<u8>) {
     for event in &node.events {
         match event {
-            TraceEvent::Draw { bytes } => prefix.extend_from_slice(bytes),
+            TraceEvent::Draw { bytes, .. } => prefix.extend_from_slice(bytes),
             TraceEvent::Range { length, children } => {
                 prefix.extend_from_slice(length);
                 for child in children {
@@ -732,7 +882,7 @@ fn flatten_node(node: &TraceNode, prefix: &mut Vec<u8>) {
 fn collect_sequence_spans(node: &TraceNode, cursor: &mut usize, sequences: &mut Vec<SequenceSpan>) {
     for event in &node.events {
         match event {
-            TraceEvent::Draw { bytes } => {
+            TraceEvent::Draw { bytes, .. } => {
                 *cursor = (*cursor).saturating_add(bytes.len());
             }
             TraceEvent::Range { length, children } => {
@@ -760,7 +910,7 @@ fn collect_sequence_spans(node: &TraceNode, cursor: &mut usize, sequences: &mut 
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticRng, Trace};
+    use super::{ByteAffinity, DrawSpan, SemanticRng, Trace};
     use rand::{Rng, RngCore, SeedableRng, rngs::SmallRng};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -924,7 +1074,15 @@ mod tests {
         let snapshot = rng.finish().expect("finish semantic rng");
 
         assert_eq!(snapshot.prefix.len(), 6);
-        assert_eq!(snapshot.draws, [0..4, 4..5, 5..6]);
+        assert_eq!(
+            snapshot.draws,
+            [
+                DrawSpan::new(0, 4, ByteAffinity::Zero),
+                DrawSpan::new(4, 1, ByteAffinity::Any),
+                DrawSpan::new(5, 1, ByteAffinity::Any),
+            ]
+        );
+        assert_eq!(snapshot.scalars, []);
         assert_eq!(snapshot.sequences.len(), 1);
         assert_eq!(snapshot.sequences[0].length_start, 0);
         assert_eq!(snapshot.sequences[0].length_len, 4);

@@ -1,4 +1,5 @@
-//! `curious()` explores code. `cautious()` keeps one behavior while avoiding code.
+//! `optimize(goals::MaximizeCoverage)` explores code.
+//! `optimize(goals::MinimizeCoverage)` keeps one behavior while avoiding code.
 //!
 //! Run with SanitizerCoverage instrumentation:
 //!
@@ -9,8 +10,7 @@
 //!
 //! `./target/debug/examples/simple_loop_match`
 
-use dowsing::{Case, CaseCoverage, CaseRng, cautious, coverage::CoverageCapture, curious};
-use rand::Rng;
+use dowsing::{Case, CaseCoverage, CaseRng, coverage::CoverageCapture, goals, optimize};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,7 +67,7 @@ fn main() {
 }
 
 fn find_interesting_path() -> Option<Case> {
-    let mut search = curious().with_seed(1);
+    let mut search = optimize(goals::MaximizeCoverage).with_seed(1);
 
     for _ in 0..512 {
         let Some(mut rng) = search.next() else {
@@ -91,7 +91,7 @@ fn find_interesting_path() -> Option<Case> {
 }
 
 fn show_cautious_avoidance(case: Case) {
-    let mut search = cautious().with_case(case);
+    let mut search = optimize(goals::MinimizeCoverage).with_case(case);
     let mut best: Option<(CaseCoverage, Vec<Arm>, BTreeSet<Arm>)> = None;
 
     println!("cautious, preserving Double:");

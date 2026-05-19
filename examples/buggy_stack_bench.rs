@@ -10,7 +10,7 @@
 //!
 //! `ITERATOR_FUZZ_BENCH=1 ./target/release/examples/buggy_stack_bench`
 
-use dowsing::{cautious, curious};
+use dowsing::{goals, optimize};
 use rand::Rng;
 use rayon::prelude::*;
 use std::{
@@ -248,7 +248,7 @@ fn main() {
     let bench = bench_enabled();
     let trace_best = trace_best_enabled();
 
-    let found = curious()
+    let found = optimize(goals::MaximizeCoverage)
         .with_seed(base_seed)
         .take(discovery_cases)
         .into_par_iter()
@@ -290,7 +290,7 @@ fn run_discovery_case(
         let case = rng.fork_case();
         let _coverage = rng.coverage().expect("finish discovery coverage");
         // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
-        let mut cautious = cautious().with_case(case);
+        let mut cautious = optimize(goals::MinimizeCoverage).with_case(case);
         let mut best = None;
         let mut bench_stats = BenchStats::default();
         for _ in 0..minimization_cases {

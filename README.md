@@ -6,10 +6,12 @@ Coverage-guided randomness for Rust tests.
 coverage it reaches. Successful paths feed the next round of exploration; failing paths can be
 forked, replayed, and minimized.
 
-The public API starts with two iterators:
+The public API starts with one optimizer configured by a goal:
 
-- `curious()` searches for new coverage.
-- `cautious()` starts from an interesting case and tries to make it smaller.
+- `optimize(goals::MaximizeCoverage)` searches for new coverage.
+- `optimize(goals::MinimizeCoverage)` starts from an interesting case and tries to make it smaller.
+
+The older `curious()` and `cautious()` constructors remain as deprecated compatibility wrappers.
 
 ## Quick Start
 
@@ -17,7 +19,7 @@ The examples below use `NoCoverage` so they can run as plain doctests. In an ins
 omit `.with_coverage(NoCoverage)` to use the default SanitizerCoverage feedback.
 
 ```rust
-use dowsing::{NoCoverage, cautious, curious};
+use dowsing::{NoCoverage, goals, optimize};
 use rand::Rng;
 
 fn sample(mut rng: impl Rng) -> u8 {
@@ -32,14 +34,19 @@ fn check(sample: u8) -> Result<(), String> {
     }
 }
 
-for mut rng in curious().with_coverage(NoCoverage).take(128) {
+for mut rng in optimize(goals::MaximizeCoverage)
+    .with_coverage(NoCoverage)
+    .take(128)
+{
     let input = sample(&mut rng);
 
     if check(input).is_err() {
         let case = rng.fork_case();
         let _ = rng.coverage().expect("finish discovery coverage");
 
-        let mut variants = cautious().with_coverage(NoCoverage).with_case(case);
+        let mut variants = optimize(goals::MinimizeCoverage)
+            .with_coverage(NoCoverage)
+            .with_case(case);
         let mut best = None;
 
         for mut variant in variants.by_ref().take(128) {
@@ -60,12 +67,13 @@ for mut rng in curious().with_coverage(NoCoverage).take(128) {
 
 ## How It Works
 
-`curious()` maximizes coverage between creation and drop of each yielded RNG. When an execution
-finds useful coverage, `dowsing` stores the consumed RNG trace and later mutates accepted flattened
-prefixes to explore nearby inputs. Trace storage and replay are implemented in the workspace
-`dowsing-rng` crate; `dowsing::Case` is a reexport of that trace type for the coverage-guided API.
+`optimize(goal)` drives a set of candidate sources toward the chosen goal. The coverage goal keeps
+executions that find useful coverage, stores the consumed RNG trace, and later mutates accepted
+flattened prefixes to explore nearby inputs. Trace storage and replay are implemented in the
+workspace `dowsing-rng` crate; `dowsing::Case` is a reexport of that trace type for the
+coverage-guided API.
 
-`cautious()` starts from one or more forked cases. It does not generate unrelated fresh roots.
+The minimization goal starts from one or more forked cases. It does not generate unrelated fresh roots.
 Non-discarded variants are treated as still valid, so call `discard()` for cases that do not
 reproduce the behavior your harness is trying to keep.
 
@@ -76,24 +84,39 @@ The minimizer ranks valid variants by:
 3. Lower hit-count weight.
 4. Fewer consumed RNG bytes.
 
-This usually means `cautious()` keeps simplifying the failing path while still spending energy on
-candidates that remove hard-to-remove code.
+This usually means the minimization goal keeps simplifying the failing path while still spending
+energy on candidates that remove hard-to-remove code.
+
+## Mutation Sets
+
+Optimizers can replace their candidate sources with built-ins or custom sources:
+
+```rust
+# use dowsing::{goals, mutations, optimize};
+let search = optimize(goals::MaximizeCoverage).with_mutations([
+    mutations::coverage_havoc(),
+]);
+```
+
+Custom sources implement `CandidateSource` and return `MutationCandidate::from_prefix(...)` or
+`MutationCandidate::from_case(...)`. Built-in sources include coverage havoc, minimizing havoc, and
+semantic reductions over ranges, scalar draws, and byte spans.
 
 ## Domain Costs
 
 Failing variants can report a harness-level cost:
 
 ```rust
-# use dowsing::{NoCoverage, cautious, curious};
+# use dowsing::{NoCoverage, goals, optimize};
 # use rand::Rng;
 # fn sample(mut rng: impl Rng) -> Vec<u8> {
 #     vec![rng.random()]
 # }
-# let mut rng = curious().with_coverage(NoCoverage).next().expect("seed case");
+# let mut rng = optimize(goals::MaximizeCoverage).with_coverage(NoCoverage).next().expect("seed case");
 # let _ = sample(&mut rng);
 # let case = rng.fork_case();
 # let _ = rng.coverage().expect("finish seed coverage");
-# let mut variants = cautious().with_coverage(NoCoverage).with_case(case);
+# let mut variants = optimize(goals::MinimizeCoverage).with_coverage(NoCoverage).with_case(case);
 # let mut variant = variants.next().expect("variant");
 # let input = sample(&mut variant);
 let coverage = variant
@@ -125,16 +148,16 @@ fn sample_items<C: dowsing::coverage::CoverageCapture>(
 node. Range items share the same tracked byte stream as the parent while recording item spans, so
 generation can use `random`, `random_range`, nested `range` calls, and other `rand::Rng` methods.
 
-`cautious()` uses range structure to try length and item reductions before falling back to generic
-byte shrinking. Larger harnesses can tune the reducer budget with
-`tuning::CautiousOptions::new().with_reducer_budget(...)` and `cautious().with_options(...)`.
+The minimization goal uses range structure to try length and item reductions before falling back to
+generic byte shrinking. Larger harnesses can tune the reducer budget with
+`tuning::CautiousOptions::new().with_reducer_budget(...)` and `.with_options(...)`.
 
 ## Parallel Search
 
 The iterators can feed Rayon directly:
 
 ```rust
-use dowsing::{NoCoverage, curious};
+use dowsing::{NoCoverage, goals, optimize};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -148,7 +171,7 @@ use rayon::prelude::*;
 #         Ok(())
 #     }
 # }
-let found = curious()
+let found = optimize(goals::MaximizeCoverage)
     .with_coverage(NoCoverage)
     .take(128)
     .into_par_iter()

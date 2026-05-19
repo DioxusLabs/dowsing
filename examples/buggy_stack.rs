@@ -10,7 +10,7 @@
 //!
 //! `./target/debug/examples/buggy_stack`
 
-use dowsing::{cautious, curious};
+use dowsing::{goals, optimize};
 use rand::Rng;
 use std::collections::VecDeque;
 
@@ -165,13 +165,13 @@ fn check_stack(ops: &[Op]) -> Result<(), String> {
 
 fn main() {
     // Maximize code coverage between when rng is created and dropped in the body of the loop, to increase the chance of hitting the bug.
-    for mut rng in curious().take(DISCOVERY_CASES) {
+    for mut rng in optimize(goals::MaximizeCoverage).take(DISCOVERY_CASES) {
         let ops = sample(&mut rng);
         if let Err(_err) = check_stack(&ops) {
             let case = rng.fork_case();
             let _coverage = rng.coverage().expect("finish discovery coverage");
             // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
-            let mut cautious = cautious().with_case(case);
+            let mut cautious = optimize(goals::MinimizeCoverage).with_case(case);
             let mut best = None;
             for mut variant in cautious.by_ref().take(MINIMIZATION_CASES) {
                 let ops = sample(&mut variant);

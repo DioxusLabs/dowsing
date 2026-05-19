@@ -39,9 +39,41 @@ impl CoverageSet {
 
     /// Extend this set from an iterator of IDs.
     pub fn extend(&mut self, ids: impl IntoIterator<Item = CoverageId>) {
-        self.ids.extend(ids);
-        self.ids.sort_unstable();
-        self.ids.dedup();
+        let mut incoming: Vec<CoverageId> = ids.into_iter().collect();
+        if incoming.is_empty() {
+            return;
+        }
+        incoming.sort_unstable();
+        incoming.dedup();
+
+        if self.ids.is_empty() {
+            self.ids = incoming;
+            return;
+        }
+
+        let mut out = Vec::with_capacity(self.ids.len() + incoming.len());
+        let (mut i, mut j) = (0, 0);
+        let existing = &self.ids;
+        while i < existing.len() && j < incoming.len() {
+            match existing[i].cmp(&incoming[j]) {
+                std::cmp::Ordering::Less => {
+                    out.push(existing[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(incoming[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    out.push(existing[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&existing[i..]);
+        out.extend_from_slice(&incoming[j..]);
+        self.ids = out;
     }
 
     /// Number of unique IDs in this set.

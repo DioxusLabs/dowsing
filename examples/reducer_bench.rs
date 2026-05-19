@@ -1,4 +1,4 @@
-use dowsing::{NoCoverage, cautious, curious};
+use dowsing::{NoCoverage, goals, optimize};
 use rand::Rng;
 use std::{
     env,
@@ -76,14 +76,18 @@ fn main() {
     let byte_len = env_usize("REDUCER_BENCH_BYTE_LEN", 8);
     let seed = env_u64("REDUCER_BENCH_SEED", 0);
 
-    let mut source = curious().with_coverage(NoCoverage).with_seed(seed);
+    let mut source = optimize(goals::MaximizeCoverage)
+        .with_coverage(NoCoverage)
+        .with_seed(seed);
     let case = {
         let mut rng = source.next().expect("source rng");
         consume_case(&mut rng, words, bytes, byte_len);
         rng.fork_case()
     };
 
-    let mut search = cautious().with_coverage(NoCoverage).with_case(case);
+    let mut search = optimize(goals::MinimizeCoverage)
+        .with_coverage(NoCoverage)
+        .with_case(case);
     {
         let mut seed_variant = search.next().expect("seed variant");
         consume_case(&mut seed_variant, words, bytes, byte_len);

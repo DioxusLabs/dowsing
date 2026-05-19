@@ -1,18 +1,21 @@
 use super::{
     prelude::{
-        CAUTIOUS_ENERGY_REFRESH_INTERVAL, CURIOUS_ENERGY_REFRESH_INTERVAL, CandidateOrigin,
-        CautiousOptions, CautiousReducer, CorpusSeed, MAX_CORPUS_LEN, MAX_DICTIONARY_VALUES,
-        MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore, Mode, PrefixFingerprint,
-        ReductionId, ReductionOp, ReductionOperation, ReductionOperationState, ReductionSpec,
-        SequenceSpan, State,
+        CandidateOrigin, CautiousOptions, CautiousReducer, CorpusSeed, DrawSpan, MAX_CORPUS_LEN,
+        MAX_DICTIONARY_VALUES, MAX_PREFIX_LEN, MAX_REDUCER_TRIED_PREFIXES, MinPathScore,
+        MutationWeights, PrefixFingerprint, ReductionId, ReductionOp, ReductionOperation,
+        ReductionOperationState, ReductionSpec, ReductionWeights, ScalarSpan, SequenceSpan,
+        StateCore,
     },
     run::Candidate,
 };
-use crate::coverage::CoverageCapture;
+use dowsing_rng::ByteAffinity;
 use std::ops::Range;
 
-const REDUCTION_OPERATIONS: [ReductionOperation; 12] = [
+const REDUCTION_OPERATIONS: [ReductionOperation; 15] = [
     ReductionOperation::SequenceDelete,
+    ReductionOperation::ScalarGroup,
+    ReductionOperation::ScalarCommonOffset,
+    ReductionOperation::ScalarLower,
     ReductionOperation::DrawLength,
     ReductionOperation::TailTrim,
     ReductionOperation::DrawDelete,
@@ -39,34 +42,33 @@ impl ReductionOperationState {
     }
 }
 
-pub(super) fn merge_dictionary_values<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
-    values: Vec<Vec<u8>>,
-) {
+pub(super) fn merge_dictionary_values(state: &mut StateCore, values: Vec<Vec<u8>>) {
+    let dictionary = std::sync::Arc::make_mut(&mut state.dictionary);
     for value in values {
-        if state.dictionary.len() >= MAX_DICTIONARY_VALUES {
+        if dictionary.len() >= MAX_DICTIONARY_VALUES {
             break;
         }
-        if value.is_empty() || state.dictionary.iter().any(|existing| existing == &value) {
+        if value.is_empty() || dictionary.iter().any(|existing| existing == &value) {
             continue;
         }
-        state.dictionary.push(value);
+        dictionary.push(value);
     }
 }
 
-pub(super) fn next_cautious_reduction<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
-) -> Option<Candidate> {
+pub(super) fn next_cautious_reduction(state: &mut StateCore) -> Option<Candidate> {
     if state.cautious_reducer.best_index != state.min_path_best_index {
         reset_cautious_reducer_to_best(state);
     }
 
-    state
-        .cautious_reducer
-        .next_candidate(&state.dictionary, state.cautious_options)
+    state.cautious_reducer.next_candidate(
+        &state.dictionary,
+        state.cautious_options,
+        &state.mutation_weights,
+        &state.reduction_weights,
+    )
 }
 
-pub(super) fn reset_cautious_reducer_to_best<Capture: CoverageCapture>(state: &mut State<Capture>) {
+pub(super) fn reset_cautious_reducer_to_best(state: &mut StateCore) {
     let Some(index) = state.min_path_best_index else {
         state.cautious_reducer = CautiousReducer::default();
         return;
@@ -78,18 +80,42 @@ pub(super) fn reset_cautious_reducer_to_best<Capture: CoverageCapture>(state: &m
     state.cautious_reducer.reset(index, entry);
 }
 
-pub(super) fn record_cautious_discard<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
-    origin: &CandidateOrigin,
-) {
-    state.cautious_reducer.record_discard(origin);
+pub(super) fn record_cautious_discard(state: &mut StateCore, origin: &CandidateOrigin) {
+    if let Some(operation) = current_reduction_operation(state, origin) {
+        state.reduction_weights.penalize_rejected(operation);
+    }
+    state.cautious_reducer.record_discard(
+        origin,
+        &state.mutation_weights,
+        &state.reduction_weights,
+    );
 }
 
-pub(super) fn record_cautious_preserved<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
+pub(super) fn record_cautious_preserved(state: &mut StateCore, origin: &CandidateOrigin) {
+    if let Some(operation) = current_reduction_operation(state, origin) {
+        state.reduction_weights.reward_preserved(operation);
+    }
+    state.cautious_reducer.record_preserved(
+        origin,
+        &state.mutation_weights,
+        &state.reduction_weights,
+    );
+}
+
+pub(super) fn record_cautious_improved(state: &mut StateCore, origin: &CandidateOrigin) {
+    if let Some(operation) = current_reduction_operation(state, origin) {
+        state.reduction_weights.reward_improved(operation);
+    }
+}
+
+fn current_reduction_operation(
+    state: &StateCore,
     origin: &CandidateOrigin,
-) {
-    state.cautious_reducer.record_preserved(origin);
+) -> Option<ReductionOperation> {
+    let CandidateOrigin::CautiousReduction(id) = origin else {
+        return None;
+    };
+    (id.epoch == state.cautious_reducer.epoch).then_some(id.operation)
 }
 
 impl CautiousReducer {
@@ -97,8 +123,10 @@ impl CautiousReducer {
         self.epoch = self.epoch.wrapping_add(1);
         self.best_index = Some(index);
         self.best_seed = entry.seed;
+        self.best_case = entry.case.clone();
         self.best_prefix = entry.prefix.clone();
         self.best_draws = entry.draws.clone();
+        self.best_scalars = entry.scalars.clone();
         self.best_sequences = entry.sequences.clone();
         self.operation_states = REDUCTION_OPERATIONS
             .iter()
@@ -119,14 +147,16 @@ impl CautiousReducer {
         &mut self,
         dictionary: &[Vec<u8>],
         options: CautiousOptions,
+        weights: &MutationWeights,
+        reduction_weights: &ReductionWeights,
     ) -> Option<Candidate> {
         if self.exhausted {
             return None;
         }
 
         for _ in 0..options.reducer_budget() {
-            self.prepare_operation_states(dictionary, options);
-            let Some(state_index) = self.next_operation_index() else {
+            self.prepare_operation_states(dictionary, options, weights, reduction_weights);
+            let Some(state_index) = self.next_operation_index(weights, reduction_weights) else {
                 self.exhausted = true;
                 return None;
             };
@@ -140,12 +170,17 @@ impl CautiousReducer {
                 state.drained = true;
             }
 
-            let Some(mut prefix) = materialize_reduction(&self.best_prefix, dictionary, &spec)
-            else {
+            let Some((mut case, mut prefix)) = spec.op.materialize(
+                self.best_seed,
+                &self.best_case,
+                &self.best_prefix,
+                dictionary,
+            ) else {
                 continue;
             };
             if prefix.len() > MAX_PREFIX_LEN {
                 prefix.truncate(MAX_PREFIX_LEN);
+                case = super::prelude::Case::from_flat_prefix(self.best_seed, prefix.clone());
             }
             if prefix == self.best_prefix {
                 continue;
@@ -165,6 +200,7 @@ impl CautiousReducer {
             let id = ReductionId {
                 epoch: self.epoch,
                 operation,
+                type_id: spec.op.type_id,
                 cursor,
                 start: spec.start(),
                 len: spec.len(),
@@ -172,7 +208,7 @@ impl CautiousReducer {
                 fingerprint,
             };
             return Some(Candidate {
-                case: super::prelude::Case::from_flat_prefix(self.best_seed, prefix),
+                case,
                 mutated: true,
                 origin: CandidateOrigin::CautiousReduction(id),
             });
@@ -181,9 +217,16 @@ impl CautiousReducer {
         None
     }
 
-    fn prepare_operation_states(&mut self, dictionary: &[Vec<u8>], options: CautiousOptions) {
+    fn prepare_operation_states(
+        &mut self,
+        dictionary: &[Vec<u8>],
+        options: CautiousOptions,
+        weights: &MutationWeights,
+        reduction_weights: &ReductionWeights,
+    ) {
         let prefix = &self.best_prefix;
         let draws = &self.best_draws;
+        let scalars = &self.best_scalars;
         let sequences = &self.best_sequences;
         let pressure = &self.range_pressure;
         for state in &mut self.operation_states {
@@ -196,25 +239,36 @@ impl CautiousReducer {
                 ReductionContext {
                     prefix,
                     draws,
+                    scalars,
                     sequences,
                     dictionary,
                     pressure,
                     options,
                 },
             );
-            sort_operation_tail(state, pressure);
+            sort_operation_tail(state, pressure, weights, reduction_weights);
             state.drained = state.specs.is_empty();
         }
     }
 
-    fn next_operation_index(&self) -> Option<usize> {
+    fn next_operation_index(
+        &self,
+        weights: &MutationWeights,
+        reduction_weights: &ReductionWeights,
+    ) -> Option<usize> {
         let mut best = None;
         for (index, state) in self.operation_states.iter().enumerate() {
             if state.drained || state.cursor >= state.specs.len() {
                 continue;
             }
             let spec = &state.specs[state.cursor];
-            let priority = candidate_priority(state, spec, &self.range_pressure);
+            let priority = candidate_priority(
+                state,
+                spec,
+                &self.range_pressure,
+                weights,
+                reduction_weights,
+            );
             if best.is_none_or(|(best_priority, best_index)| {
                 (priority, index) < (best_priority, best_index)
             }) {
@@ -224,7 +278,12 @@ impl CautiousReducer {
         best.map(|(_, index)| index)
     }
 
-    fn record_discard(&mut self, origin: &CandidateOrigin) {
+    fn record_discard(
+        &mut self,
+        origin: &CandidateOrigin,
+        weights: &MutationWeights,
+        reduction_weights: &ReductionWeights,
+    ) {
         let CandidateOrigin::CautiousReduction(id) = origin else {
             return;
         };
@@ -241,10 +300,15 @@ impl CautiousReducer {
             state.rejects = state.rejects.saturating_add(1);
         }
         self.apply_range_feedback(id.start, id.len, Feedback::Rejected);
-        self.sort_operation_tails();
+        self.sort_operation_tails(weights, reduction_weights);
     }
 
-    fn record_preserved(&mut self, origin: &CandidateOrigin) {
+    fn record_preserved(
+        &mut self,
+        origin: &CandidateOrigin,
+        weights: &MutationWeights,
+        reduction_weights: &ReductionWeights,
+    ) {
         let CandidateOrigin::CautiousReduction(id) = origin else {
             return;
         };
@@ -261,13 +325,17 @@ impl CautiousReducer {
             state.preserves = state.preserves.saturating_add(1);
         }
         self.apply_range_feedback(id.start, id.len, Feedback::Preserved);
-        self.sort_operation_tails();
+        self.sort_operation_tails(weights, reduction_weights);
     }
 
-    fn sort_operation_tails(&mut self) {
+    fn sort_operation_tails(
+        &mut self,
+        weights: &MutationWeights,
+        reduction_weights: &ReductionWeights,
+    ) {
         let pressure = &self.range_pressure;
         for state in &mut self.operation_states {
-            sort_operation_tail(state, pressure);
+            sort_operation_tail(state, pressure, weights, reduction_weights);
         }
     }
 
@@ -297,7 +365,9 @@ enum Feedback {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CandidatePriority {
+    reduction_weight: std::cmp::Reverse<u64>,
     operation_penalty: u64,
+    mutation_weight: std::cmp::Reverse<u64>,
     range_score: u64,
     structure_rank: u8,
     simplification: std::cmp::Reverse<usize>,
@@ -311,9 +381,13 @@ fn candidate_priority(
     state: &ReductionOperationState,
     spec: &ReductionSpec,
     pressure: &[u16],
+    weights: &MutationWeights,
+    reduction_weights: &ReductionWeights,
 ) -> CandidatePriority {
     CandidatePriority {
+        reduction_weight: std::cmp::Reverse(reduction_weights.priority_key(state.operation)),
         operation_penalty: state.rejects.saturating_sub(state.preserves),
+        mutation_weight: std::cmp::Reverse(weights.priority_key(spec.op.type_id)),
         range_score: spec.bias + spec_pressure(pressure, spec),
         structure_rank: operation_structure_rank(state.operation),
         simplification: std::cmp::Reverse(spec.simplification()),
@@ -324,7 +398,12 @@ fn candidate_priority(
     }
 }
 
-fn sort_operation_tail(state: &mut ReductionOperationState, pressure: &[u16]) {
+fn sort_operation_tail(
+    state: &mut ReductionOperationState,
+    pressure: &[u16],
+    weights: &MutationWeights,
+    reduction_weights: &ReductionWeights,
+) {
     if state.cursor >= state.specs.len() {
         state.drained = true;
         return;
@@ -333,6 +412,8 @@ fn sort_operation_tail(state: &mut ReductionOperationState, pressure: &[u16]) {
     let operation = state.operation;
     state.specs[state.cursor..].sort_by_key(|spec| {
         (
+            std::cmp::Reverse(reduction_weights.priority_key(operation)),
+            std::cmp::Reverse(weights.priority_key(spec.op.type_id)),
             spec.bias + spec_pressure(pressure, spec),
             std::cmp::Reverse(spec.simplification()),
             spec.start(),
@@ -352,37 +433,44 @@ fn operation_structure_rank(operation: ReductionOperation) -> u8 {
         ReductionOperation::SequenceDelete
         | ReductionOperation::SequenceProject
         | ReductionOperation::SequenceReplace => 0,
-        ReductionOperation::DrawLength | ReductionOperation::DrawDelete => 1,
+        ReductionOperation::ScalarGroup
+        | ReductionOperation::ScalarCommonOffset
+        | ReductionOperation::ScalarLower => 1,
+        ReductionOperation::DrawLength | ReductionOperation::DrawDelete => 2,
         ReductionOperation::TailTrim
         | ReductionOperation::WeightedBlockDelete
-        | ReductionOperation::DictionaryRepair => 2,
+        | ReductionOperation::DictionaryRepair => 3,
         ReductionOperation::BlockZero
         | ReductionOperation::WordLower
         | ReductionOperation::ByteLower
-        | ReductionOperation::RepeatedValue => 3,
+        | ReductionOperation::RepeatedValue => 4,
     }
 }
 
 fn operation_stable_rank(operation: ReductionOperation) -> u8 {
     match operation {
         ReductionOperation::SequenceDelete => 0,
-        ReductionOperation::DrawLength => 1,
-        ReductionOperation::TailTrim => 2,
-        ReductionOperation::DrawDelete => 3,
-        ReductionOperation::SequenceProject => 4,
-        ReductionOperation::SequenceReplace => 5,
-        ReductionOperation::WeightedBlockDelete => 6,
-        ReductionOperation::BlockZero => 7,
-        ReductionOperation::WordLower => 8,
-        ReductionOperation::ByteLower => 9,
-        ReductionOperation::RepeatedValue => 10,
-        ReductionOperation::DictionaryRepair => 11,
+        ReductionOperation::ScalarGroup => 1,
+        ReductionOperation::ScalarCommonOffset => 2,
+        ReductionOperation::ScalarLower => 3,
+        ReductionOperation::DrawLength => 4,
+        ReductionOperation::TailTrim => 5,
+        ReductionOperation::DrawDelete => 6,
+        ReductionOperation::SequenceProject => 7,
+        ReductionOperation::SequenceReplace => 8,
+        ReductionOperation::WeightedBlockDelete => 9,
+        ReductionOperation::BlockZero => 10,
+        ReductionOperation::WordLower => 11,
+        ReductionOperation::ByteLower => 12,
+        ReductionOperation::RepeatedValue => 13,
+        ReductionOperation::DictionaryRepair => 14,
     }
 }
 
 struct ReductionContext<'a> {
     prefix: &'a [u8],
-    draws: &'a [Range<usize>],
+    draws: &'a [DrawSpan],
+    scalars: &'a [ScalarSpan],
     sequences: &'a [SequenceSpan],
     dictionary: &'a [Vec<u8>],
     pressure: &'a [u16],
@@ -420,6 +508,24 @@ fn reduction_specs(
             )
         }
         ReductionOperation::SequenceProject | ReductionOperation::SequenceReplace => Vec::new(),
+        ReductionOperation::ScalarGroup => scalar_group_specs(
+            context.prefix,
+            context.scalars,
+            context.pressure,
+            context.options,
+        ),
+        ReductionOperation::ScalarCommonOffset => scalar_common_offset_specs(
+            context.prefix,
+            context.scalars,
+            context.pressure,
+            context.options,
+        ),
+        ReductionOperation::ScalarLower => scalar_lower_specs(
+            context.prefix,
+            context.scalars,
+            context.pressure,
+            context.options,
+        ),
         ReductionOperation::DrawLength => draw_length_specs(
             context.prefix,
             context.draws,
@@ -488,13 +594,13 @@ fn sequence_delete_specs(
                 }
                 let target_len = sequence.items.len() - (item_end - item_start);
                 specs.push(ReductionSpec {
-                    op: ReductionOp::DeleteSequenceItems {
-                        length_start: sequence.length_start,
-                        length_width: sequence.length_len,
+                    op: ReductionOp::delete_sequence_items(
+                        sequence.length_start,
+                        sequence.length_len,
                         target_len,
-                        start: first.start,
-                        len: last.end - first.start,
-                    },
+                        first.start,
+                        last.end - first.start,
+                    ),
                     bias: 0,
                 });
             }
@@ -643,14 +749,14 @@ fn push_sequence_projection(
     }
 
     specs.push(ReductionSpec {
-        op: ReductionOp::ProjectSequenceItems {
-            length_start: sequence.length_start,
-            length_width: sequence.length_len,
-            target_len: items.len(),
-            replace_start: region.start,
-            replace_len: region.len,
+        op: ReductionOp::project_sequence_items(
+            sequence.length_start,
+            sequence.length_len,
+            items.len(),
+            region.start,
+            region.len,
             items,
-        },
+        ),
         bias: weight_bias,
     });
 }
@@ -736,9 +842,246 @@ fn item_simplicity_key(bytes: &[u8]) -> (usize, usize, &[u8]) {
     (bytes.len(), nonzero, bytes)
 }
 
+fn scalar_lower_specs(
+    prefix: &[u8],
+    scalars: &[ScalarSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut specs = Vec::new();
+    for scalar in scalars.iter().take(options.draw_limit()) {
+        if !valid_scalar(prefix, scalar) {
+            continue;
+        }
+        let current = read_scalar_rank(prefix, scalar);
+        for target in scalar_targets(scalar, current) {
+            specs.push(ReductionSpec {
+                op: ReductionOp::set_scalar_ranks(
+                    vec![(scalar.start, scalar.len(), target)],
+                    target_key(target),
+                ),
+                bias: 0,
+            });
+        }
+    }
+    specs.sort_by_key(|spec| {
+        (
+            spec_pressure(pressure, spec),
+            spec.start(),
+            spec.len(),
+            spec.target(),
+        )
+    });
+    specs
+}
+
+fn scalar_group_specs(
+    prefix: &[u8],
+    scalars: &[ScalarSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let scalars: Vec<_> = scalars
+        .iter()
+        .take(options.draw_limit())
+        .filter(|scalar| valid_scalar(prefix, scalar))
+        .collect();
+    let mut specs = Vec::new();
+    for (index, scalar) in scalars.iter().enumerate() {
+        let current = read_scalar_rank(prefix, scalar);
+        if scalars[..index].iter().any(|candidate| {
+            candidate.len() == scalar.len()
+                && candidate.span == scalar.span
+                && read_scalar_rank(prefix, candidate) == current
+        }) {
+            continue;
+        }
+        let mut group = vec![*scalar];
+        for candidate in scalars.iter().skip(index + 1) {
+            if candidate.len() != scalar.len() || candidate.span != scalar.span {
+                continue;
+            }
+            let candidate_current = read_scalar_rank(prefix, candidate);
+            if candidate_current == current {
+                group.push(*candidate);
+            }
+        }
+        if group.len() < 2 {
+            continue;
+        }
+        for (target, priority) in scalar_group_targets(scalar, current) {
+            let writes: Vec<_> = group
+                .iter()
+                .map(|scalar| (scalar.start, scalar.len(), target))
+                .collect();
+            let start = group.iter().map(|scalar| scalar.start).min().unwrap_or(0);
+            let end = group.iter().map(|scalar| scalar.end).max().unwrap_or(start);
+            specs.push(ReductionSpec {
+                op: ReductionOp::set_scalar_ranks(writes, priority),
+                bias: range_weight(pressure, start, end.saturating_sub(start)),
+            });
+        }
+    }
+    specs.sort_by_key(|spec| {
+        (
+            spec.bias + spec_pressure(pressure, spec),
+            spec.target(),
+            spec.start(),
+            spec.len(),
+        )
+    });
+    specs
+}
+
+#[derive(Clone, Copy)]
+struct ScalarRank<'a> {
+    scalar: &'a ScalarSpan,
+    current: u128,
+}
+
+fn scalar_common_offset_specs(
+    prefix: &[u8],
+    scalars: &[ScalarSpan],
+    pressure: &[u16],
+    options: CautiousOptions,
+) -> Vec<ReductionSpec> {
+    let mut ranked: Vec<_> = scalars
+        .iter()
+        .take(options.draw_limit())
+        .filter(|scalar| valid_scalar(prefix, scalar))
+        .map(|scalar| ScalarRank {
+            scalar,
+            current: read_scalar_rank(prefix, scalar),
+        })
+        .filter(|rank| rank.current > 0)
+        .collect();
+    ranked.sort_by_key(|rank| (rank.scalar.len(), rank.scalar.span, rank.scalar.start));
+
+    let mut specs = Vec::new();
+    let mut start = 0;
+    while start < ranked.len() {
+        let len = ranked[start].scalar.len();
+        let span = ranked[start].scalar.span;
+        let mut end = start + 1;
+        while end < ranked.len()
+            && ranked[end].scalar.len() == len
+            && ranked[end].scalar.span == span
+        {
+            end += 1;
+        }
+        push_scalar_common_offset_group_specs(&mut specs, &ranked[start..end], pressure);
+        start = end;
+    }
+
+    specs.sort_by_key(|spec| {
+        (
+            spec.bias + spec_pressure(pressure, spec),
+            spec.target(),
+            spec.start(),
+            std::cmp::Reverse(spec.simplification()),
+            spec.len(),
+        )
+    });
+    specs
+}
+
+fn push_scalar_common_offset_group_specs(
+    specs: &mut Vec<ReductionSpec>,
+    group: &[ScalarRank<'_>],
+    pressure: &[u16],
+) {
+    if group.len() < 2 {
+        return;
+    }
+
+    push_scalar_common_offset_cohort_specs(specs, group, pressure);
+    for width in [8, 4, 3, 2] {
+        if width >= group.len() {
+            continue;
+        }
+        for start in 0..=group.len() - width {
+            push_scalar_common_offset_cohort_specs(specs, &group[start..start + width], pressure);
+        }
+    }
+}
+
+fn push_scalar_common_offset_cohort_specs(
+    specs: &mut Vec<ReductionSpec>,
+    cohort: &[ScalarRank<'_>],
+    _pressure: &[u16],
+) {
+    for (delta, priority) in scalar_common_offset_deltas(cohort) {
+        let writes: Vec<_> = cohort
+            .iter()
+            .map(|rank| {
+                (
+                    rank.scalar.start,
+                    rank.scalar.len(),
+                    rank.current.saturating_sub(delta),
+                )
+            })
+            .collect();
+        specs.push(ReductionSpec {
+            op: ReductionOp::set_scalar_ranks(writes, priority),
+            bias: 0,
+        });
+    }
+}
+
+fn scalar_common_offset_deltas(cohort: &[ScalarRank<'_>]) -> Vec<(u128, u64)> {
+    let Some(max_delta) = cohort.iter().map(|rank| rank.current).min() else {
+        return Vec::new();
+    };
+    if max_delta == 0 {
+        return Vec::new();
+    }
+
+    let mut deltas = Vec::new();
+    for rank in cohort {
+        for target in scalar_common_offset_targets(rank.scalar, rank.current) {
+            if target >= rank.current {
+                continue;
+            }
+            let delta = rank.current - target;
+            if delta == 0
+                || delta > max_delta
+                || deltas
+                    .iter()
+                    .any(|(existing, _): &(u128, u64)| *existing == delta)
+            {
+                continue;
+            }
+            if cohort.iter().any(|candidate| {
+                !scalar_target_allowed(candidate.scalar, candidate.current.saturating_sub(delta))
+            }) {
+                continue;
+            }
+            let priority = deltas.len().min(u64::MAX as usize) as u64;
+            deltas.push((delta, priority));
+        }
+    }
+    deltas
+}
+
+fn scalar_common_offset_targets(scalar: &ScalarSpan, current: u128) -> Vec<u128> {
+    let mut targets = Vec::new();
+    for target in scalar_group_base_targets().into_iter().chain([
+        current / 2,
+        current / 4,
+        current / 8,
+        current.saturating_sub(1),
+    ]) {
+        if target != current && scalar_target_allowed(scalar, target) && !targets.contains(&target)
+        {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
 fn draw_length_specs(
     prefix: &[u8],
-    draws: &[Range<usize>],
+    draws: &[DrawSpan],
     pressure: &[u16],
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
@@ -747,6 +1090,14 @@ fn draw_length_specs(
         if !valid_draw(prefix, draw) {
             continue;
         }
+        if draw.affinity == ByteAffinity::Zero
+            && prefix[draw.start..draw.end].iter().any(|byte| *byte != 0)
+        {
+            specs.push(ReductionSpec {
+                op: ReductionOp::zero_range(draw.start, draw.len()),
+                bias: 0,
+            });
+        }
         for width in draw_widths(draw) {
             if draw.start + width > prefix.len() {
                 continue;
@@ -754,12 +1105,7 @@ fn draw_length_specs(
             let current = read_le_word(&prefix[draw.start..draw.start + width]);
             for target in small_length_targets(current, width) {
                 specs.push(ReductionSpec {
-                    op: ReductionOp::SetWord {
-                        start: draw.start,
-                        width,
-                        target,
-                        zero_until: Some(draw.end),
-                    },
+                    op: ReductionOp::set_word(draw.start, width, target, Some(draw.end)),
                     bias: 0,
                 });
             }
@@ -785,11 +1131,7 @@ fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
     for trim in shrink_sizes_including_full(prefix.len()) {
         let start = prefix.len().saturating_sub(trim);
         specs.push(ReductionSpec {
-            op: ReductionOp::DeleteRange {
-                start,
-                len: trim,
-                adjust_first: true,
-            },
+            op: ReductionOp::delete_range(start, trim, true),
             bias: 0,
         });
     }
@@ -805,7 +1147,7 @@ fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
 
 fn draw_delete_specs(
     prefix: &[u8],
-    draws: &[Range<usize>],
+    draws: &[DrawSpan],
     pressure: &[u16],
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
@@ -819,11 +1161,7 @@ fn draw_delete_specs(
             continue;
         }
         specs.push(ReductionSpec {
-            op: ReductionOp::DeleteRange {
-                start: draw.start,
-                len: draw.len(),
-                adjust_first: true,
-            },
+            op: ReductionOp::delete_range(draw.start, draw.len(), true),
             bias: 0,
         });
     }
@@ -847,11 +1185,7 @@ fn draw_delete_specs(
                 continue;
             }
             specs.push(ReductionSpec {
-                op: ReductionOp::DeleteRange {
-                    start: first.start,
-                    len: end - first.start,
-                    adjust_first: true,
-                },
+                op: ReductionOp::delete_range(first.start, end - first.start, true),
                 bias: 0,
             });
         }
@@ -880,11 +1214,7 @@ fn weighted_block_delete_specs(prefix: &[u8], pressure: &[u16]) -> Vec<Reduction
                 continue;
             }
             specs.push(ReductionSpec {
-                op: ReductionOp::DeleteRange {
-                    start,
-                    len,
-                    adjust_first: true,
-                },
+                op: ReductionOp::delete_range(start, len, true),
                 bias: 0,
             });
         }
@@ -912,7 +1242,7 @@ fn block_zero_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
                 continue;
             }
             specs.push(ReductionSpec {
-                op: ReductionOp::ZeroRange { start, len },
+                op: ReductionOp::zero_range(start, len),
                 bias: 0,
             });
         }
@@ -929,7 +1259,7 @@ fn block_zero_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
 
 fn word_lower_specs(
     prefix: &[u8],
-    draws: &[Range<usize>],
+    draws: &[DrawSpan],
     pressure: &[u16],
     options: CautiousOptions,
 ) -> Vec<ReductionSpec> {
@@ -958,12 +1288,7 @@ fn word_lower_specs(
             let current = read_le_word(&prefix[start..start + width]);
             for target in smaller_word_targets(current, width) {
                 specs.push(ReductionSpec {
-                    op: ReductionOp::SetWord {
-                        start,
-                        width,
-                        target,
-                        zero_until: None,
-                    },
+                    op: ReductionOp::set_word(start, width, target, None),
                     bias: 0,
                 });
             }
@@ -985,7 +1310,7 @@ fn byte_lower_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
     for (start, byte) in prefix.iter().copied().enumerate() {
         for value in smaller_byte_targets(byte) {
             specs.push(ReductionSpec {
-                op: ReductionOp::SetByte { start, value },
+                op: ReductionOp::set_byte(start, value),
                 bias: 0,
             });
         }
@@ -1008,7 +1333,7 @@ fn repeated_value_specs(prefix: &[u8]) -> Vec<ReductionSpec> {
     values
         .into_iter()
         .map(|value| ReductionSpec {
-            op: ReductionOp::ZeroRepeated { value },
+            op: ReductionOp::zero_repeated(value),
             bias: 0,
         })
         .collect()
@@ -1034,11 +1359,7 @@ fn dictionary_repair_specs(
                 continue;
             }
             specs.push(ReductionSpec {
-                op: ReductionOp::ReplaceDictionary {
-                    start,
-                    len: value.len(),
-                    dictionary_index,
-                },
+                op: ReductionOp::replace_dictionary(start, value.len(), dictionary_index),
                 bias: 0,
             });
         }
@@ -1052,122 +1373,6 @@ fn dictionary_repair_specs(
         )
     });
     specs
-}
-
-fn materialize_reduction(
-    prefix: &[u8],
-    dictionary: &[Vec<u8>],
-    spec: &ReductionSpec,
-) -> Option<Vec<u8>> {
-    let mut candidate = prefix.to_vec();
-    match &spec.op {
-        ReductionOp::SetWord {
-            start,
-            width,
-            target,
-            zero_until,
-        } => {
-            if start.saturating_add(*width) > candidate.len() {
-                return None;
-            }
-            write_le_word(&mut candidate[*start..*start + *width], *target);
-            if let Some(end) = zero_until {
-                let tail_start = start.saturating_add(*width);
-                if tail_start < *end && *end <= candidate.len() {
-                    candidate[tail_start..*end].fill(0);
-                }
-            }
-        }
-        ReductionOp::DeleteRange {
-            start,
-            len,
-            adjust_first,
-        } => {
-            if *len == 0 || start.saturating_add(*len) > candidate.len() {
-                return None;
-            }
-            candidate.drain(*start..*start + *len);
-            if *adjust_first {
-                shrink_first_by(&mut candidate, *len);
-            }
-        }
-        ReductionOp::DeleteSequenceItems {
-            length_start,
-            length_width,
-            target_len,
-            start,
-            len,
-        } => {
-            if *length_width == 0
-                || length_start.saturating_add(*length_width) > candidate.len()
-                || *len == 0
-                || start.saturating_add(*len) > candidate.len()
-            {
-                return None;
-            }
-            write_le_word(
-                &mut candidate[*length_start..*length_start + *length_width],
-                *target_len as u64,
-            );
-            candidate.drain(*start..*start + *len);
-        }
-        ReductionOp::ProjectSequenceItems {
-            length_start,
-            length_width,
-            target_len,
-            replace_start,
-            replace_len,
-            items,
-        } => {
-            if *length_width == 0
-                || length_start.saturating_add(*length_width) > candidate.len()
-                || replace_start.saturating_add(*replace_len) > candidate.len()
-            {
-                return None;
-            }
-            let mut replacement = Vec::new();
-            for (start, len) in items {
-                if *len == 0 || start.saturating_add(*len) > prefix.len() {
-                    return None;
-                }
-                replacement.extend_from_slice(&prefix[*start..*start + *len]);
-            }
-            write_le_word(
-                &mut candidate[*length_start..*length_start + *length_width],
-                *target_len as u64,
-            );
-            candidate.splice(*replace_start..*replace_start + *replace_len, replacement);
-        }
-        ReductionOp::ZeroRange { start, len } => {
-            if *len == 0 || start.saturating_add(*len) > candidate.len() {
-                return None;
-            }
-            candidate[*start..*start + *len].fill(0);
-        }
-        ReductionOp::SetByte { start, value } => {
-            let byte = candidate.get_mut(*start)?;
-            *byte = *value;
-        }
-        ReductionOp::ZeroRepeated { value } => {
-            for byte in &mut candidate {
-                if *byte == *value {
-                    *byte = 0;
-                }
-            }
-        }
-        ReductionOp::ReplaceDictionary {
-            start,
-            len,
-            dictionary_index,
-        } => {
-            let value = dictionary.get(*dictionary_index)?;
-            if value.len() != *len || start.saturating_add(*len) > candidate.len() {
-                return None;
-            }
-            candidate[*start..*start + *len].copy_from_slice(value);
-        }
-    }
-    Some(candidate)
 }
 
 fn prefix_fingerprint(prefix: &[u8]) -> PrefixFingerprint {
@@ -1230,11 +1435,24 @@ fn valid_range(prefix: &[u8], range: &Range<usize>) -> bool {
     range.start < range.end && range.end <= prefix.len()
 }
 
-fn valid_draw(prefix: &[u8], draw: &Range<usize>) -> bool {
-    valid_range(prefix, draw)
+fn valid_draw(prefix: &[u8], draw: &DrawSpan) -> bool {
+    !draw.is_empty() && draw.end <= prefix.len()
 }
 
-fn draw_widths(draw: &Range<usize>) -> Vec<usize> {
+fn valid_scalar(prefix: &[u8], scalar: &ScalarSpan) -> bool {
+    !scalar.is_empty() && scalar.end <= prefix.len() && scalar.len() <= 16
+}
+
+fn read_scalar_rank(prefix: &[u8], scalar: &ScalarSpan) -> u128 {
+    let raw = read_le_u128(&prefix[scalar.start..scalar.end]);
+    if scalar.span == 0 {
+        raw
+    } else {
+        raw % scalar.span
+    }
+}
+
+fn draw_widths(draw: &DrawSpan) -> Vec<usize> {
     let mut widths = Vec::new();
     let len = draw.len();
     for width in [len.min(8), 4, 2, 1] {
@@ -1279,6 +1497,68 @@ fn shrink_sizes(len: usize) -> Vec<usize> {
     sizes
 }
 
+fn scalar_targets(scalar: &ScalarSpan, current: u128) -> Vec<u128> {
+    let mut targets = Vec::new();
+    for target in scalar_base_targets().into_iter().chain([
+        current / 2,
+        current / 4,
+        current.saturating_sub(1),
+    ]) {
+        if target != current && scalar_target_allowed(scalar, target) && !targets.contains(&target)
+        {
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn scalar_group_targets(scalar: &ScalarSpan, current: u128) -> Vec<(u128, u64)> {
+    let mut targets = Vec::new();
+    for target in scalar_group_base_targets().into_iter().chain([
+        current / 2,
+        current / 4,
+        current.saturating_sub(1),
+    ]) {
+        if target != current
+            && scalar_target_allowed(scalar, target)
+            && !targets
+                .iter()
+                .any(|(existing, _): &(u128, u64)| *existing == target)
+        {
+            let priority = targets.len().min(u64::MAX as usize) as u64;
+            targets.push((target, priority));
+        }
+    }
+    targets
+}
+
+fn scalar_base_targets() -> Vec<u128> {
+    (0..=16)
+        .chain([31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1023, 1024])
+        .collect()
+}
+
+fn scalar_group_base_targets() -> Vec<u128> {
+    [
+        9, 10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 31, 32, 63, 64, 127, 128, 255,
+        256, 511, 512, 1023, 1024,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn scalar_target_allowed(scalar: &ScalarSpan, target: u128) -> bool {
+    (scalar.span == 0 || target < scalar.span) && target_fits_width(target, scalar.len())
+}
+
+fn target_fits_width(target: u128, width: usize) -> bool {
+    width >= 16 || target < (1_u128 << (width * 8))
+}
+
+fn target_key(target: u128) -> u64 {
+    target.min(u64::MAX as u128) as u64
+}
+
 fn small_length_targets(word: u64, width: usize) -> Vec<u64> {
     let max = max_word_value(width);
     let mut targets = Vec::new();
@@ -1313,11 +1593,12 @@ fn read_le_word(bytes: &[u8]) -> u64 {
     word
 }
 
-fn write_le_word(bytes: &mut [u8], mut word: u64) {
-    for byte in bytes {
-        *byte = word as u8;
-        word >>= 8;
+fn read_le_u128(bytes: &[u8]) -> u128 {
+    let mut word = 0_u128;
+    for (index, byte) in bytes.iter().take(16).enumerate() {
+        word |= (*byte as u128) << (index * 8);
     }
+    word
 }
 
 fn smaller_word_targets(word: u64, width: usize) -> Vec<u64> {
@@ -1385,32 +1666,18 @@ fn replacement_simplifies(current: &[u8], value: &[u8]) -> bool {
     (value_nonzero, value) < (current_nonzero, current)
 }
 
-fn shrink_first_by(prefix: &mut [u8], amount: usize) {
-    let Some(first) = prefix.first_mut() else {
-        return;
-    };
-    *first = first.saturating_sub(amount.min(u8::MAX as usize) as u8);
-}
-
 fn truncate_specs(specs: &mut Vec<ReductionSpec>, limit: usize) {
     if specs.len() > limit {
         specs.truncate(limit);
     }
 }
 
-pub(super) fn energy_refresh_interval(mode: Mode) -> u64 {
-    match mode {
-        Mode::Curious => CURIOUS_ENERGY_REFRESH_INTERVAL,
-        Mode::Cautious => CAUTIOUS_ENERGY_REFRESH_INTERVAL,
-    }
-}
-
-pub(super) fn prune_corpus<Capture: CoverageCapture>(state: &mut State<Capture>) {
+pub(super) fn prune_corpus(state: &mut StateCore, prune_by_worst_score: bool) -> bool {
     if state.corpus.len() <= MAX_CORPUS_LEN {
-        return;
+        return false;
     }
 
-    let remove = if state.mode == Mode::Cautious {
+    let remove = if prune_by_worst_score {
         state
             .corpus
             .iter()
@@ -1445,14 +1712,13 @@ pub(super) fn prune_corpus<Capture: CoverageCapture>(state: &mut State<Capture>)
     if let Some(index) = remove {
         state.corpus.swap_remove(index);
         state.energy_index.swap_remove(index);
-        if state.mode == Mode::Cautious {
-            refresh_min_path_best(state);
-            reset_cautious_reducer_to_best(state);
-        }
+        return true;
     }
+
+    false
 }
 
-fn refresh_min_path_best<Capture: CoverageCapture>(state: &mut State<Capture>) {
+pub(super) fn refresh_min_path_best(state: &mut StateCore) {
     let best = state
         .corpus
         .iter()

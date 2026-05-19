@@ -10,5 +10,7 @@ edition = "2024"
 [dependencies]
 dowsing-rng = { version = "0.1.0", path = "crates/dowsing-rng" }
 dowsing-sys = { version = "0.1.0", path = "crates/dowsing-sys" }
+parking_lot = "0.12"
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = "1.10"
+rustc-hash = "2"

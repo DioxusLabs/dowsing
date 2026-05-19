@@ -1,155 +1,284 @@
 use super::{
-    prelude::{INTERESTING_BYTES, MAX_PREFIX_LEN, MinPathScore, Mode, State},
-    run::min_path_schedule_energy,
+    mutation::{self, MutationWeights, RngByteMutation},
+    prelude::{INTERESTING_BYTES, MAX_PREFIX_LEN, StateCore},
 };
-use crate::coverage::{CoverageCapture, CoverageId};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
+use std::any::TypeId;
+
+#[derive(Debug)]
+struct WeightedMutation {
+    type_id: TypeId,
+    baseline: f64,
+    mutator: Box<dyn RngByteMutation>,
+}
 
 pub(super) fn havoc_prefix(
     prefix: &[u8],
     rng: &mut SmallRng,
     depth: usize,
     dictionary: &[Vec<u8>],
-) -> Vec<u8> {
+    weights: &MutationWeights,
+) -> (Vec<u8>, Vec<TypeId>) {
     let mut candidate = prefix.to_vec();
+    let mut kinds = Vec::new();
     for _ in 0..depth.max(1) {
-        mutate_minimizing_havoc(&mut candidate, rng, dictionary);
+        if let Some(kind) = mutate_minimizing_havoc(&mut candidate, rng, dictionary, weights) {
+            kinds.push(kind);
+        }
         if candidate.len() > MAX_PREFIX_LEN {
             candidate.truncate(MAX_PREFIX_LEN);
         }
     }
-    if candidate == prefix {
-        mutate_minimizing_havoc(&mut candidate, rng, dictionary);
+    if candidate == prefix
+        && let Some(kind) = mutate_minimizing_havoc(&mut candidate, rng, dictionary, weights)
+    {
+        kinds.push(kind);
     }
-    candidate
+    (candidate, kinds)
 }
 
-fn mutate_minimizing_havoc(prefix: &mut Vec<u8>, rng: &mut SmallRng, dictionary: &[Vec<u8>]) {
-    match rng.random_range(0..40) {
-        0..=4 if prefix.len() > 1 => {
-            let removed = drain_minimizing_chunk(prefix, rng, true);
-            shrink_leading_byte(prefix, removed, rng);
-        }
-        5..=7 if prefix.len() > 1 => {
-            drain_minimizing_chunk(prefix, rng, false);
-        }
-        8 if prefix.len() > 1 => {
-            let keep_from = rng.random_range(1..prefix.len());
-            prefix.drain(0..keep_from);
-        }
-        9..=10 if prefix.len() > 1 => {
-            let keep = 1 + minimizing_index(prefix.len() - 1, rng);
-            let removed = prefix.len() - keep;
-            prefix.truncate(keep);
-            shrink_leading_byte(prefix, removed, rng);
-        }
-        11 if !prefix.is_empty() => {
-            let len = minimizing_index(prefix.len(), rng);
-            prefix.truncate(len);
-        }
-        12..=13 if !prefix.is_empty() => {
-            let start = minimizing_index(prefix.len(), rng);
-            let end = minimizing_end(prefix.len(), start, rng);
-            prefix[start..end].fill(0);
-        }
-        14..=17 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = shrink_byte(prefix[index], rng);
-        }
-        18 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = small_or_interesting_byte(rng);
-        }
-        19 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] ^= 1 << rng.random_range(0..8);
-        }
-        20 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = prefix[index].wrapping_add(rng.random_range(1..=35));
-        }
-        21 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = prefix[index].wrapping_sub(rng.random_range(1..=35));
-        }
-        22 if !dictionary.is_empty() && !prefix.is_empty() => {
-            let bytes = &dictionary[rng.random_range(0..dictionary.len())];
-            replace_bytes(prefix, rng, bytes);
-        }
-        23 if !dictionary.is_empty() => {
-            let bytes = &dictionary[rng.random_range(0..dictionary.len())];
-            insert_bytes(prefix, rng, bytes);
-        }
-        24..=27 if prefix.len() >= 2 => {
-            shrink_word_to_target(prefix, rng, 2);
-        }
-        28..=30 if prefix.len() >= 4 => {
-            shrink_word_to_target(prefix, rng, 4);
-        }
-        31 if prefix.len() >= 8 => {
-            shrink_word_to_target(prefix, rng, 8);
-        }
-        32 if prefix.len() >= 2 => {
-            mutate_word(prefix, rng, 2);
-        }
-        33 if prefix.len() >= 4 => {
-            mutate_word(prefix, rng, 4);
-        }
-        34 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = 0;
-        }
-        35 if prefix.len() > 1 => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix.remove(index);
-        }
-        36 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = rng.random();
-        }
-        37 if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = prefix[index].min(small_or_interesting_byte(rng));
-        }
-        38 if prefix.len() > 1 => {
-            let start = minimizing_index(prefix.len(), rng);
-            let end = minimizing_end(prefix.len(), start, rng);
-            for byte in &mut prefix[start..end] {
-                *byte = small_or_interesting_byte(rng);
-            }
-        }
-        39 => {
-            let index = rng.random_range(0..=prefix.len());
-            prefix.insert(index, rng.random());
-        }
-        _ if !prefix.is_empty() => {
-            let index = minimizing_index(prefix.len(), rng);
-            prefix[index] = shrink_byte(prefix[index], rng);
-        }
-        _ => prefix.push(rng.random()),
-    }
+fn mutate_minimizing_havoc(
+    prefix: &mut Vec<u8>,
+    rng: &mut SmallRng,
+    dictionary: &[Vec<u8>],
+    weights: &MutationWeights,
+) -> Option<TypeId> {
+    let mutations = minimizing_havoc_mutations(prefix, rng, dictionary);
+    let mutation = choose_weighted_mutation(mutations, weights, rng)?;
+    apply_mutation(prefix, dictionary, mutation)
 }
 
-fn drain_minimizing_chunk(prefix: &mut Vec<u8>, rng: &mut SmallRng, body_only: bool) -> usize {
-    let start = if body_only && prefix.len() > 1 {
-        1 + minimizing_index(prefix.len() - 1, rng)
+fn minimizing_havoc_mutations(
+    prefix: &[u8],
+    rng: &mut SmallRng,
+    dictionary: &[Vec<u8>],
+) -> Vec<WeightedMutation> {
+    let mut mutations = Vec::new();
+
+    if prefix.len() > 1 {
+        let (start, len) = minimizing_chunk(prefix.len(), rng, true);
+        push_mutation(
+            &mut mutations,
+            5.0,
+            mutation::delete_range(start, len, leading_byte_subtraction(len, rng)),
+        );
+
+        let (start, len) = minimizing_chunk(prefix.len(), rng, false);
+        push_mutation(
+            &mut mutations,
+            3.0,
+            mutation::delete_range(start, len, None),
+        );
+
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::drain_prefix(rng.random_range(1..prefix.len())),
+        );
+
+        let keep = 1 + minimizing_index(prefix.len() - 1, rng);
+        let removed = prefix.len() - keep;
+        push_mutation(
+            &mut mutations,
+            2.0,
+            mutation::truncate(keep, leading_byte_subtraction(removed, rng)),
+        );
+
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::delete_range(minimizing_index(prefix.len(), rng), 1, None),
+        );
+
+        let start = minimizing_index(prefix.len(), rng);
+        let end = minimizing_end(prefix.len(), start, rng);
+        let bytes = (start..end)
+            .map(|_| small_or_interesting_byte(rng))
+            .collect();
+        push_mutation(&mut mutations, 1.0, mutation::fill_range(start, bytes));
+    }
+
+    if !prefix.is_empty() {
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::truncate(minimizing_index(prefix.len(), rng), None),
+        );
+
+        let start = minimizing_index(prefix.len(), rng);
+        let end = minimizing_end(prefix.len(), start, rng);
+        push_mutation(
+            &mut mutations,
+            2.0,
+            mutation::fill_range(start, vec![0; end - start]),
+        );
+
+        let index = minimizing_index(prefix.len(), rng);
+        push_mutation(
+            &mut mutations,
+            4.0,
+            mutation::set_byte(index, shrink_byte(prefix[index], rng)),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::set_byte(
+                minimizing_index(prefix.len(), rng),
+                small_or_interesting_byte(rng),
+            ),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::xor_bit(minimizing_index(prefix.len(), rng), rng.random_range(0..8)),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::add_byte(
+                minimizing_index(prefix.len(), rng),
+                rng.random_range(1..=35),
+            ),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::sub_byte(
+                minimizing_index(prefix.len(), rng),
+                rng.random_range(1..=35),
+            ),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::set_byte(minimizing_index(prefix.len(), rng), 0),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::set_byte(minimizing_index(prefix.len(), rng), rng.random()),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::min_byte(
+                minimizing_index(prefix.len(), rng),
+                small_or_interesting_byte(rng),
+            ),
+        );
+    }
+
+    if !dictionary.is_empty() {
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::insert_dictionary(
+                rng.random_range(0..=prefix.len()),
+                rng.random_range(0..dictionary.len()),
+            ),
+        );
+        if !prefix.is_empty() {
+            let dictionary_index = rng.random_range(0..dictionary.len());
+            let start = rng.random_range(0..prefix.len());
+            let len = dictionary[dictionary_index].len().min(prefix.len() - start);
+            push_mutation(
+                &mut mutations,
+                1.0,
+                mutation::replace_dictionary(start, len, dictionary_index),
+            );
+        }
+    }
+
+    if prefix.len() >= 2 {
+        push_mutation(
+            &mut mutations,
+            4.0,
+            sample_shrink_word_to_target(prefix, rng, 2),
+        );
+        push_mutation(&mut mutations, 1.0, sample_mutate_word(prefix, rng, 2));
+    }
+    if prefix.len() >= 4 {
+        push_mutation(
+            &mut mutations,
+            3.0,
+            sample_shrink_word_to_target(prefix, rng, 4),
+        );
+        push_mutation(&mut mutations, 1.0, sample_mutate_word(prefix, rng, 4));
+    }
+    if prefix.len() >= 8 {
+        push_mutation(
+            &mut mutations,
+            1.0,
+            sample_shrink_word_to_target(prefix, rng, 8),
+        );
+    }
+
+    push_mutation(
+        &mut mutations,
+        1.0,
+        mutation::insert_bytes(rng.random_range(0..=prefix.len()), vec![rng.random()]),
+    );
+    mutations
+}
+
+fn push_mutation(
+    mutations: &mut Vec<WeightedMutation>,
+    baseline: f64,
+    mutator: Box<dyn RngByteMutation>,
+) {
+    mutations.push(WeightedMutation {
+        type_id: mutator.as_ref().type_id(),
+        baseline,
+        mutator,
+    });
+}
+
+fn choose_weighted_mutation(
+    mut mutations: Vec<WeightedMutation>,
+    weights: &MutationWeights,
+    rng: &mut SmallRng,
+) -> Option<Box<dyn RngByteMutation>> {
+    let total = mutations
+        .iter()
+        .map(|mutation| weights.selection_weight(mutation.type_id, mutation.baseline))
+        .sum::<f64>();
+    if !total.is_finite() || total <= 0.0 {
+        return mutations.pop().map(|mutation| mutation.mutator);
+    }
+
+    let mut target = rng.random::<f64>() * total;
+    for (index, mutation) in mutations.iter().enumerate() {
+        let weight = weights.selection_weight(mutation.type_id, mutation.baseline);
+        if target < weight {
+            return Some(mutations.swap_remove(index).mutator);
+        }
+        target -= weight;
+    }
+    mutations.pop().map(|mutation| mutation.mutator)
+}
+
+fn apply_mutation(
+    prefix: &mut Vec<u8>,
+    dictionary: &[Vec<u8>],
+    mutation: Box<dyn RngByteMutation>,
+) -> Option<TypeId> {
+    let type_id = mutation.as_ref().type_id();
+    mutation.apply_bytes(prefix, dictionary).then_some(type_id)
+}
+
+fn minimizing_chunk(len: usize, rng: &mut SmallRng, body_only: bool) -> (usize, usize) {
+    let start = if body_only && len > 1 {
+        1 + minimizing_index(len - 1, rng)
     } else {
-        minimizing_index(prefix.len(), rng)
+        minimizing_index(len, rng)
     };
-    let end = minimizing_end(prefix.len(), start, rng);
-    let removed = end - start;
-    prefix.drain(start..end);
-    removed
+    let end = minimizing_end(len, start, rng);
+    (start, end - start)
 }
 
-fn shrink_leading_byte(prefix: &mut [u8], removed: usize, rng: &mut SmallRng) {
-    let Some(first) = prefix.first_mut() else {
-        return;
-    };
+fn leading_byte_subtraction(removed: usize, rng: &mut SmallRng) -> Option<u8> {
     let max = removed.min(16) as u8;
-    if max != 0 {
-        *first = first.saturating_sub(rng.random_range(1..=max));
-    }
+    (max != 0).then(|| rng.random_range(1..=max))
 }
 
 fn minimizing_index(len: usize, rng: &mut SmallRng) -> usize {
@@ -188,9 +317,7 @@ fn shrink_byte(byte: u8, rng: &mut SmallRng) -> u8 {
     }
 }
 
-pub(super) fn choose_corpus_index<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
-) -> Option<usize> {
+pub(super) fn choose_corpus_index(state: &mut StateCore) -> Option<usize> {
     if state.corpus.is_empty() {
         return None;
     }
@@ -198,7 +325,7 @@ pub(super) fn choose_corpus_index<Capture: CoverageCapture>(
     entropic_corpus_index(state)
 }
 
-fn entropic_corpus_index<Capture: CoverageCapture>(state: &mut State<Capture>) -> Option<usize> {
+fn entropic_corpus_index(state: &mut StateCore) -> Option<usize> {
     state
         .energy_index
         .sample(&mut state.scheduler)
@@ -211,93 +338,142 @@ pub(super) fn mutate_prefix(
     crossover_prefix: Option<&[u8]>,
     dictionary: &[Vec<u8>],
     salt: u64,
-) {
-    match rng.random_range(0..14) {
-        0 if !prefix.is_empty() => {
-            let index = rng.random_range(0..prefix.len());
-            prefix[index] ^= 1 << rng.random_range(0..8);
-        }
-        1 if !prefix.is_empty() => {
-            let index = rng.random_range(0..prefix.len());
-            prefix[index] = rng.random();
-        }
-        2 => {
-            let index = rng.random_range(0..=prefix.len());
-            prefix.insert(index, rng.random());
-        }
-        3 if prefix.len() > 1 => {
-            let index = rng.random_range(0..prefix.len());
-            prefix.remove(index);
-        }
-        4 if !prefix.is_empty() => {
-            let start = rng.random_range(0..prefix.len());
-            let end = rng.random_range(start + 1..=prefix.len());
-            for byte in &mut prefix[start..end] {
-                *byte = rng.random();
-            }
-        }
-        5 if prefix.len() > 1 => {
-            let start = rng.random_range(0..prefix.len());
-            let end = rng.random_range(start + 1..=prefix.len());
-            prefix.drain(start..end);
-        }
-        6 if !prefix.is_empty() => {
-            let start = rng.random_range(0..prefix.len());
-            let end = rng.random_range(start + 1..=prefix.len());
-            let chunk: Vec<_> = prefix[start..end].to_vec();
-            let insert = rng.random_range(0..=prefix.len());
-            prefix.splice(insert..insert, chunk);
-        }
-        7 if !prefix.is_empty() => {
-            let index = rng.random_range(0..prefix.len());
-            prefix[index] = prefix[index].wrapping_add(rng.random_range(1..=35));
-        }
-        8 if !prefix.is_empty() => {
-            let index = rng.random_range(0..prefix.len());
-            prefix[index] = prefix[index].wrapping_sub(rng.random_range(1..=35));
-        }
-        9 if !prefix.is_empty() => {
-            mutate_word(prefix, rng, 2);
-        }
-        10 if !prefix.is_empty() => {
-            mutate_word(prefix, rng, 4);
-        }
-        11 if !dictionary.is_empty() => {
-            let bytes = &dictionary[rng.random_range(0..dictionary.len())];
-            insert_bytes(prefix, rng, bytes);
-        }
-        12 if !dictionary.is_empty() && !prefix.is_empty() => {
-            let bytes = &dictionary[rng.random_range(0..dictionary.len())];
-            let index = rng.random_range(0..prefix.len());
-            let end = (index + bytes.len()).min(prefix.len());
-            prefix.splice(index..end, bytes.iter().copied());
-        }
-        13 if crossover_prefix.is_some_and(|other| !other.is_empty()) => {
-            let other = crossover_prefix.expect("checked crossover prefix");
-            let start = rng.random_range(0..other.len());
-            let end = rng.random_range(start + 1..=other.len());
-            insert_bytes(prefix, rng, &other[start..end]);
-        }
-        _ => {
-            let mut filler = SmallRng::seed_from_u64(salt);
-            let extra = rng.random_range(1..=8);
-            prefix.extend((0..extra).map(|_| filler.random::<u8>()));
-        }
-    };
+    weights: &MutationWeights,
+) -> Option<TypeId> {
+    let mutations = curious_mutations(prefix, rng, crossover_prefix, dictionary, salt);
+    let mutation = choose_weighted_mutation(mutations, weights, rng)?;
+    apply_mutation(prefix, dictionary, mutation)
 }
 
-fn mutate_word(prefix: &mut [u8], rng: &mut SmallRng, width: usize) {
+fn curious_mutations(
+    prefix: &[u8],
+    rng: &mut SmallRng,
+    crossover_prefix: Option<&[u8]>,
+    dictionary: &[Vec<u8>],
+    salt: u64,
+) -> Vec<WeightedMutation> {
+    let mut mutations = Vec::new();
+
+    if !prefix.is_empty() {
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::xor_bit(rng.random_range(0..prefix.len()), rng.random_range(0..8)),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::set_byte(rng.random_range(0..prefix.len()), rng.random()),
+        );
+
+        let start = rng.random_range(0..prefix.len());
+        let end = rng.random_range(start + 1..=prefix.len());
+        let bytes = (start..end).map(|_| rng.random()).collect();
+        push_mutation(&mut mutations, 1.0, mutation::fill_range(start, bytes));
+
+        let start = rng.random_range(0..prefix.len());
+        let end = rng.random_range(start + 1..=prefix.len());
+        let chunk = prefix[start..end].to_vec();
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::insert_bytes(rng.random_range(0..=prefix.len()), chunk),
+        );
+
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::add_byte(rng.random_range(0..prefix.len()), rng.random_range(1..=35)),
+        );
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::sub_byte(rng.random_range(0..prefix.len()), rng.random_range(1..=35)),
+        );
+        push_mutation(&mut mutations, 1.0, sample_mutate_word(prefix, rng, 2));
+        push_mutation(&mut mutations, 1.0, sample_mutate_word(prefix, rng, 4));
+    }
+
+    push_mutation(
+        &mut mutations,
+        1.0,
+        mutation::insert_bytes(rng.random_range(0..=prefix.len()), vec![rng.random()]),
+    );
+
+    if prefix.len() > 1 {
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::delete_range(rng.random_range(0..prefix.len()), 1, None),
+        );
+        let start = rng.random_range(0..prefix.len());
+        let end = rng.random_range(start + 1..=prefix.len());
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::delete_range(start, end - start, None),
+        );
+    }
+
+    if !dictionary.is_empty() {
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::insert_dictionary(
+                rng.random_range(0..=prefix.len()),
+                rng.random_range(0..dictionary.len()),
+            ),
+        );
+        if !prefix.is_empty() {
+            let dictionary_index = rng.random_range(0..dictionary.len());
+            let index = rng.random_range(0..prefix.len());
+            let len = dictionary[dictionary_index].len().min(prefix.len() - index);
+            push_mutation(
+                &mut mutations,
+                1.0,
+                mutation::replace_dictionary(index, len, dictionary_index),
+            );
+        }
+    }
+
+    if let Some(other) = crossover_prefix.filter(|other| !other.is_empty()) {
+        let start = rng.random_range(0..other.len());
+        let end = rng.random_range(start + 1..=other.len());
+        push_mutation(
+            &mut mutations,
+            1.0,
+            mutation::insert_bytes(
+                rng.random_range(0..=prefix.len()),
+                other[start..end].to_vec(),
+            ),
+        );
+    }
+
+    let mut filler = SmallRng::seed_from_u64(salt);
+    let extra = rng.random_range(1..=8);
+    push_mutation(
+        &mut mutations,
+        1.0,
+        mutation::insert_bytes(
+            prefix.len(),
+            (0..extra).map(|_| filler.random::<u8>()).collect(),
+        ),
+    );
+
+    mutations
+}
+
+fn sample_mutate_word(prefix: &[u8], rng: &mut SmallRng, width: usize) -> Box<dyn RngByteMutation> {
     if prefix.len() < width {
         let index = rng.random_range(0..prefix.len());
-        prefix[index] = interesting_byte(rng);
-        return;
+        return mutation::set_byte(index, interesting_byte(rng));
     }
     let index = rng.random_range(0..=prefix.len() - width);
     match width {
         2 => {
             let value = u16::from_le_bytes([prefix[index], prefix[index + 1]]);
             let value = value.wrapping_add(rng.random_range(1..=35));
-            prefix[index..index + 2].copy_from_slice(&value.to_le_bytes());
+            mutation::set_word(index, width, u64::from(value))
         }
         4 => {
             let value = u32::from_le_bytes([
@@ -307,17 +483,20 @@ fn mutate_word(prefix: &mut [u8], rng: &mut SmallRng, width: usize) {
                 prefix[index + 3],
             ]);
             let value = value.wrapping_sub(rng.random_range(1..=35));
-            prefix[index..index + 4].copy_from_slice(&value.to_le_bytes());
+            mutation::set_word(index, width, u64::from(value))
         }
-        _ => {}
+        _ => mutation::set_byte(index, interesting_byte(rng)),
     }
 }
 
-fn shrink_word_to_target(prefix: &mut [u8], rng: &mut SmallRng, width: usize) {
+fn sample_shrink_word_to_target(
+    prefix: &[u8],
+    rng: &mut SmallRng,
+    width: usize,
+) -> Box<dyn RngByteMutation> {
     if prefix.len() < width {
         let index = minimizing_index(prefix.len(), rng);
-        prefix[index] = shrink_byte(prefix[index], rng);
-        return;
+        return mutation::set_byte(index, shrink_byte(prefix[index], rng));
     }
 
     let index = minimizing_index(prefix.len() - width + 1, rng);
@@ -325,10 +504,9 @@ fn shrink_word_to_target(prefix: &mut [u8], rng: &mut SmallRng, width: usize) {
     let targets = smaller_word_targets(current, width);
     let Some(target) = choose_word_target(&targets, rng) else {
         let byte = index + minimizing_index(width, rng);
-        prefix[byte] = shrink_byte(prefix[byte], rng);
-        return;
+        return mutation::set_byte(byte, shrink_byte(prefix[byte], rng));
     };
-    write_le_word(&mut prefix[index..index + width], target);
+    mutation::set_word(index, width, target)
 }
 
 fn choose_word_target(targets: &[u64], rng: &mut SmallRng) -> Option<u64> {
@@ -351,13 +529,6 @@ fn read_le_word(bytes: &[u8]) -> u64 {
         word |= (*byte as u64) << (index * 8);
     }
     word
-}
-
-fn write_le_word(bytes: &mut [u8], mut word: u64) {
-    for byte in bytes {
-        *byte = word as u8;
-        word >>= 8;
-    }
 }
 
 fn smaller_word_targets(word: u64, width: usize) -> Vec<u64> {
@@ -396,79 +567,52 @@ fn interesting_byte(rng: &mut SmallRng) -> u8 {
     INTERESTING_BYTES[rng.random_range(0..INTERESTING_BYTES.len())]
 }
 
-fn insert_bytes(prefix: &mut Vec<u8>, rng: &mut SmallRng, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    let index = rng.random_range(0..=prefix.len());
-    prefix.splice(index..index, bytes.iter().copied());
-}
-
-fn replace_bytes(prefix: &mut Vec<u8>, rng: &mut SmallRng, bytes: &[u8]) {
-    if bytes.is_empty() || prefix.is_empty() {
-        return;
-    }
-    let index = rng.random_range(0..prefix.len());
-    let end = (index + bytes.len()).min(prefix.len());
-    prefix.splice(index..end, bytes.iter().copied());
-}
-
 #[cfg(test)]
 pub(crate) fn test_dictionary_mutation(prefix: &mut Vec<u8>, dictionary: &[Vec<u8>]) {
     if let Some(bytes) = dictionary.first() {
         let mut rng = SmallRng::seed_from_u64(1);
-        insert_bytes(prefix, &mut rng, bytes);
+        let mutation = mutation::insert_bytes(rng.random_range(0..=prefix.len()), bytes.clone());
+        let _ = mutation.apply_bytes(prefix, dictionary);
     }
 }
 
-pub(super) fn corpus_energy<Capture: CoverageCapture>(
-    state: &State<Capture>,
-    coverage: &[CoverageId],
-) -> f64 {
-    let executions = state.stats.executed.max(1) as f64;
-    let mut energy = 0.0;
-    for id in coverage {
-        let frequency = (*state.coverage_frequency.get(id).unwrap_or(&1)).max(1) as f64;
-        energy += (executions / frequency).ln().max(0.0);
-    }
-    energy.max(1.0)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub(super) fn refresh_corpus_energies<Capture: CoverageCapture>(state: &mut State<Capture>) {
-    match state.mode {
-        Mode::Curious => {
-            let executions = state.stats.executed.max(1) as f64;
-            for entry in &mut state.corpus {
-                let mut energy = 0.0;
-                for id in &entry.coverage {
-                    let frequency = (*state.coverage_frequency.get(id).unwrap_or(&1)).max(1) as f64;
-                    energy += (executions / frequency).ln().max(0.0);
-                }
-                entry.energy = energy.max(1.0);
-            }
+    #[test]
+    fn weighted_mutation_selection_favors_boosted_concrete_mutator() {
+        let mut weights = MutationWeights::default();
+        let set_byte_id = mutation::set_byte(0, 0).as_ref().type_id();
+        let insert_bytes_id = mutation::insert_bytes(0, vec![1]).as_ref().type_id();
+        weights.set_for_test(set_byte_id, 16.0);
+        weights.set_for_test(insert_bytes_id, 0.10);
+
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mut set_byte = 0;
+        for _ in 0..64 {
+            let insert_bytes = mutation::insert_bytes(0, vec![1]);
+            let set_byte_mutation = mutation::set_byte(0, 0);
+            let mutation = choose_weighted_mutation(
+                vec![
+                    WeightedMutation {
+                        type_id: insert_bytes.as_ref().type_id(),
+                        baseline: 1.0,
+                        mutator: insert_bytes,
+                    },
+                    WeightedMutation {
+                        type_id: set_byte_mutation.as_ref().type_id(),
+                        baseline: 1.0,
+                        mutator: set_byte_mutation,
+                    },
+                ],
+                &weights,
+                &mut rng,
+            )
+            .expect("weighted mutation");
+            set_byte += usize::from(mutation.as_ref().type_id() == set_byte_id);
         }
-        Mode::Cautious => {
-            if let Some(best) = state.min_path_best {
-                for entry in &mut state.corpus {
-                    entry.energy = min_path_schedule_energy(
-                        &state.min_path_removed_frequency,
-                        state.stats.accepted,
-                        best,
-                        &entry.removed,
-                        MinPathScore::with_case_cost(
-                            entry.case_cost,
-                            entry.score,
-                            entry.hit_count_weight,
-                            entry.path_len,
-                            entry.nonzero_bytes,
-                        ),
-                    );
-                }
-            }
-        }
+
+        assert!(set_byte >= 60, "set_byte selected {set_byte} times");
     }
-    state
-        .energy_index
-        .rebuild(state.corpus.iter().map(|entry| entry.energy));
-    state.executions_since_refresh = 0;
 }

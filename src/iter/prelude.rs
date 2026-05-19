@@ -1,15 +1,20 @@
+pub(super) use super::mutation::{MutationWeights, ReductionOp};
+pub(super) use super::optimize::{GoalBehavior, MutationSource};
 use crate::{
     coverage::{CoverageCapture, CoverageId, CoverageSet},
     sancov::SancovCoverage,
 };
-pub(super) use dowsing_rng::SequenceSpan;
 pub use dowsing_rng::Trace as Case;
+pub(super) use dowsing_rng::{DrawSpan, ScalarSpan, SequenceSpan};
+use parking_lot::Mutex;
 use rand::{Rng, rngs::SmallRng};
+use rustc_hash::FxHashMap;
 use std::{
+    any::TypeId,
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    ops::Range,
-    sync::{Arc, Mutex},
+    collections::{HashSet, VecDeque},
+    ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 pub(super) const DEFAULT_MUTATE_DEPTH: usize = 5;
@@ -22,12 +27,10 @@ pub(super) const MAX_CORPUS_LEN: usize = 4096;
 pub(super) const MAX_REDUCER_TRIED_PREFIXES: usize = 65536;
 pub(super) const MAX_DICTIONARY_VALUES: usize = 256;
 pub(super) const INTERESTING_BYTES: [u8; 10] = [0, 1, 16, 31, 32, 63, 64, 127, 128, 255];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Mode {
-    Curious,
-    Cautious,
-}
+const REDUCTION_OPERATION_COUNT: usize = 15;
+const MIN_REDUCTION_WEIGHT: f64 = 0.05;
+const MAX_REDUCTION_WEIGHT: f64 = 64.0;
+const REDUCTION_WEIGHT_PRIORITY_SCALE: f64 = 1_000_000.0;
 
 /// Tuning knobs for [`cautious`] minimization.
 ///
@@ -195,9 +198,13 @@ impl Ord for CaseCoverage {
 ///
 /// Each item is an RNG. The RNG owns a coverage guard; when the item is dropped at the end of the
 /// caller's loop body, the guard may record coverage and update the next seed choice.
+#[deprecated(note = "use optimize(goals::MaximizeCoverage)")]
 pub fn curious() -> Curious<SancovCoverage> {
     Curious {
-        engine: Engine::new(SancovCoverage::new(), Mode::Curious),
+        engine: Engine::new(
+            SancovCoverage::new(),
+            super::optimize::goals::MaximizeCoverage,
+        ),
     }
 }
 
@@ -205,10 +212,22 @@ pub fn curious() -> Curious<SancovCoverage> {
 ///
 /// Seed it with [`Cautious::with_case`]. Each yielded variant records coverage unless the caller
 /// excludes it with [`crate::CaseRng::discard`].
+#[deprecated(note = "use optimize(goals::MinimizeCoverage)")]
 pub fn cautious() -> Cautious<SancovCoverage> {
     Cautious {
-        engine: Engine::new(SancovCoverage::new(), Mode::Cautious),
+        engine: Engine::new(
+            SancovCoverage::new(),
+            super::optimize::goals::MinimizeCoverage,
+        ),
     }
+}
+
+/// Build a generalized optimizer for `goal`.
+pub fn optimize<G>(goal: G) -> super::optimize::Optimizer<G, SancovCoverage>
+where
+    G: super::optimize::Goal,
+{
+    super::optimize::optimizer_from_engine(Engine::new(SancovCoverage::new(), goal))
 }
 
 /// Coverage-maximizing search returned by [`curious`].
@@ -228,13 +247,31 @@ pub(super) struct Engine<Capture: CoverageCapture = SancovCoverage> {
 #[derive(Debug)]
 pub(super) struct State<Capture: CoverageCapture> {
     pub(super) capture: Capture,
-    pub(super) mode: Mode,
+    pub(super) core: StateCore,
+}
+
+impl<Capture: CoverageCapture> Deref for State<Capture> {
+    type Target = StateCore;
+    fn deref(&self) -> &StateCore {
+        &self.core
+    }
+}
+
+impl<Capture: CoverageCapture> DerefMut for State<Capture> {
+    fn deref_mut(&mut self) -> &mut StateCore {
+        &mut self.core
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct StateCore {
+    pub(super) goal: Option<Box<dyn GoalBehavior>>,
     pub(super) base_seed: u64,
     pub(super) next: u64,
     pub(super) scheduler: SmallRng,
     pub(super) global: CoverageSet,
-    pub(super) coverage_frequency: HashMap<CoverageId, u64>,
-    pub(super) min_path_removed_frequency: HashMap<CoverageId, u64>,
+    pub(super) coverage_frequency: FxHashMap<CoverageId, u64>,
+    pub(super) min_path_removed_frequency: FxHashMap<CoverageId, u64>,
     pub(super) min_path_target: CoverageSet,
     pub(super) min_path_target_initialized: bool,
     pub(super) min_path_best: Option<MinPathScore>,
@@ -242,8 +279,12 @@ pub(super) struct State<Capture: CoverageCapture> {
     pub(super) corpus: Vec<CorpusSeed>,
     pub(super) energy_index: EnergyIndex,
     pub(super) pending_cases: VecDeque<Case>,
+    pub(super) candidate_sources: Vec<MutationSource>,
+    pub(super) fresh_roots: bool,
     pub(super) cautious_reducer: CautiousReducer,
-    pub(super) dictionary: Vec<Vec<u8>>,
+    pub(super) mutation_weights: MutationWeights,
+    pub(super) reduction_weights: ReductionWeights,
+    pub(super) dictionary: Arc<Vec<Vec<u8>>>,
     pub(super) cautious_options: CautiousOptions,
     pub(super) executions_since_refresh: u64,
     pub(super) mutate_depth: usize,
@@ -258,7 +299,8 @@ pub(super) struct Active {
     pub(super) seed: u64,
     pub(super) case: Case,
     pub(super) trace: Vec<u8>,
-    pub(super) draws: Vec<Range<usize>>,
+    pub(super) draws: Vec<DrawSpan>,
+    pub(super) scalars: Vec<ScalarSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) bytes_consumed: usize,
     pub(super) origin: CandidateOrigin,
@@ -266,9 +308,11 @@ pub(super) struct Active {
 
 #[derive(Debug, Clone)]
 pub(super) struct CorpusSeed {
+    pub(super) case: Case,
     pub(super) seed: u64,
     pub(super) prefix: Vec<u8>,
-    pub(super) draws: Vec<Range<usize>>,
+    pub(super) draws: Vec<DrawSpan>,
+    pub(super) scalars: Vec<ScalarSpan>,
     pub(super) sequences: Vec<SequenceSpan>,
     pub(super) coverage: Vec<CoverageId>,
     pub(super) removed: Vec<CoverageId>,
@@ -292,9 +336,31 @@ pub(super) struct MinPathScore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CandidateOrigin {
     SeededCase,
-    CuriousMutation,
+    CuriousMutation(Vec<TypeId>),
     CautiousReduction(ReductionId),
-    CautiousHavoc,
+    CautiousHavoc(Vec<TypeId>),
+    CustomMutation {
+        source: usize,
+        mutations: Vec<TypeId>,
+    },
+}
+
+impl CandidateOrigin {
+    pub(super) fn mutation_ids(&self) -> &[TypeId] {
+        match self {
+            Self::SeededCase => &[],
+            Self::CuriousMutation(kinds) | Self::CautiousHavoc(kinds) => kinds,
+            Self::CautiousReduction(id) => std::slice::from_ref(&id.type_id),
+            Self::CustomMutation { mutations, .. } => mutations,
+        }
+    }
+
+    pub(super) fn custom_source(&self) -> Option<usize> {
+        match self {
+            Self::CustomMutation { source, .. } => Some(*source),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,8 +368,10 @@ pub(super) struct CautiousReducer {
     pub(super) epoch: u64,
     pub(super) best_index: Option<usize>,
     pub(super) best_seed: u64,
+    pub(super) best_case: Case,
     pub(super) best_prefix: Vec<u8>,
-    pub(super) best_draws: Vec<Range<usize>>,
+    pub(super) best_draws: Vec<DrawSpan>,
+    pub(super) best_scalars: Vec<ScalarSpan>,
     pub(super) best_sequences: Vec<SequenceSpan>,
     pub(super) operation_states: Vec<ReductionOperationState>,
     pub(super) tried_prefixes: HashSet<PrefixFingerprint>,
@@ -319,8 +387,10 @@ impl Default for CautiousReducer {
             epoch: 0,
             best_index: None,
             best_seed: 0,
+            best_case: Case::empty(0),
             best_prefix: Vec::new(),
             best_draws: Vec::new(),
+            best_scalars: Vec::new(),
             best_sequences: Vec::new(),
             operation_states: Vec::new(),
             tried_prefixes: HashSet::new(),
@@ -342,6 +412,7 @@ pub(super) struct PrefixFingerprint {
 pub(super) struct ReductionId {
     pub(super) epoch: u64,
     pub(super) operation: ReductionOperation,
+    pub(super) type_id: TypeId,
     pub(super) cursor: usize,
     pub(super) start: usize,
     pub(super) len: usize,
@@ -361,6 +432,9 @@ pub(super) struct ReductionOperationState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ReductionOperation {
+    ScalarGroup,
+    ScalarCommonOffset,
+    ScalarLower,
     DrawLength,
     TailTrim,
     DrawDelete,
@@ -375,6 +449,111 @@ pub(super) enum ReductionOperation {
     SequenceReplace,
 }
 
+impl ReductionOperation {
+    const fn index(self) -> usize {
+        match self {
+            Self::ScalarGroup => 0,
+            Self::ScalarCommonOffset => 1,
+            Self::ScalarLower => 2,
+            Self::DrawLength => 3,
+            Self::TailTrim => 4,
+            Self::DrawDelete => 5,
+            Self::WeightedBlockDelete => 6,
+            Self::BlockZero => 7,
+            Self::WordLower => 8,
+            Self::ByteLower => 9,
+            Self::RepeatedValue => 10,
+            Self::DictionaryRepair => 11,
+            Self::SequenceDelete => 12,
+            Self::SequenceProject => 13,
+            Self::SequenceReplace => 14,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ReductionWeights {
+    multipliers: [f64; REDUCTION_OPERATION_COUNT],
+}
+
+impl Default for ReductionWeights {
+    fn default() -> Self {
+        Self {
+            multipliers: [1.0; REDUCTION_OPERATION_COUNT],
+        }
+    }
+}
+
+impl ReductionWeights {
+    pub(super) fn priority_key(&self, operation: ReductionOperation) -> u64 {
+        (self.multiplier(operation) * REDUCTION_WEIGHT_PRIORITY_SCALE).round() as u64
+    }
+
+    pub(super) fn reward_improved(&mut self, operation: ReductionOperation) {
+        self.apply_factor(operation, 3.0);
+        match operation {
+            ReductionOperation::ScalarGroup => {
+                self.apply_factor(ReductionOperation::ScalarCommonOffset, 1.5);
+                self.apply_factor(ReductionOperation::ScalarLower, 2.0);
+            }
+            ReductionOperation::ScalarCommonOffset => {
+                self.apply_factor(ReductionOperation::ScalarLower, 4.0);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn reward_preserved(&mut self, operation: ReductionOperation) {
+        self.apply_factor(operation, 1.15);
+    }
+
+    pub(super) fn penalize_rejected(&mut self, operation: ReductionOperation) {
+        self.apply_factor(operation, 0.50);
+    }
+
+    fn multiplier(&self, operation: ReductionOperation) -> f64 {
+        self.multipliers[operation.index()]
+    }
+
+    fn apply_factor(&mut self, operation: ReductionOperation, factor: f64) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let slot = &mut self.multipliers[operation.index()];
+        *slot = (*slot * factor).clamp(MIN_REDUCTION_WEIGHT, MAX_REDUCTION_WEIGHT);
+    }
+}
+
+#[cfg(test)]
+mod reduction_weight_tests {
+    use super::{ReductionOperation, ReductionWeights};
+
+    #[test]
+    fn scalar_common_offset_success_boosts_scalar_lower_followup() {
+        let mut weights = ReductionWeights::default();
+
+        weights.reward_improved(ReductionOperation::ScalarCommonOffset);
+
+        assert!(weights.multiplier(ReductionOperation::ScalarLower) > 1.0);
+        assert!(
+            weights.multiplier(ReductionOperation::ScalarLower)
+                > weights.multiplier(ReductionOperation::ScalarCommonOffset)
+        );
+        assert_eq!(weights.multiplier(ReductionOperation::ByteLower), 1.0);
+    }
+
+    #[test]
+    fn rejected_operations_are_penalized_and_clamped() {
+        let mut weights = ReductionWeights::default();
+
+        for _ in 0..16 {
+            weights.penalize_rejected(ReductionOperation::ScalarLower);
+        }
+
+        assert_eq!(weights.multiplier(ReductionOperation::ScalarLower), 0.05);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ReductionSpec {
     pub(super) op: ReductionOp,
@@ -383,112 +562,20 @@ pub(super) struct ReductionSpec {
 
 impl ReductionSpec {
     pub(super) fn start(&self) -> usize {
-        match &self.op {
-            ReductionOp::SetWord { start, .. }
-            | ReductionOp::DeleteRange { start, .. }
-            | ReductionOp::DeleteSequenceItems { start, .. }
-            | ReductionOp::ProjectSequenceItems {
-                replace_start: start,
-                ..
-            }
-            | ReductionOp::ZeroRange { start, .. }
-            | ReductionOp::SetByte { start, .. }
-            | ReductionOp::ReplaceDictionary { start, .. } => *start,
-            ReductionOp::ZeroRepeated { .. } => 0,
-        }
+        self.op.start()
     }
 
     pub(super) fn len(&self) -> usize {
-        match &self.op {
-            ReductionOp::SetWord { width, .. } => *width,
-            ReductionOp::DeleteRange { len, .. }
-            | ReductionOp::DeleteSequenceItems { len, .. }
-            | ReductionOp::ProjectSequenceItems {
-                replace_len: len, ..
-            }
-            | ReductionOp::ZeroRange { len, .. }
-            | ReductionOp::ReplaceDictionary { len, .. } => *len,
-            ReductionOp::SetByte { .. } => 1,
-            ReductionOp::ZeroRepeated { .. } => 0,
-        }
+        self.op.len()
     }
 
     pub(super) fn target(&self) -> u64 {
-        match &self.op {
-            ReductionOp::SetWord { target, .. } => *target,
-            ReductionOp::DeleteSequenceItems { target_len, .. }
-            | ReductionOp::ProjectSequenceItems { target_len, .. } => *target_len as u64,
-            ReductionOp::SetByte { value, .. } => *value as u64,
-            ReductionOp::ZeroRepeated { value } => *value as u64,
-            ReductionOp::ReplaceDictionary {
-                dictionary_index, ..
-            } => *dictionary_index as u64,
-            ReductionOp::DeleteRange { .. } | ReductionOp::ZeroRange { .. } => 0,
-        }
+        self.op.target()
     }
 
     pub(super) fn simplification(&self) -> usize {
-        match &self.op {
-            ReductionOp::SetWord { width, .. } => *width,
-            ReductionOp::DeleteRange { len, .. }
-            | ReductionOp::DeleteSequenceItems { len, .. }
-            | ReductionOp::ZeroRange { len, .. }
-            | ReductionOp::ReplaceDictionary { len, .. } => *len,
-            ReductionOp::ProjectSequenceItems {
-                replace_len, items, ..
-            } => {
-                let replacement_len = items.iter().map(|(_, len)| *len).sum::<usize>();
-                replace_len.saturating_sub(replacement_len)
-            }
-            ReductionOp::SetByte { .. } | ReductionOp::ZeroRepeated { .. } => 1,
-        }
+        self.op.simplification()
     }
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum ReductionOp {
-    SetWord {
-        start: usize,
-        width: usize,
-        target: u64,
-        zero_until: Option<usize>,
-    },
-    DeleteRange {
-        start: usize,
-        len: usize,
-        adjust_first: bool,
-    },
-    DeleteSequenceItems {
-        length_start: usize,
-        length_width: usize,
-        target_len: usize,
-        start: usize,
-        len: usize,
-    },
-    ProjectSequenceItems {
-        length_start: usize,
-        length_width: usize,
-        target_len: usize,
-        replace_start: usize,
-        replace_len: usize,
-        items: Vec<(usize, usize)>,
-    },
-    ZeroRange {
-        start: usize,
-        len: usize,
-    },
-    SetByte {
-        start: usize,
-        value: u8,
-    },
-    ZeroRepeated {
-        value: u8,
-    },
-    ReplaceDictionary {
-        start: usize,
-        len: usize,
-        dictionary_index: usize,
-    },
 }
 
 impl MinPathScore {

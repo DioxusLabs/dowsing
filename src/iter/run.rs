@@ -1,18 +1,20 @@
 use super::{
-    mutate::{choose_corpus_index, havoc_prefix, mutate_prefix, refresh_corpus_energies},
+    mutate::{havoc_prefix, mutate_prefix},
+    optimize::{
+        BuiltInMutationSource, Goal, MutationContext, MutationSourceKind, Optimizer,
+        builtin_source_enabled, record_mutation_scheduled, select_goal_corpus_index,
+    },
     prelude::{
-        CandidateOrigin, Case, CaseCost, Cautious, Curious, Engine, MAX_PREFIX_LEN, MinPathScore,
-        Mode, State,
+        CandidateOrigin, Case, Cautious, Curious, Engine, MAX_PREFIX_LEN, MutationWeights, State,
+        StateCore,
     },
     rng::CaseRng,
-    shrink::{energy_refresh_interval, next_cautious_reduction},
+    shrink::next_cautious_reduction,
 };
-use crate::coverage::{CaptureStart, CoverageCapture, CoverageId, ParallelCoverageCapture};
+use crate::coverage::{CaptureStart, CoverageCapture, ParallelCoverageCapture};
+use parking_lot::Mutex;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 impl<Capture> Iterator for Engine<Capture>
 where
@@ -22,9 +24,12 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         let plan = {
-            let mut state = self.shared.lock().expect("search state poisoned");
-            let plan = choose_candidate_plan(&mut state)?;
+            let mut state = self.shared.lock();
+            let plan = choose_candidate_plan(&mut state.core)?;
+            let plan_is_mutation = plan.is_mutation();
             state.active_cases = state.active_cases.saturating_add(1);
+            state.stats.generated += 1;
+            state.stats.mutated += u64::from(plan_is_mutation);
             plan
         };
         let candidate = materialize_candidate(plan);
@@ -36,11 +41,6 @@ where
                 return None;
             }
         };
-
-        let mut state = self.shared.lock().expect("search state poisoned");
-        state.stats.generated += 1;
-        state.stats.mutated += u64::from(candidate.mutated);
-        drop(state);
 
         Some(CaseRng::new(
             Arc::clone(&self.shared),
@@ -74,6 +74,18 @@ where
     }
 }
 
+impl<G, Capture> Iterator for Optimizer<G, Capture>
+where
+    G: Goal,
+    Capture: CoverageCapture,
+{
+    type Item = CaseRng<Capture>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.engine.next()
+    }
+}
+
 pub(super) fn next_parallel_rng<Capture>(
     shared: &Arc<Mutex<State<Capture>>>,
     mut capture: Capture,
@@ -83,9 +95,12 @@ where
     Capture::Session: Send,
 {
     let plan = loop {
-        let mut state = shared.lock().expect("search state poisoned");
-        if let Some(plan) = choose_candidate_plan(&mut state) {
+        let mut state = shared.lock();
+        if let Some(plan) = choose_candidate_plan(&mut state.core) {
+            let plan_is_mutation = plan.is_mutation();
             state.active_cases = state.active_cases.saturating_add(1);
+            state.stats.generated += 1;
+            state.stats.mutated += u64::from(plan_is_mutation);
             break plan;
         }
         if state.active_cases == 0 {
@@ -104,12 +119,6 @@ where
         }
     };
 
-    {
-        let mut state = shared.lock().expect("search state poisoned");
-        state.stats.generated += 1;
-        state.stats.mutated += u64::from(candidate.mutated);
-    }
-
     Some(CaseRng::new(
         Arc::clone(shared),
         candidate.case,
@@ -124,11 +133,7 @@ where
     Capture: CoverageCapture,
 {
     loop {
-        let session = shared
-            .lock()
-            .expect("search state poisoned")
-            .capture
-            .start_capture();
+        let session = shared.lock().capture.start_capture();
         match session {
             Ok(CaptureStart::Started(session)) => return Some(session),
             Ok(CaptureStart::Busy) => {
@@ -156,7 +161,7 @@ fn finish_started_case<Capture>(shared: &Arc<Mutex<State<Capture>>>)
 where
     Capture: CoverageCapture,
 {
-    let mut state = shared.lock().expect("search state poisoned");
+    let mut state = shared.lock();
     state.active_cases = state.active_cases.saturating_sub(1);
 }
 
@@ -170,28 +175,29 @@ pub(super) struct Candidate {
 #[derive(Debug, Clone)]
 enum CandidatePlan {
     Ready(Candidate),
-    CuriousMutation {
+    BuiltInMutation {
+        source: BuiltInMutationSource,
         parent_seed: u64,
         parent_prefix: Vec<u8>,
         crossover_prefix: Option<Vec<u8>>,
-        dictionary: Vec<Vec<u8>>,
-        fallback: u64,
-        rng_seed: u64,
-        depth: usize,
-    },
-    CautiousMutation {
-        parent_seed: u64,
-        parent_prefix: Vec<u8>,
-        dictionary: Vec<Vec<u8>>,
+        dictionary: Arc<Vec<Vec<u8>>>,
+        mutation_weights: MutationWeights,
         fallback: u64,
         rng_seed: u64,
         depth: usize,
     },
 }
 
-fn choose_candidate_plan<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
-) -> Option<CandidatePlan> {
+impl CandidatePlan {
+    fn is_mutation(&self) -> bool {
+        match self {
+            Self::Ready(candidate) => candidate.mutated,
+            Self::BuiltInMutation { .. } => true,
+        }
+    }
+}
+
+fn choose_candidate_plan(state: &mut StateCore) -> Option<CandidatePlan> {
     if let Some(case) = state.pending_cases.pop_front() {
         return Some(CandidatePlan::Ready(Candidate {
             case,
@@ -200,192 +206,221 @@ fn choose_candidate_plan<Capture: CoverageCapture>(
         }));
     }
 
-    if state.mode == Mode::Cautious && state.corpus.is_empty() {
+    if state.corpus.is_empty() {
+        return state.fresh_roots.then(|| {
+            CandidatePlan::Ready(Candidate {
+                case: Case::empty(next_fallback_seed(state)),
+                mutated: false,
+                origin: CandidateOrigin::SeededCase,
+            })
+        });
+    }
+
+    if state.fresh_roots {
+        state.seed_step = state.seed_step.wrapping_add(1);
+        if state.seed_step.is_multiple_of(state.seed_ratio) {
+            return Some(CandidatePlan::Ready(Candidate {
+                case: Case::empty(next_fallback_seed(state)),
+                mutated: false,
+                origin: CandidateOrigin::SeededCase,
+            }));
+        }
+    }
+
+    choose_source_candidate_plan(state)
+}
+
+fn choose_source_candidate_plan(state: &mut StateCore) -> Option<CandidatePlan> {
+    let mut index = 0;
+    while index < state.candidate_sources.len() {
+        let mut source = state.candidate_sources.remove(index);
+        let plan = match &mut source.kind {
+            MutationSourceKind::BuiltIn(source) => choose_builtin_source_plan(state, *source),
+            MutationSourceKind::Custom(source) => choose_custom_source_plan(state, index, source),
+        };
+        state.candidate_sources.insert(index, source);
+        if plan.is_some() {
+            return plan;
+        }
+        index += 1;
+    }
+    None
+}
+
+fn choose_builtin_source_plan(
+    state: &mut StateCore,
+    source: BuiltInMutationSource,
+) -> Option<CandidatePlan> {
+    if !builtin_source_enabled(state, source) {
         return None;
     }
 
-    if state.mode == Mode::Cautious {
-        return choose_cautious_candidate_plan(state);
+    match source {
+        BuiltInMutationSource::SemanticReductions => {
+            next_cautious_reduction(state).map(CandidatePlan::Ready)
+        }
+        BuiltInMutationSource::CoverageHavoc => choose_havoc_source_plan(state, source),
+        BuiltInMutationSource::MinimizingHavoc => choose_havoc_source_plan(state, source),
     }
+}
 
-    let fallback = state.base_seed.wrapping_add(state.next);
-    state.next = state.next.wrapping_add(1);
-
-    let pull_fresh_root = if state.corpus.is_empty() {
-        true
-    } else {
-        state.seed_step = state.seed_step.wrapping_add(1);
-        state.seed_step.is_multiple_of(state.seed_ratio)
-    };
-    if pull_fresh_root {
-        return Some(CandidatePlan::Ready(Candidate {
-            case: Case::empty(fallback),
-            mutated: false,
-            origin: CandidateOrigin::SeededCase,
-        }));
-    }
-
-    let Some(index) = choose_corpus_index(state) else {
-        return Some(CandidatePlan::Ready(Candidate {
-            case: Case::empty(fallback),
-            mutated: false,
-            origin: CandidateOrigin::SeededCase,
-        }));
-    };
-
+fn choose_havoc_source_plan(
+    state: &mut StateCore,
+    source: BuiltInMutationSource,
+) -> Option<CandidatePlan> {
+    let index = scheduled_corpus_index(state)?;
     let (parent_seed, parent_prefix) = {
         let parent = &state.corpus[index];
         (parent.seed, parent.prefix.clone())
     };
-    let crossover_prefix = if state.corpus.len() > 1 {
-        let other_index = state.scheduler.random_range(0..state.corpus.len());
-        Some(state.corpus[other_index].prefix.clone())
-    } else {
-        None
-    };
+    let crossover_prefix =
+        if source == BuiltInMutationSource::CoverageHavoc && state.corpus.len() > 1 {
+            let other_index = state.scheduler.random_range(0..state.corpus.len());
+            Some(state.corpus[other_index].prefix.clone())
+        } else {
+            None
+        };
+    record_mutation_schedule(state);
+    let fallback = next_fallback_seed(state);
     let rng_seed = state.scheduler.random();
-    Some(CandidatePlan::CuriousMutation {
+    Some(CandidatePlan::BuiltInMutation {
+        source,
         parent_seed,
         parent_prefix,
         crossover_prefix,
-        dictionary: state.dictionary.clone(),
+        dictionary: Arc::clone(&state.dictionary),
+        mutation_weights: state.mutation_weights.clone(),
         fallback,
         rng_seed,
         depth: state.mutate_depth.max(1),
     })
 }
 
-fn choose_cautious_candidate_plan<Capture: CoverageCapture>(
-    state: &mut State<Capture>,
+fn choose_custom_source_plan(
+    state: &mut StateCore,
+    source_index: usize,
+    source: &mut Box<dyn super::optimize::CandidateSource>,
 ) -> Option<CandidatePlan> {
-    if let Some(candidate) = next_cautious_reduction(state) {
-        return Some(CandidatePlan::Ready(candidate));
-    }
-    if !state.cautious_options.havoc() {
-        return None;
-    }
-
-    let index = cautious_corpus_index(state)?;
-    let (parent_seed, parent_prefix) = {
+    let index = scheduled_corpus_index(state)?;
+    let (parent_case, parent_seed, parent_prefix, draws, scalars, sequences) = {
         let parent = &state.corpus[index];
-        (parent.seed, parent.prefix.clone())
+        (
+            parent.case.clone(),
+            parent.seed,
+            parent.prefix.clone(),
+            parent.draws.clone(),
+            parent.scalars.clone(),
+            parent.sequences.clone(),
+        )
     };
-    record_cautious_schedule(state);
     let fallback = state.base_seed.wrapping_add(state.next);
-    state.next = state.next.wrapping_add(1);
     let rng_seed = state.scheduler.random();
-    Some(CandidatePlan::CautiousMutation {
-        parent_seed,
-        parent_prefix,
-        dictionary: state.dictionary.clone(),
+    let dictionary = Arc::clone(&state.dictionary);
+    let mut rng = SmallRng::seed_from_u64(rng_seed);
+    let mut context = MutationContext::new(
+        &parent_case,
+        &parent_prefix,
+        &draws,
+        &scalars,
+        &sequences,
+        &dictionary,
+        &mut rng,
         fallback,
-        rng_seed,
-        depth: state.mutate_depth.max(1),
-    })
+    );
+    let candidate = source.next_candidate(&mut context)?;
+    record_mutation_schedule(state);
+    state.next = state.next.wrapping_add(1);
+    let (case, mutations) = candidate.materialize(parent_seed, fallback, &mut rng);
+    Some(CandidatePlan::Ready(Candidate {
+        case,
+        mutated: true,
+        origin: CandidateOrigin::CustomMutation {
+            source: source_index,
+            mutations,
+        },
+    }))
 }
 
 fn materialize_candidate(plan: CandidatePlan) -> Candidate {
     match plan {
         CandidatePlan::Ready(candidate) => candidate,
-        CandidatePlan::CuriousMutation {
+        CandidatePlan::BuiltInMutation {
+            source,
             parent_seed,
             parent_prefix,
             crossover_prefix,
             dictionary,
+            mutation_weights,
             fallback,
             rng_seed,
             depth,
         } => {
             let mut rng = SmallRng::seed_from_u64(rng_seed);
-            let mut prefix = parent_prefix;
-            for _ in 0..depth {
-                mutate_prefix(
-                    &mut prefix,
-                    &mut rng,
-                    crossover_prefix.as_deref(),
-                    &dictionary,
-                    fallback,
-                );
-            }
-            if prefix.is_empty() {
-                prefix.push(rng.random());
-            }
-            if prefix.len() > MAX_PREFIX_LEN {
-                prefix.truncate(MAX_PREFIX_LEN);
-            }
+            match source {
+                BuiltInMutationSource::CoverageHavoc => {
+                    let mut prefix = parent_prefix;
+                    let mut kinds = Vec::new();
+                    for _ in 0..depth {
+                        if let Some(kind) = mutate_prefix(
+                            &mut prefix,
+                            &mut rng,
+                            crossover_prefix.as_deref(),
+                            &dictionary,
+                            fallback,
+                            &mutation_weights,
+                        ) {
+                            kinds.push(kind);
+                        }
+                    }
+                    if prefix.is_empty() {
+                        prefix.push(rng.random());
+                    }
+                    if prefix.len() > MAX_PREFIX_LEN {
+                        prefix.truncate(MAX_PREFIX_LEN);
+                    }
 
-            Candidate {
-                case: Case::from_flat_prefix(parent_seed ^ fallback.rotate_left(17), prefix),
-                mutated: true,
-                origin: CandidateOrigin::CuriousMutation,
+                    Candidate {
+                        case: Case::from_flat_prefix(
+                            parent_seed ^ fallback.rotate_left(17),
+                            prefix,
+                        ),
+                        mutated: true,
+                        origin: CandidateOrigin::CuriousMutation(kinds),
+                    }
+                }
+                BuiltInMutationSource::MinimizingHavoc => {
+                    let (prefix, kinds) = havoc_prefix(
+                        &parent_prefix,
+                        &mut rng,
+                        depth,
+                        &dictionary,
+                        &mutation_weights,
+                    );
+                    Candidate {
+                        case: Case::from_flat_prefix(
+                            parent_seed ^ fallback.rotate_left(17),
+                            prefix,
+                        ),
+                        mutated: true,
+                        origin: CandidateOrigin::CautiousHavoc(kinds),
+                    }
+                }
+                BuiltInMutationSource::SemanticReductions => unreachable!("reduction is ready"),
             }
         }
-        CandidatePlan::CautiousMutation {
-            parent_seed,
-            parent_prefix,
-            dictionary,
-            fallback,
-            rng_seed,
-            depth,
-        } => {
-            let mut rng = SmallRng::seed_from_u64(rng_seed);
-            let prefix = havoc_prefix(&parent_prefix, &mut rng, depth, &dictionary);
-            Candidate {
-                case: Case::from_flat_prefix(parent_seed ^ fallback.rotate_left(17), prefix),
-                mutated: true,
-                origin: CandidateOrigin::CautiousHavoc,
-            }
-        }
     }
 }
 
-fn cautious_corpus_index<Capture: CoverageCapture>(state: &mut State<Capture>) -> Option<usize> {
-    state
-        .energy_index
-        .sample(&mut state.scheduler)
-        .or_else(|| Some(state.scheduler.random_range(0..state.corpus.len())))
+fn scheduled_corpus_index(state: &mut StateCore) -> Option<usize> {
+    select_goal_corpus_index(state)
 }
 
-fn record_cautious_schedule<Capture: CoverageCapture>(state: &mut State<Capture>) {
-    state.executions_since_refresh = state.executions_since_refresh.saturating_add(1);
-    if state.executions_since_refresh >= energy_refresh_interval(state.mode) {
-        refresh_corpus_energies(state);
-    }
+fn record_mutation_schedule(state: &mut StateCore) {
+    record_mutation_scheduled(state);
 }
 
-pub(super) fn min_path_schedule_energy(
-    removed_frequency: &HashMap<CoverageId, u64>,
-    accepted: u64,
-    best: MinPathScore,
-    removed: &[CoverageId],
-    candidate: MinPathScore,
-) -> f64 {
-    let accepted = accepted.max(1) as f64;
-    let mut rarity = 0.0;
-    for id in removed {
-        let frequency = (*removed_frequency.get(id).unwrap_or(&1)).max(1) as f64;
-        rarity += (accepted / frequency).ln().max(0.0);
-    }
-
-    let byte_quality = ((best.bytes + 1) as f64 / (candidate.bytes + 1) as f64)
-        .min(1.0)
-        .powi(3);
-    let feature_quality = ((best.features + 1) as f64 / (candidate.features + 1) as f64)
-        .min(1.0)
-        .sqrt();
-    let hit_quality = ((best.hit_count_weight + 1) as f64
-        / (candidate.hit_count_weight + 1) as f64)
-        .min(1.0)
-        .sqrt();
-    let cost_quality = case_cost_quality(best.case_cost, candidate.case_cost).powi(3);
-    let simplicity_quality = ((best.nonzero_bytes + 1) as f64
-        / (candidate.nonzero_bytes + 1) as f64)
-        .min(1.0)
-        .sqrt();
-    let quality = cost_quality * byte_quality * feature_quality * hit_quality * simplicity_quality;
-    ((rarity + 1.0) * quality).max(0.01)
-}
-
-fn case_cost_quality(best: CaseCost, candidate: CaseCost) -> f64 {
-    (best.raw().saturating_add(1) as f64 / candidate.raw().saturating_add(1) as f64).min(1.0)
+fn next_fallback_seed(state: &mut StateCore) -> u64 {
+    let fallback = state.base_seed.wrapping_add(state.next);
+    state.next = state.next.wrapping_add(1);
+    fallback
 }
