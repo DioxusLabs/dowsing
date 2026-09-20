@@ -413,6 +413,10 @@ extern "C" fn crash_handler(
             ptr::write_volatile(&raw mut (*header).counters_len, written as u32);
             ptr::write_volatile(&raw mut (*header).crash_signal, signal as u32);
             ptr::write_volatile(&raw mut (*header).state, STATE_CRASHED);
+            // Exit instead of re-raising: the default action would hand the process to the
+            // core-dump pipe (apport on Ubuntu), which costs tens of milliseconds per crash.
+            // The supervisor reads the signal number from the header.
+            libc::_exit(128 + signal);
         }
         libc::signal(signal, libc::SIG_DFL);
         libc::raise(signal);

@@ -558,3 +558,47 @@ comparable to the README's structured example.
   feedback, `NoCoverage`, and raw harness; used with `perf record` after
   `sudo sysctl kernel.perf_event_paranoid=1`.
 * `readelf -SW` on the instrumented example for the `__sancov_cntrs` layout.
+
+## 10. What the prototype changed (post-implementation notes)
+
+Written after building the prototype in `spikes/coverage-bridge/`; see its `README.md` for the
+measurements. Where the built thing differs from §3–§7, this section is authoritative.
+
+* **Location.** Everything lives in the standalone `spikes/coverage-bridge` crate (prototype
+  rules) instead of `src/bridge/` behind a `bridge` feature. The root crate only gained hidden
+  hooks: `Case::into_raw`/`from_raw` + `RawCase`/`RawSpan`/`RawSequence`,
+  `CaseRng::fill_budget`/`absorb_trace`, and `sancov::{counter_ranges, decode_counters}`
+  (re-exported as `iterator_fuzz::raw`).
+* **Crash handler exits instead of re-raising.** §3.4 planned "export counters, then re-raise so
+  the exit status carries the signal". Re-raising hands the child to the kernel core-dump pipe
+  (`apport` on Ubuntu, `core_pattern=|/usr/share/apport/apport ...`), which cost ~40 ms per crashing
+  case. The handler now writes the signal number into the header and `_exit(128 + sig)`s; the
+  supervisor takes `Status::Crashed` from the header. Crashing cases now cost ~0.3–0.4 ms (a
+  2048-case `cautious()` run on an aborting harness takes 2.3 s). The information lost is only a core file, which the
+  supervisor never wanted.
+* **Child decodes its own features.** §3.4 had the child export raw counters and cmp features
+  separately and the supervisor decode both. The child instead wraps the case in the base crate's
+  `SancovCoverage` (reset at `start_capture`, `finish_capture` at case end) and exports the
+  decoded `ExecutionFeedback` (features + dictionary) *and* the raw counter bytes. Reusing
+  `SancovCoverage` in the child guarantees feature-id equality with in-process runs for free
+  (risk 9 in §6) and left the "subtract init snapshot" fallback for forkserver-image pollution
+  (risk 2) unnecessary: the reset at case start discards whatever the serve loop bumped. Raw
+  counters are still exported so crash cases (where `finish_capture` never runs) get edge
+  coverage via `decode_counters` in the supervisor.
+* **The cmp callbacks dominate, not the bridge.** With `-sanitizer-coverage-trace-compares` the
+  harness takes ~620 µs in the child versus ~25 µs with edge counters only, because
+  `sancov::record_cmp` hashes and records every comparison while a capture is active regardless
+  of `with_cmp_feedback`. §2.4's "supervisor bookkeeping is the bottleneck" holds for the
+  in-process run (324 exec/s); for the bridge the supervisor is uninstrumented, so the forkserver
+  reaches 842 exec/s with cmp feedback and 3 468 exec/s with edge counters only (protocol floor
+  for this target: 3 723 exec/s uninstrumented, 4 762 for the tiny echo target).
+* **fd passing.** Fixed fd numbers 197/198/199 (`dup2` in `pre_exec`) plus `COVERAGE_BRIDGE_MODE`
+  in the environment; no `/proc/self/fd` paths (risk 8).
+* **PDEATHSIG on case children too.** Each forked case child sets `PR_SET_PDEATHSIG(SIGKILL)` and
+  checks `getppid() == 1`, after an interrupted benchmark left a spinning case reparented to init.
+* **Budget exhaustion is a retry, not a failure.** If the child runs past `input_len` the
+  supervisor doubles the budget (up to the input table cap) and re-runs the case from the same
+  `CaseRng`; `fill_budget` is deterministic so the retry consumes the same prefix.
+* **Not built:** trace-pc-guard as second format, SIGALRM-in-child coverage for timeouts,
+  incremental trace publication for crash shrinking, pidfd watchdog (poll on the status pipe +
+  PDEATHSIG was enough), `rayon` parallel measurement. All listed as next steps in the README.

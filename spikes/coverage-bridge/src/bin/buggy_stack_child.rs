@@ -22,7 +22,16 @@ use std::time::Instant;
 
 fn main() {
     if ChildMode::from_env().is_some() {
-        coverage_bridge::child::serve(|rng: &mut CaseRng<NoCoverage>| run_case(rng).0);
+        // BUGGY_STACK_ABORT=1 turns the logical failure into a SIGABRT so the crash path
+        // (signal handler exporting counters) can be exercised end to end.
+        let abort_on_bug = std::env::var_os("BUGGY_STACK_ABORT").is_some();
+        coverage_bridge::child::serve(move |rng: &mut CaseRng<NoCoverage>| {
+            let verdict = run_case(rng).0;
+            if abort_on_bug && verdict.failed {
+                std::process::abort();
+            }
+            verdict
+        });
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
