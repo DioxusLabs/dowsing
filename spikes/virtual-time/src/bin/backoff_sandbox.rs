@@ -149,7 +149,9 @@ fn main() {
     let mut best: Option<(iterator_fuzz::CaseCoverage, Case, RunReport)> = None;
     let mut reproduced = 0_usize;
     let mut tried = 0_usize;
-    let mut cautious = cautious().with_coverage(coverage.clone()).with_case(case.clone());
+    let mut cautious = cautious()
+        .with_coverage(coverage.clone())
+        .with_case(case.clone());
     for mut variant in cautious.by_ref().take(o.shrink) {
         tried += 1;
         let report = sandbox.run(&mut variant);
@@ -200,7 +202,11 @@ fn main() {
     let mut rng = best_case.replay();
     let shown = sandbox.clone().quiet(false).keep_events(true).run(&mut rng);
     rng.discard();
-    for e in shown.events.iter().filter(|e| e.contains("jump") && !e.contains("kind=0")) {
+    for e in shown
+        .events
+        .iter()
+        .filter(|e| e.contains("jump") && !e.contains("kind=0"))
+    {
         eprintln!("  {e}");
     }
     eprintln!("{}", describe(&shown));

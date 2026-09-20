@@ -18,5 +18,5 @@ pub mod sandbox;
 pub mod seccomp;
 mod waits;
 
-pub use sandbox::{Decisions, Outcome, RunReport, Sandbox, StopStats};
 pub use coverage::SandboxCoverage;
+pub use sandbox::{Decisions, Outcome, RunReport, Sandbox, StopStats};

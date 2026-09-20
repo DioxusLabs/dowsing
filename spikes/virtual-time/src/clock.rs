@@ -95,3 +95,48 @@ pub fn to_ns(secs: i64, nanos: i64) -> u64 {
 pub fn split(ns: u64) -> (i64, i64) {
     ((ns / NANOS) as i64, (ns % NANOS) as i64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_advance_by_the_quantum_and_share_one_timeline() {
+        let mut clock = VirtualClock::new(100);
+        let (s, n) = clock.read(libc::CLOCK_MONOTONIC as i64).unwrap();
+        assert_eq!((s, n), (1_000_000, 100));
+        let (s, n) = clock.read(libc::CLOCK_REALTIME as i64).unwrap();
+        assert_eq!((s, n), (1_767_225_600, 200));
+        assert_eq!(clock.now(), 200);
+        assert!(clock.read(libc::CLOCK_PROCESS_CPUTIME_ID as i64).is_none());
+    }
+
+    #[test]
+    fn deadlines_translate_both_clocks_into_vnow() {
+        let mut clock = VirtualClock::new(0);
+        clock.advance_to(5 * NANOS);
+        assert_eq!(clock.deadline_from_relative(2, 500), 7 * NANOS + 500);
+        assert_eq!(
+            clock.deadline_from_absolute(libc::CLOCK_MONOTONIC as i64, 1_000_010, 0),
+            Some(10 * NANOS)
+        );
+        assert_eq!(
+            clock.deadline_from_absolute(libc::CLOCK_REALTIME as i64, 1_767_225_603, 1),
+            Some(3 * NANOS + 1)
+        );
+        clock.realtime_step_ns = NANOS as i64;
+        assert_eq!(
+            clock.deadline_from_absolute(libc::CLOCK_REALTIME as i64, 1_767_225_603, 1),
+            Some(2 * NANOS + 1)
+        );
+        assert_eq!(clock.deadline_from_absolute(99, 1, 0), None);
+    }
+
+    #[test]
+    fn advance_never_moves_backwards() {
+        let mut clock = VirtualClock::new(0);
+        clock.advance_to(10);
+        clock.advance_to(5);
+        assert_eq!(clock.now(), 10);
+    }
+}

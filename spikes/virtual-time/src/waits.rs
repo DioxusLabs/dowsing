@@ -40,7 +40,9 @@ pub fn read_pollfds(pid: pid_t, addr: u64, nfds: u64) -> io::Result<Vec<(i32, i1
     let mut buf = vec![0_u8; nfds * 8];
     ptrace::read_mem(pid, addr, &mut buf)?;
     Ok(buf
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| {
             (
                 i32::from_ne_bytes(c[..4].try_into().unwrap()),
@@ -72,8 +74,8 @@ pub fn read_fdsets(
         }
         let mut buf = vec![0_u8; words * 8];
         ptrace::read_mem(pid, addr, &mut buf)?;
-        for (w, chunk) in buf.chunks_exact(8).enumerate() {
-            let bits = u64::from_ne_bytes(chunk.try_into().unwrap());
+        for (w, chunk) in buf.as_chunks::<8>().0.iter().enumerate() {
+            let bits = u64::from_ne_bytes(*chunk);
             for b in 0..64 {
                 if bits & (1 << b) != 0 {
                     let fd = (w * 64 + b) as i32;

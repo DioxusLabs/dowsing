@@ -54,7 +54,10 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> sock_filter {
 
 /// Build the filter program for `syscalls`.
 pub fn build_filter(syscalls: &[i64]) -> Vec<sock_filter> {
-    assert!(syscalls.len() < 250, "too many traced syscalls for one BPF jump table");
+    assert!(
+        syscalls.len() < 250,
+        "too many traced syscalls for one BPF jump table"
+    );
     let mut prog = Vec::with_capacity(syscalls.len() + 5);
     // seccomp_data.arch is at offset 4, seccomp_data.nr at offset 0.
     prog.push(stmt(BPF_LD_W_ABS, 4));
@@ -85,9 +88,37 @@ pub unsafe fn install(filter: &[sock_filter]) -> io::Result<()> {
             len: filter.len() as u16,
             filter: filter.as_ptr() as *mut sock_filter,
         };
-        if libc::prctl(libc::PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog as *const sock_fprog) != 0 {
+        if libc::prctl(
+            libc::PR_SET_SECCOMP,
+            SECCOMP_MODE_FILTER,
+            &prog as *const sock_fprog,
+        ) != 0
+        {
             return Err(io::Error::last_os_error());
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_checks_arch_then_traces_only_the_listed_syscalls() {
+        let filter = build_filter(&[libc::SYS_clock_gettime, ANNOUNCE_NR]);
+        // arch load + arch compare + nr load + 2 compares + trace + allow (+ kill on bad arch).
+        assert!(filter.len() >= 7);
+        let rets: Vec<u32> = filter
+            .iter()
+            .filter(|i| i.code == BPF_RET_K)
+            .map(|i| i.k)
+            .collect();
+        assert!(rets.contains(&SECCOMP_RET_TRACE));
+        assert!(rets.contains(&SECCOMP_RET_ALLOW));
+        let ks: Vec<u32> = filter.iter().map(|i| i.k).collect();
+        assert!(ks.contains(&(libc::SYS_clock_gettime as u32)));
+        assert!(ks.contains(&(ANNOUNCE_NR as u32)));
+        assert!(ks.contains(&AUDIT_ARCH_X86_64));
+    }
 }

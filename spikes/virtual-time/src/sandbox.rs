@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -303,6 +303,8 @@ struct Run<'a, C: CoverageCapture> {
     events: Vec<String>,
     watchdog: Option<mpsc::Sender<()>>,
     hung: Arc<AtomicBool>,
+    /// Every thread group seen so far (the target may fork); killed together.
+    tgids: Arc<Mutex<BTreeSet<pid_t>>>,
     realtime_applied: bool,
     forced: Option<Outcome>,
 }
@@ -315,9 +317,16 @@ impl<C: CoverageCapture> Drop for Run<'_, C> {
     }
 }
 
-fn ready_kill(pid: pid_t) {
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
+/// (tid, tgid, pollfds) of a thread parked in a poll-family wait.
+type ParkedPoll = (pid_t, pid_t, Vec<(i32, i16)>);
+
+fn kill_all(tgids: &Mutex<BTreeSet<pid_t>>) {
+    if let Ok(tgids) = tgids.lock() {
+        for &pid in tgids.iter() {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
     }
 }
 
@@ -341,6 +350,7 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
             events: Vec::new(),
             watchdog: None,
             hung: Arc::new(AtomicBool::new(false)),
+            tgids: Arc::new(Mutex::new(BTreeSet::new())),
             realtime_applied: false,
             forced: None,
         }
@@ -356,9 +366,7 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
     }
 
     fn kill(&mut self) {
-        if self.main_pid > 0 {
-            ready_kill(self.main_pid);
-        }
+        kill_all(&self.tgids);
     }
 
     fn stop_watchdog(&mut self) {
@@ -370,6 +378,9 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
             return Ok(());
         }
         let tgid = ptrace::tgid_of(tid).unwrap_or(tid);
+        if let Ok(mut tgids) = self.tgids.lock() {
+            tgids.insert(tgid);
+        }
         let index = self.next_index;
         self.next_index += 1;
         self.stats.threads += 1;
@@ -407,15 +418,19 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
         let child = cmd.spawn()?;
         let pid = child.id() as pid_t;
         self.main_pid = pid;
+        if let Ok(mut tgids) = self.tgids.lock() {
+            tgids.insert(pid);
+        }
 
         // Wall-clock watchdog: kills the tracee if it stops making supervised progress.
         let (tx, rx) = mpsc::channel::<()>();
         let hung = Arc::clone(&self.hung);
+        let tgids = Arc::clone(&self.tgids);
         let limit = self.sandbox.wall_limit;
         std::thread::spawn(move || {
             if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(limit) {
                 hung.store(true, Ordering::SeqCst);
-                ready_kill(pid);
+                kill_all(&tgids);
             }
         });
         self.watchdog = Some(tx);
@@ -465,7 +480,7 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
     fn wait_any(&mut self) -> io::Result<(pid_t, i32)> {
         loop {
             let mut status = 0;
-            let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
+            let tid = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::__WNOTHREAD) };
             if tid < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -733,7 +748,14 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
                 let deadline = self.restart_or_relative_ms(tid, timeout_ms);
                 let mut probe_regs = regs;
                 probe_regs.r10 = 0;
-                self.start_poll_probe(tid, regs, probe_regs, nr, deadline, vec![(a1 as i32, libc::POLLIN)])
+                self.start_poll_probe(
+                    tid,
+                    regs,
+                    probe_regs,
+                    nr,
+                    deadline,
+                    vec![(a1 as i32, libc::POLLIN)],
+                )
             }
             libc::SYS_epoll_pwait2 => {
                 let deadline = self.restart_or_relative_ts(tid, a4)?;
@@ -743,7 +765,14 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
                 let scratch = self.scratch_timespec(tid, &regs)?;
                 let mut probe_regs = regs;
                 probe_regs.r10 = scratch;
-                self.start_poll_probe(tid, regs, probe_regs, nr, deadline, vec![(a1 as i32, libc::POLLIN)])
+                self.start_poll_probe(
+                    tid,
+                    regs,
+                    probe_regs,
+                    nr,
+                    deadline,
+                    vec![(a1 as i32, libc::POLLIN)],
+                )
             }
             libc::SYS_poll => {
                 let timeout_ms = a3 as i32;
@@ -862,8 +891,14 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
         };
         // Keep the kernel timer disarmed; expirations are injected through the mirror.
         let zero = libc::itimerspec {
-            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-            it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
         };
         unsafe { libc::timerfd_settime(mirror, 0, &zero, std::ptr::null_mut()) };
         let previous = self.timers.insert(
@@ -904,10 +939,17 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
                 continue;
             }
             let one_ns = libc::itimerspec {
-                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
-                it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 },
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1,
+                },
             };
-            if unsafe { libc::timerfd_settime(timer.mirror, 0, &one_ns, std::ptr::null_mut()) } < 0 {
+            if unsafe { libc::timerfd_settime(timer.mirror, 0, &one_ns, std::ptr::null_mut()) } < 0
+            {
                 return Err(io::Error::last_os_error());
             }
             // Wait for the 1 ns timer to actually expire so readiness probes see it.
@@ -1044,7 +1086,11 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
             WaitKind::Poll => result == 0,
             WaitKind::Sleep => false,
         };
-        self.log(tid, "probe", format!("nr={} result={result} block={would_block}", probe.nr));
+        self.log(
+            tid,
+            "probe",
+            format!("nr={} result={result} block={would_block}", probe.nr),
+        );
         if !would_block {
             return ptrace::cont(tid, 0);
         }
@@ -1094,7 +1140,10 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
         let Some(wait) = thread.wait.take() else {
             return Ok(());
         };
-        let probe = thread.probe.take().expect("parked probe keeps its registers");
+        let probe = thread
+            .probe
+            .take()
+            .expect("parked probe keeps its registers");
         thread.restart = Some(Restart {
             deadline: wait.deadline,
         });
@@ -1126,7 +1175,7 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
         }
     }
 
-    fn parked_poll_threads(&self) -> Vec<(pid_t, pid_t, Vec<(i32, i16)>)> {
+    fn parked_poll_threads(&self) -> Vec<ParkedPoll> {
         self.threads
             .iter()
             .filter_map(|(tid, t)| {
@@ -1241,8 +1290,14 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
 }
 
 fn write_itimerspec(tid: pid_t, addr: u64, interval_ns: u64, value_ns: u64) -> io::Result<()> {
-    let (is, ins) = ((interval_ns / clock::NANOS) as i64, (interval_ns % clock::NANOS) as i64);
-    let (vs, vns) = ((value_ns / clock::NANOS) as i64, (value_ns % clock::NANOS) as i64);
+    let (is, ins) = (
+        (interval_ns / clock::NANOS) as i64,
+        (interval_ns % clock::NANOS) as i64,
+    );
+    let (vs, vns) = (
+        (value_ns / clock::NANOS) as i64,
+        (value_ns % clock::NANOS) as i64,
+    );
     ptrace::write_timespec(tid, addr, is, ins)?;
     ptrace::write_timespec(tid, addr + 16, vs, vns)
 }
