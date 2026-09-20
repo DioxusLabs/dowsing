@@ -67,6 +67,7 @@ pub fn generate(session: &mut Session, len: usize) -> Vec<u8> {
         expand.fill_bytes(&mut out[drawn..]);
     }
     session.report.entropy_bytes += len as u64;
+    session.report.entropy.extend_from_slice(&out[..drawn]);
     out
 }
 

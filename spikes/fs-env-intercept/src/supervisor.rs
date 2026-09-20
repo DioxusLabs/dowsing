@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::bpf;
-use crate::draw::{Draw, RngDraw};
+use crate::draw::{RngDraw, SessionDraw};
 use crate::mem::TargetMem;
 use crate::notif::{self, Notification};
 use crate::spec::Spec;
@@ -46,6 +46,8 @@ pub struct CaseReport {
     pub answered: u64,
     pub virtual_opens: u64,
     pub entropy_bytes: u64,
+    /// Drawn entropy bytes in the order they were served (urandom reads and getrandom).
+    pub entropy: Vec<u8>,
     pub per_tid: HashMap<u32, u64>,
     pub unsupported: Vec<String>,
     pub send_retries: u64,
@@ -72,7 +74,7 @@ impl CaseReport {
 }
 
 pub struct Session {
-    pub draw: Box<dyn Draw>,
+    pub draw: Box<dyn SessionDraw>,
     pub spec: Arc<Spec>,
     pub vfs: Vfs,
     pub mem: TargetMem,
@@ -137,6 +139,10 @@ impl Sandbox {
     ///
     /// Returns the RNG so the harness calls `coverage()`/`coverage_with_cost()`/`discard()` as
     /// usual, plus a report of what the sandbox did.
+    ///
+    /// This generic shim is deliberately tiny: everything else runs through the type-erased
+    /// [`Sandbox::run_erased`], which is compiled into this crate and therefore stays outside
+    /// the harness's SanitizerCoverage instrumentation (see DESIGN.md risk R10).
     pub fn run_case<Capture, R>(
         &mut self,
         rng: CaseRng<Capture>,
@@ -147,7 +153,27 @@ impl Sandbox {
         Capture: CoverageCapture + Send + 'static,
         Capture::Token: Send,
     {
-        let draw: Box<dyn Draw> = Box::new(RngDraw::new(rng));
+        let mut target = Some(target);
+        let mut output = None;
+        let (mut draw, report) = self.run_erased(Box::new(RngDraw::new(rng)), spec, &mut || {
+            output = Some((target.take().expect("target runs once"))());
+        });
+        let rng = draw
+            .as_any_mut()
+            .downcast_mut::<RngDraw<Capture>>()
+            .expect("draw source has the harness capture type")
+            .take();
+        (rng, report, output.expect("target ran"))
+    }
+
+    /// Type-erased body of [`Sandbox::run_case`]. Panics in `target` propagate after the sandbox
+    /// state has been restored.
+    pub fn run_erased(
+        &mut self,
+        draw: Box<dyn SessionDraw>,
+        spec: &Arc<Spec>,
+        target: &mut dyn FnMut(),
+    ) -> (Box<dyn SessionDraw>, CaseReport) {
         let session = self.start_case(draw, spec);
         // No trapped syscall may run between here and the unlock below.
         {
@@ -155,7 +181,7 @@ impl Sandbox {
             assert!(guard.is_none(), "sandbox case already active");
             *guard = Some(session);
         }
-        let output = target();
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(target));
         let session = self
             .shared
             .session
@@ -163,11 +189,15 @@ impl Sandbox {
             .expect("session poisoned")
             .take()
             .expect("session vanished");
-        let (rng, report) = self.finish_case(session);
-        (rng, report, output)
+        let result = self.finish_case(session);
+        match output {
+            Ok(()) => result,
+            // Sandbox state is consistent again; let the harness see the panic.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
-    fn start_case(&mut self, mut draw: Box<dyn Draw>, spec: &Arc<Spec>) -> Session {
+    fn start_case(&mut self, mut draw: Box<dyn SessionDraw>, spec: &Arc<Spec>) -> Session {
         static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
         let case_id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id() as libc::pid_t;
@@ -207,11 +237,7 @@ impl Sandbox {
         }
     }
 
-    fn finish_case<Capture>(&mut self, mut session: Session) -> (CaseRng<Capture>, CaseReport)
-    where
-        Capture: CoverageCapture + Send + 'static,
-        Capture::Token: Send,
-    {
+    fn finish_case(&mut self, mut session: Session) -> (Box<dyn SessionDraw>, CaseReport) {
         crate::env::restore(&mut self.saved_env);
         let mut report = std::mem::take(&mut session.report);
         report.materialized_bytes = session.vfs.materialized_bytes;
@@ -234,13 +260,7 @@ impl Sandbox {
         files.sort();
         report.files = files;
         session.vfs.cleanup();
-        let mut draw = session.draw;
-        let rng = draw
-            .as_any_mut()
-            .downcast_mut::<RngDraw<Capture>>()
-            .expect("draw source has the harness capture type")
-            .take();
-        (rng, report)
+        (session.draw, report)
     }
 }
 

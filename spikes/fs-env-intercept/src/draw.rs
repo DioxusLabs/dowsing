@@ -9,20 +9,37 @@
 use std::any::Any;
 use std::ops::RangeInclusive;
 
-use iterator_fuzz::CaseRng;
 use iterator_fuzz::coverage::CoverageCapture;
+use iterator_fuzz::{CaseRng, ChildRng};
 use rand::RngCore;
 
-pub trait Draw: Any + Send {
+pub trait Draw {
     /// `CaseRng::variant`.
     fn variant(&mut self, upper: usize) -> usize;
     /// A `range` of single-byte items: shrinkable in length and per byte.
     fn bytes(&mut self, len: RangeInclusive<usize>) -> Vec<u8>;
+    /// A `range` of structured items: `item(index, draw)` runs once per element inside its own
+    /// sequence-item span, so `cautious()` can delete or reorder whole items.
+    fn sequence(&mut self, len: RangeInclusive<usize>, item: &mut dyn FnMut(usize, &mut dyn Draw));
     /// Raw `fill_bytes` (one draw span).
     fn fill(&mut self, buf: &mut [u8]);
     /// Trace bytes consumed through this object.
     fn consumed(&self) -> usize;
+}
+
+/// The per-case draw source owned by the supervisor session; downcast to recover the `CaseRng`.
+pub trait SessionDraw: Draw + Send {
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<Capture> SessionDraw for RngDraw<Capture>
+where
+    Capture: CoverageCapture + Send + 'static,
+    Capture::Token: Send,
+{
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 pub struct RngDraw<Capture: CoverageCapture> {
@@ -75,6 +92,19 @@ where
         out
     }
 
+    fn sequence(&mut self, len: RangeInclusive<usize>, item: &mut dyn FnMut(usize, &mut dyn Draw)) {
+        if len.start() != len.end() {
+            self.consumed += 4;
+        }
+        let mut consumed = 0;
+        for (index, child) in self.rng().range(len).enumerate() {
+            let mut child = ChildDraw { child, consumed: 0 };
+            item(index, &mut child);
+            consumed += child.consumed;
+        }
+        self.consumed += consumed;
+    }
+
     fn fill(&mut self, buf: &mut [u8]) {
         self.consumed += buf.len();
         self.rng().fill_bytes(buf);
@@ -83,9 +113,45 @@ where
     fn consumed(&self) -> usize {
         self.consumed
     }
+}
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
+/// One element of a [`Draw::sequence`]. `ChildRng` has no nested `range`, so `bytes` and
+/// `sequence` degrade to a length variant plus per-element draws inside this item's span.
+struct ChildDraw<'a, Capture: CoverageCapture> {
+    child: ChildRng<'a, Capture>,
+    consumed: usize,
+}
+
+impl<Capture: CoverageCapture> Draw for ChildDraw<'_, Capture> {
+    fn variant(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        self.consumed += 4;
+        self.child.variant(upper)
+    }
+
+    fn bytes(&mut self, len: RangeInclusive<usize>) -> Vec<u8> {
+        let n = *len.start() + self.variant(len.end() - len.start() + 1);
+        let mut out = vec![0u8; n];
+        self.fill(&mut out);
+        out
+    }
+
+    fn sequence(&mut self, len: RangeInclusive<usize>, item: &mut dyn FnMut(usize, &mut dyn Draw)) {
+        let n = *len.start() + self.variant(len.end() - len.start() + 1);
+        for index in 0..n {
+            item(index, self);
+        }
+    }
+
+    fn fill(&mut self, buf: &mut [u8]) {
+        self.consumed += buf.len();
+        self.child.fill_bytes(buf);
+    }
+
+    fn consumed(&self) -> usize {
+        self.consumed
     }
 }
 
