@@ -1,0 +1,23 @@
+[package]
+name = "net-intercept"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }
+
+[dev-dependencies]
+# Only used by examples/tokio_client.rs, the nonblocking demo target.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+
+[profile.release]
+debug = 1
+
+[[bench]]
+name = "roundtrip"
+harness = false
