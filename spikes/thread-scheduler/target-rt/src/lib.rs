@@ -119,6 +119,15 @@ pub fn supervised() -> bool {
     !SHM.load(Ordering::Relaxed).is_null()
 }
 
+/// Edges recorded in the shared mapping so far (0 when not attached).
+pub fn edges() -> u64 {
+    let base = SHM.load(Ordering::Relaxed);
+    if base.is_null() {
+        return 0;
+    }
+    unsafe { header_u64(base, OFF_EDGES).load(Ordering::Relaxed) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __sanitizer_cov_trace_pc_guard_init(start: *mut u32, end: *mut u32) {
     if start.is_null() || end.is_null() || start >= end {
@@ -156,10 +165,17 @@ pub extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
     if id >= BITMAP_BYTES * 8 {
         return;
     }
+    // Plain load/store (no RMW): the supervisor guarantees exactly one target thread runs at a
+    // time, so unlocked updates are exact; without a supervisor the bitmap is merely advisory.
     unsafe {
         let byte = &*(base.add(HEADER_BYTES + id / 8) as *const AtomicU8);
-        byte.fetch_or(1 << (id % 8), Ordering::Relaxed);
-        header_u64(base, OFF_EDGES).fetch_add(1, Ordering::Relaxed);
+        let bit = 1u8 << (id % 8);
+        let old = byte.load(Ordering::Relaxed);
+        if old & bit == 0 {
+            byte.store(old | bit, Ordering::Relaxed);
+        }
+        let edges = header_u64(base, OFF_EDGES);
+        edges.store(edges.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
         let budget = header_u32(base, OFF_BUDGET);
         let remaining = budget.load(Ordering::Relaxed);
         if remaining == 0 {
@@ -167,7 +183,8 @@ pub extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
         }
         if remaining == 1 {
             budget.store(0, Ordering::Relaxed);
-            header_u64(base, OFF_MARKER_HITS).fetch_add(1, Ordering::Relaxed);
+            let hits = header_u64(base, OFF_MARKER_HITS);
+            hits.store(hits.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
             yield_marker();
         } else {
             budget.store(remaining - 1, Ordering::Relaxed);
