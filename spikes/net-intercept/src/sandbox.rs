@@ -23,6 +23,8 @@ pub struct SandboxConfig {
     pub verbose: bool,
     /// Silence the child's panic message (the harness reports it from the verdict instead).
     pub quiet_child: bool,
+    /// Protocol-aware renderer for `Data` payloads in transcripts (default: hex).
+    pub describe_payload: Option<fn(&[u8]) -> String>,
 }
 
 impl Default for SandboxConfig {
@@ -33,6 +35,7 @@ impl Default for SandboxConfig {
             sync_wake_up: true,
             verbose: false,
             quiet_child: true,
+            describe_payload: None,
         }
     }
 }
@@ -121,6 +124,7 @@ impl Sandbox {
         let events = rng.range(0..=self.config.max_events);
         let payload = (self.payload_factory)();
         let mut sup = NetSupervisor::new(events, payload, self.config.verbose);
+        sup.describe_payload = self.config.describe_payload;
 
         let coverage = self.coverage.clone();
         let quiet = self.config.quiet_child;

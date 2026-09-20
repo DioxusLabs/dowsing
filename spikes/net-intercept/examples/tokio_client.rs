@@ -1,22 +1,15 @@
-//! Blocking `std::net` demo: the client connects to 10.66.66.1:7000 (nothing listens there; with
-//! the sandbox the SYN never leaves the process), sends a hello, and parses frames until EOF.
-//! The fuzzer plays the server. `compressed` frames with n > 64 crash the parser.
+//! Nonblocking demo: the same frame client on a tokio current-thread runtime (mio + epoll).
+//! The runtime's eventfd/timerfd and the fake sockets share one epoll; readiness on the fake
+//! sockets comes from the AF_UNIX pair the supervisor materialises events into.
 //!
-//! Plain build (NoCoverage / ChildCoverage without instrumentation):
-//!   cargo run --release --example std_client
-//! Sancov build (coverage-guided):
-//!   cargo rustc --release --example std_client -- -Cpasses=sancov-module \
-//!     -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-inline-8bit-counters \
-//!     -Cllvm-args=-sanitizer-coverage-pc-table -Cllvm-args=-sanitizer-coverage-trace-compares
-//!   ./target/release/examples/std_client
+//!   cargo run --release --example tokio_client
+//!   ./build-sancov.sh tokio_client && ./target/release/examples/tokio_client
 //!
-//! Flags: `--no-coverage`, `--raw` (byte payloads instead of frame payloads), `--kind-byte`
-//! (frame kind drawn as a raw byte: needs trace-compares to find quickly), `--cases N`,
-//! `--seed S`, `--verbose`, `--once` (run the target once, print the transcript).
+//! Flags as in `std_client`: `--no-coverage`, `--kind-byte`, `--raw`, `--cases N`, `--shrink N`,
+//! `--seed S`, `--verbose`, `--once`.
 
 use std::{
-    io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    net::{Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
@@ -25,32 +18,44 @@ use net_intercept::{
     demo::{self, Stats, frame_payload, frame_payload_kind_byte, raw_payload},
     fuzz,
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 const SERVER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(10, 66, 66, 1)), 7000);
 
-/// The target. Everything here is ordinary std networking.
-fn client() {
-    let mut stream = match TcpStream::connect_timeout(&SERVER, Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(e) => {
+async fn session() {
+    let connect = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(SERVER));
+    let mut stream = match connect.await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             eprintln!("connect failed: {e}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("connect timed out");
             return;
         }
     };
     stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    if let Err(e) = stream.write_all(b"HELLO frames/1\n") {
+    if let Err(e) = stream.write_all(b"HELLO frames/1\n").await {
         eprintln!("hello failed: {e}");
         return;
     }
     let mut stats = Stats::default();
     loop {
         let mut header = [0u8; 3];
-        match stream.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header));
+        match read.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Err(e)) => {
                 eprintln!("read failed: {e}");
+                return;
+            }
+            Err(_) => {
+                eprintln!("read timed out");
                 return;
             }
         }
@@ -60,17 +65,26 @@ fn client() {
             return;
         }
         let mut body = vec![0u8; len - 1];
-        if stream.read_exact(&mut body).is_err() {
+        if stream.read_exact(&mut body).await.is_err() {
             break;
         }
         if let Err(e) = demo::handle_frame(header[2], &body, &mut stats) {
             eprintln!("protocol error: {e}");
-            let _ = stream.write_all(b"ERR\n");
+            let _ = stream.write_all(b"ERR\n").await;
             return;
         }
-        let _ = stream.write_all(b"ACK\n");
+        let _ = stream.write_all(b"ACK\n").await;
     }
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = stream.shutdown().await;
+}
+
+/// The target: builds the runtime inside the sandboxed child.
+fn client() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(session());
 }
 
 fn main() {
@@ -86,15 +100,13 @@ fn main() {
     let features = net_intercept::probe_features();
     println!("kernel features: {features:?}");
 
-    let mut config = SandboxConfig {
+    let config = SandboxConfig {
         verbose: flag("--verbose") || flag("--once"),
         quiet_child: !flag("--once"),
         describe_payload: Some(demo::describe_frames),
+        sync_wake_up: !flag("--no-sync"),
         ..SandboxConfig::default()
     };
-    if flag("--no-sync") {
-        config.sync_wake_up = false;
-    }
     let mut sandbox = Sandbox::new(config).expect("sandbox");
     sandbox = if flag("--raw") {
         sandbox.with_payload(raw_payload)

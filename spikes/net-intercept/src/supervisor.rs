@@ -3,7 +3,7 @@
 //! kernel run them (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     io,
     net::{IpAddr, SocketAddr},
     os::fd::{AsFd, RawFd},
@@ -30,8 +30,6 @@ pub struct NetSupervisor<'a, C: CoverageCapture> {
     payload: PayloadGen,
     sockets: BTreeMap<RawFd, FakeSocket>,
     next_fd: RawFd,
-    /// epfd -> (fd -> interest mask), mirrored from `epoll_ctl` on fake fds.
-    epoll: HashMap<RawFd, HashMap<RawFd, u32>>,
     closed_sent: Vec<(RawFd, Vec<u8>)>,
     pub transcript: Vec<String>,
     pub decisions: usize,
@@ -40,6 +38,8 @@ pub struct NetSupervisor<'a, C: CoverageCapture> {
     pub syscalls: u64,
     pub continued: u64,
     pub verbose: bool,
+    /// Optional protocol-aware renderer for `Data` payloads in the transcript.
+    pub describe_payload: Option<fn(&[u8]) -> String>,
 }
 
 /// Errno as `Handled`.
@@ -71,7 +71,6 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
             payload,
             sockets: BTreeMap::new(),
             next_fd: FAKE_FD_BASE as RawFd,
-            epoll: HashMap::new(),
             closed_sent: Vec::new(),
             transcript: Vec::new(),
             decisions: 0,
@@ -80,6 +79,7 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
             syscalls: 0,
             continued: 0,
             verbose,
+            describe_payload: None,
         }
     }
 
@@ -177,7 +177,6 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
                 self.unhandled("select/pselect6: passed through without gating".into());
                 cont()
             }
-            libc::SYS_epoll_ctl => self.sys_epoll_ctl(n),
             libc::SYS_epoll_wait | libc::SYS_epoll_pwait => {
                 self.sys_epoll_wait(n, (n.arg(3) as i32) < 0)
             }
@@ -499,13 +498,9 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
         if let Some(mut s) = self.sockets.remove(&fd) {
             s.pump();
             self.log(format!("close({fd})"));
-            for set in self.epoll.values_mut() {
-                set.remove(&fd);
-            }
             // Keep the sent log for the report.
             self.closed_sent.push((fd, std::mem::take(&mut s.sent)));
         }
-        self.epoll.remove(&fd);
         cont()
     }
 
@@ -550,7 +545,11 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
                 if let Err(e) = sock.deliver(&bytes) {
                     self.unhandled(format!("deliver failed: {e}"));
                 }
-                self.log(format!("{via}({fd}) <- Data[{}] {}", bytes.len(), hex(&bytes)));
+                let shown = match self.describe_payload {
+                    Some(describe) => describe(&bytes),
+                    None => hex(&bytes),
+                };
+                self.log(format!("{via}({fd}) <- Data[{}] {shown}", bytes.len()));
                 cont()
             }
             PeerEvent::Data(_) | PeerEvent::WouldBlock if may_block => {
@@ -774,10 +773,10 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
                     }
                 }
             }
-            (SockType::Stream, State::Connected | State::Connecting) => {
-                if sock.state == State::Connecting && sock.pending_error != 0 {
-                    return;
-                }
+            // A pending nonblocking connect waits for writability, which the fresh socketpair
+            // already has; SO_ERROR then reports the drawn outcome.
+            (SockType::Stream, State::Connecting) => {}
+            (SockType::Stream, State::Connected) => {
                 if sock.reset || sock.eof_sent || sock.target_unread() > 0 {
                     return;
                 }
@@ -813,39 +812,24 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
         cont()
     }
 
-    fn sys_epoll_ctl(&mut self, n: &Notification<'_>) -> Handled {
-        let epfd = n.fd_arg(0);
-        let op = n.arg(1) as i32;
-        let fd = n.fd_arg(2);
-        if !self.sockets.contains_key(&fd) {
+    /// The epoll interest list comes from `/proc/<pid>/fdinfo/<epfd>` (the kernel's own view),
+    /// so dup'ed epoll fds (mio's `Registry::try_clone`) and registrations made before the
+    /// supervisor existed are covered without mirroring `epoll_ctl`.
+    fn sys_epoll_wait(&mut self, n: &Notification<'_>, infinite: bool) -> Handled {
+        if self.sockets.is_empty() {
             return cont();
         }
-        match op {
-            libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD => {
-                let Ok(events) = n.read_pod::<u32>(n.arg(3)) else {
-                    return cont();
-                };
-                self.epoll.entry(epfd).or_default().insert(fd, events);
-            }
-            libc::EPOLL_CTL_DEL => {
-                if let Some(set) = self.epoll.get_mut(&epfd) {
-                    set.remove(&fd);
-                }
-            }
-            _ => {}
-        }
-        cont()
-    }
-
-    fn sys_epoll_wait(&mut self, n: &Notification<'_>, infinite: bool) -> Handled {
         let epfd = n.fd_arg(0);
-        let Some(set) = self.epoll.get(&epfd) else {
+        let Ok(info) = std::fs::read_to_string(format!("/proc/{}/fdinfo/{epfd}", n.pid())) else {
             return cont();
         };
-        let mut interested: Vec<RawFd> = set
-            .iter()
-            .filter(|(_, ev)| **ev & libc::EPOLLIN as u32 != 0)
-            .map(|(fd, _)| *fd)
+        let mut interested: Vec<RawFd> = info
+            .lines()
+            .filter_map(parse_epoll_tfd)
+            .filter(|(fd, events)| {
+                *events & libc::EPOLLIN as u32 != 0 && self.sockets.contains_key(fd)
+            })
+            .map(|(fd, _)| fd)
             .collect();
         interested.sort_unstable();
         let mut forced = false;
@@ -881,6 +865,18 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
             _ => cont(),
         }
     }
+}
+
+/// `tfd:     1000 events:     201d data: ...` -> `(1000, 0x201d)`.
+fn parse_epoll_tfd(line: &str) -> Option<(RawFd, u32)> {
+    let rest = line.strip_prefix("tfd:")?;
+    let mut words = rest.split_whitespace();
+    let fd: RawFd = words.next()?.parse().ok()?;
+    if words.next()? != "events:" {
+        return None;
+    }
+    let events = u32::from_str_radix(words.next()?, 16).ok()?;
+    Some((fd, events))
 }
 
 fn ensure_connected(sock: &mut FakeSocket) -> Result<(), i32> {

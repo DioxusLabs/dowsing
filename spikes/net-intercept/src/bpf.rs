@@ -124,6 +124,5 @@ pub fn network_rules() -> Vec<Rule> {
         NotifyIfFakeFd(SYS_dup, 0),
         NotifyIfFakeFd(SYS_dup2, 0),
         NotifyIfFakeFd(SYS_dup3, 0),
-        NotifyIfFakeFd(SYS_epoll_ctl, 2),
     ]
 }
