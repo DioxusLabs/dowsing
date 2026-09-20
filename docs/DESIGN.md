@@ -193,6 +193,31 @@ sandbox/target-rt/  crate dowsing-target-rt: trace-pc-guard callbacks, budget, m
 sandbox/targets/    demo programs (built with sancov flags by build-targets.sh; never linked to the fuzzer)
 ```
 
+Inside `sandbox/src` the crate is layered so that a source of nondeterminism is a module, not
+an arm of the supervisor's `match nr`:
+
+```
+ptrace, seccomp, shm, snapshot   process control: stops, registers, memory, one BPF program, page store
+sched, world, oracle             core state: threads + virtual clock, decisions/trace/coverage, failure classes
+model                            the boundary: Model trait, Cx (what a model may do), Emu, Filter, Ext, Prior
+models/{time,entropy,net}        built-in models; net/http1 is the first Protocol
+session/{mod,events,schedule,snapshot}  the supervisor: lifecycle + dispatch, ptrace/core syscalls,
+                                 candidate scheduling and idle, snapshot/restore
+tree                             search: PCT rollouts, frontier, replay, shrink
+```
+
+A `Model` declares the syscalls it wants stopped (`Filter`: always, or only when `args[0]` is
+a virtual descriptor); `seccomp::Program::compose` folds every installed model's filter with
+the core's into the single BPF program the child installs. On a stop the session routes the
+registers to the owning model, which answers with an `Emu`: return a value, stop the thread at
+a schedule point, park it in a `ThreadState::Wait`, pass it to the kernel (reported as
+uncontrolled), or let the kernel run it silently. Models also offer external events (`Ext`,
+tagged with a `Prior` so the search can rank them without knowing what they are), own their
+own decision kinds (`Pending::Model`), and classify idle states (`Model::idle`, folded into
+the `Oracle`). Everything a model owns lives in `World` and is cloned with it, so snapshot and
+restore need no per-model code. The search sees only `Candidate::{Run, Fire, Ext}` and `Kind`;
+nothing in `tree.rs` names a socket.
+
 Everything reused from the spikes is the scheduler's ptrace/seccomp/futex code and the
 target runtime. Dropped: seccomp-unotify data plane, fork-based holders, byte-prefix keying,
 in-process filters, LD_PRELOAD.
@@ -240,9 +265,10 @@ when nonzero — that is all tokio's `mio` waker needs.
 been delivered (`rx`), whether FIN has been sent, and the bytes the server wrote back. They
 appear in the tree as decisions:
 
-- `Schedule` candidates now include `Client(Connect | Send(c) | Close(c))` next to `Run(t)` and
-  `Fire(timer)`, with PCT priorities of their own, so *when* a connection arrives relative to
-  the workers' progress is a searched choice;
+- `Schedule` candidates now include the net model's events (connect, send to `c`, close `c`)
+  next to `Run(t)` and `Fire(timer)`, with PCT priorities of their own (`Prior::Spawn`,
+  `Prior::Actor(c)`, `Prior::Last`), so *when* a connection arrives relative to the workers'
+  progress is a searched choice;
 - `Payload(n)`: which corpus request a new connection carries (`--corpus dir`, one file per
   request; `--request` for literals);
 - `Chunk`: how much of the remaining request `Send` delivers — all, half, all but one byte, or
@@ -253,17 +279,19 @@ appear in the tree as decisions:
 legitimate but different test, and it dominated the early rollouts).
 
 **Blocking.** `read`/`recvfrom`/`accept` on an empty blocking socket, `epoll_wait` with nothing
-ready and `poll`/`ppoll` on virtual descriptors park the thread as `IoWait { deadline, seq }` /
-`EpollWait { .. }` with the entry registers saved; a network change (`deliver`, `connect`, FIN,
-server write) re-runs the emulation of every parked call and completes the ones now satisfied;
+ready and `poll`/`ppoll` on virtual descriptors park the thread as
+`ThreadState::Wait { model: Net, deadline, seq }` with the entry registers saved; a network
+change (`deliver`, `connect`, FIN, server write) re-runs the emulation of every parked call and
+completes the ones now satisfied;
 a deadline is a timer candidate like any `FutexWait` deadline, and firing it completes the call
 with the timeout result. So a std server that `poll(fds, 1, 50ms)`s in a loop is a sequence of
-`IoWait → Fire | Client(..)` decisions with no wall-clock sleeping. `poll` over kernel
+`Wait → Fire | Ext(..)` decisions with no wall-clock sleeping. `poll` over kernel
 descriptors is left alone when it cannot block (timeout 0) and reported as uncontrolled
 otherwise; a mixed set is reported.
 
 **Oracles**, all on the world: a `panicked at` line on the target's stderr (`Outcome::Panic`);
-an HTTP status ≥ 500 in a client's response (`Outcome::HttpError`); a client whose request was
+an HTTP status ≥ 500 in a client's response (`Protocol::verdict`, `Outcome::Protocol`); a
+client whose request was
 fully read but that never got a response once nothing is runnable and the idle timers have been
 fired (`Outcome::Hang { clients }`). Repeated equivalent failures (same outcome and first
 stderr line) get no novelty credit, so `--keep-going` keeps searching for a *different* one.

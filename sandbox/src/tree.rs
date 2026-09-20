@@ -16,18 +16,18 @@
 //! the frontier pointed at unexplored preemption points.
 
 use crate::{
-    net::ClientEvent,
+    model::{ModelId, Prior},
     session::{Event, Session},
     shm::Bitmap,
     snapshot::SnapshotId,
     world::{
-        BUDGET_MAX, CHUNK_CHOICES, CLIENT_THREAD, Candidate, Decision, Kind, Outcome, Pending,
-        Point, TraceEvent,
+        BUDGET_MAX, CHUNK_CHOICES, Candidate, Decision, Kind, Outcome, Pending, Point, TraceEvent,
+        WORLD_THREAD,
     },
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
     io,
@@ -145,9 +145,10 @@ struct Policy {
     prio: Vec<u32>,
     /// Priority of a thread's pending timeout when it is offered as a `Fire` candidate.
     timer_prio: Vec<u32>,
-    /// Priority of each modelled client's next action (send/close), and of a new connection.
-    client_prio: Vec<u32>,
-    connect_prio: u32,
+    /// Priority of each external actor's next step (`Prior::Actor`), per owning model.
+    actor_prio: HashMap<(ModelId, usize), u32>,
+    /// Priority of a new actor appearing (`Prior::Spawn`), one per rollout.
+    spawn_prio: u32,
     /// Global edge counts at which the running thread is demoted, ascending.
     change_points: Vec<u64>,
     lowest: u32,
@@ -170,17 +171,17 @@ impl Policy {
         Self {
             prio,
             timer_prio,
-            client_prio: Vec::new(),
-            connect_prio: rng.random_range(1000..2000),
+            actor_prio: HashMap::new(),
+            spawn_prio: rng.random_range(1000..2000),
             change_points,
             lowest: 1000,
         }
     }
 
-    fn ensure_client(&mut self, rng: &mut SmallRng, client: usize) {
-        while self.client_prio.len() <= client {
-            self.client_prio.push(rng.random_range(1000..2000));
-        }
+    fn actor(&mut self, rng: &mut SmallRng, model: ModelId, actor: usize) -> &mut u32 {
+        self.actor_prio
+            .entry((model, actor))
+            .or_insert_with(|| rng.random_range(1000..2000))
     }
 
     fn ensure(&mut self, rng: &mut SmallRng, thread: usize) {
@@ -203,14 +204,13 @@ impl Policy {
                     self.ensure(rng, t);
                     self.timer_prio[t]
                 }
-                Candidate::Client(ClientEvent::Connect) => self.connect_prio,
-                Candidate::Client(ClientEvent::Send(c)) => {
-                    self.ensure_client(rng, c);
-                    self.client_prio[c]
-                }
-                // A client hangs up only once nothing else can happen; closing early is left
-                // to the search, which tries it as an untried sibling.
-                Candidate::Client(ClientEvent::Close(_)) => 0,
+                Candidate::Ext(ev) => match ev.prior {
+                    Prior::Actor(a) => *self.actor(rng, ev.model, a),
+                    Prior::Spawn => self.spawn_prio,
+                    // Only once nothing else can happen; doing it earlier is left to the
+                    // search, which tries it as an untried sibling.
+                    Prior::Last => 0,
+                },
             };
             if i == 0 || p > best_p {
                 best = i;
@@ -245,12 +245,12 @@ impl Policy {
         self.timer_prio[thread] = self.lowest;
     }
 
-    /// A segment boundary is the network preempting the client: the rest of its request
-    /// arrives after everything else that is ready has run.
-    fn demote_client(&mut self, rng: &mut SmallRng, client: usize) {
-        self.ensure_client(rng, client);
+    /// An actor whose input the search split is preempted by the world: the rest of it arrives
+    /// after everything else that is ready has run.
+    fn demote_actor(&mut self, rng: &mut SmallRng, model: ModelId, actor: usize) {
         self.lowest -= 1;
-        self.client_prio[client] = self.lowest;
+        let lowest = self.lowest;
+        *self.actor(rng, model, actor) = lowest;
     }
 }
 
@@ -375,7 +375,7 @@ impl Search {
                 depth: 0,
                 kind: Some(kind),
                 n,
-                edges: session.world.edges,
+                edges: session.world.cov.edges,
                 children: Vec::new(),
                 segment: None,
                 exhausted: false,
@@ -391,7 +391,7 @@ impl Search {
                 depth: 0,
                 kind: None,
                 n: 0,
-                edges: session.world.edges,
+                edges: session.world.cov.edges,
                 children: Vec::new(),
                 segment: None,
                 exhausted: false,
@@ -447,7 +447,7 @@ impl Search {
         let mut per_thread: Vec<u64> = Vec::new();
         for w in trace.windows(2) {
             let (a, b) = (w[0], w[1]);
-            if a.thread != CLIENT_THREAD {
+            if a.thread != WORLD_THREAD {
                 if per_thread.len() <= a.thread {
                     per_thread.resize(a.thread + 1, 0);
                 }
@@ -463,14 +463,14 @@ impl Search {
             }
         }
         if let Some(last) = trace.last()
-            && last.thread != CLIENT_THREAD
+            && last.thread != WORLD_THREAD
         {
             if per_thread.len() <= last.thread {
                 per_thread.resize(last.thread + 1, 0);
             }
             per_thread[last.thread] += last.edges;
         }
-        self.k_est = self.k_est.max(self.session.world.edges);
+        self.k_est = self.k_est.max(self.session.world.cov.edges);
         if self.thread_est.len() < per_thread.len() {
             self.thread_est.resize(per_thread.len(), 0);
         }
@@ -546,7 +546,7 @@ impl Search {
             return existing;
         }
         let depth = self.nodes[parent].depth + 1;
-        let edges = self.session.world.edges;
+        let edges = self.session.world.cov.edges;
         let node = match ev {
             Event::Decision { kind, n } => Node {
                 parent: Some(parent),
@@ -594,15 +594,20 @@ impl Search {
                 let candidates = candidates.clone();
                 policy.schedule(&mut self.rng, &candidates)
             }
-            Some(Pending::Budget { .. }) => policy.budget(self.session.world.edges),
-            Some(Pending::Variant { n, .. } | Pending::Payload { n, .. }) => {
+            Some(Pending::Budget { .. }) => policy.budget(self.session.world.cov.edges),
+            // Mostly whole inputs; the search, not the rollout, is what tries fragments.
+            Some(Pending::Model {
+                kind: Kind::Chunk, ..
+            }) => {
+                if self.rng.random_range(0..4) == 0 {
+                    self.rng.random_range(1..CHUNK_CHOICES)
+                } else {
+                    0
+                }
+            }
+            Some(Pending::Variant { n, .. } | Pending::Model { n, .. }) => {
                 self.rng.random_range(0..*n)
             }
-            // Mostly whole requests; the search, not the rollout, is what tries fragments.
-            Some(Pending::Chunk { .. }) if self.rng.random_range(0..4) == 0 => {
-                self.rng.random_range(1..CHUNK_CHOICES)
-            }
-            Some(Pending::Chunk { .. }) => 0,
             None => 0,
         }
     }
@@ -679,7 +684,7 @@ impl Search {
         let mut choice = first;
         let mut fresh_total = 0;
         let mut path = self.path(at);
-        let threads = self.session.world.threads.len();
+        let threads = self.session.world.sched.threads.len();
         let spent = self
             .session
             .world
@@ -698,8 +703,13 @@ impl Search {
         loop {
             let mark = self.session.world.trace.len();
             match self.session.world.pending.as_ref() {
-                Some(Pending::Chunk { client }) if choice != 0 => {
-                    policy.demote_client(&mut self.rng, *client);
+                Some(Pending::Model {
+                    kind: Kind::Chunk,
+                    model,
+                    actor,
+                    ..
+                }) if choice != 0 => {
+                    policy.demote_actor(&mut self.rng, *model, *actor);
                 }
                 Some(Pending::Schedule { candidates }) => {
                     if let Some(Candidate::Fire(thread)) = candidates.get(choice as usize) {

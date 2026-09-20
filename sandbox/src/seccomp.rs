@@ -1,75 +1,39 @@
 //! seccomp-BPF filter: `SECCOMP_RET_TRACE` for the modelled syscalls, `ALLOW` for everything
-//! else. Installed by the child between `fork` and `execve`; the tracer is attached before the
-//! first traced syscall because the child stops itself with `SIGSTOP` right after installing it.
+//! else. One program, composed from the core's syscalls ([`CORE`]) and every installed model's
+//! [`Filter`]; built by the supervisor and installed by the child between `fork` and `execve`.
+//! The tracer is attached before the first traced syscall because the child stops itself with
+//! `SIGSTOP` right after installing it.
 //!
 //! Descriptor syscalls (`read`, `write`, `close`, ...) are traced only when the descriptor is
-//! one the supervisor handed out (`>= VFD_BASE`); the target's ordinary files stay kernel-side
-//! at no cost.
+//! one a model handed out (`>= VFD_BASE`); the target's ordinary files stay kernel-side at no
+//! cost.
 
-use crate::net::VFD_BASE;
+use crate::model::{Filter, VFD_BASE};
 use std::io;
 
-/// Syscalls that always stop in the supervisor.
-pub const TRACED_SYSCALLS: &[libc::c_long] = &[
-    libc::SYS_futex,
-    libc::SYS_clone,
-    libc::SYS_clone3,
-    libc::SYS_sched_yield,
-    libc::SYS_nanosleep,
-    libc::SYS_clock_nanosleep,
-    libc::SYS_clock_gettime,
-    libc::SYS_gettimeofday,
-    libc::SYS_time,
-    libc::SYS_exit,
-    libc::SYS_exit_group,
-    libc::SYS_getrandom,
-    libc::SYS_rseq,
-    libc::SYS_munmap,
-    libc::SYS_epoll_wait,
-    libc::SYS_epoll_pwait,
-    libc::SYS_epoll_pwait2,
-    libc::SYS_poll,
-    libc::SYS_ppoll,
-    // Not modelled (no Rust runtime uses them); traced so a target that does is reported
-    // as uncontrolled instead of blocking in the kernel on a virtual descriptor.
-    libc::SYS_select,
-    libc::SYS_pselect6,
-    libc::SYS_socket,
-    libc::SYS_epoll_create1,
-    libc::SYS_epoll_create,
-    libc::SYS_eventfd2,
-    libc::SYS_sched_getaffinity,
-    crate::shm::MARKER_SYSCALL,
-];
+/// What the core itself stops for: the scheduler's syscalls (futex, clone, yield, exit), the
+/// target runtime's marker, and the two the snapshot mechanism must see.
+pub const CORE: Filter = Filter {
+    always: &[
+        libc::SYS_futex,
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_rseq,
+        libc::SYS_munmap,
+        crate::shm::MARKER_SYSCALL,
+    ],
+    vfd: &[],
+};
 
-/// Syscalls that stop in the supervisor when their first argument is a virtual descriptor.
-pub const FD_SYSCALLS: &[libc::c_long] = &[
-    libc::SYS_read,
-    libc::SYS_write,
-    libc::SYS_readv,
-    libc::SYS_writev,
-    libc::SYS_recvfrom,
-    libc::SYS_sendto,
-    libc::SYS_recvmsg,
-    libc::SYS_sendmsg,
-    libc::SYS_close,
-    libc::SYS_fcntl,
-    libc::SYS_ioctl,
-    libc::SYS_bind,
-    libc::SYS_listen,
-    libc::SYS_accept,
-    libc::SYS_accept4,
-    libc::SYS_connect,
-    libc::SYS_shutdown,
-    libc::SYS_getsockname,
-    libc::SYS_getpeername,
-    libc::SYS_setsockopt,
-    libc::SYS_getsockopt,
-    libc::SYS_epoll_ctl,
-    libc::SYS_dup,
-    libc::SYS_dup3,
-    libc::SYS_fstat,
-];
+/// A ready-to-install program.
+#[derive(Debug, Clone)]
+pub struct Program {
+    insns: Vec<libc::sock_filter>,
+}
 
 /// Offset of `args[0]`'s low word in `struct seccomp_data`.
 const SECCOMP_DATA_ARG0: u32 = 16;
@@ -97,49 +61,76 @@ const BPF_JMP_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
 const BPF_JMP_JGE_K: u16 = (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16;
 const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 
-/// Layout:
-/// ```text
-///   ld arch; jeq x86_64 else KILL
-///   ld nr
-///   jeq <always traced>  -> TRACE      (one per entry)
-///   jeq <fd syscall>     -> FDCHECK    (one per entry)
-///   ret ALLOW
-/// FDCHECK: ld arg0; jge VFD_BASE -> TRACE; ret ALLOW
-/// TRACE:   ret TRACE
-/// ```
-pub fn program() -> Vec<libc::sock_filter> {
-    let mut prog = vec![
-        stmt(BPF_LD_W_ABS, 4),
-        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
-        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
-        stmt(BPF_LD_W_ABS, 0),
-    ];
-    let (a, f) = (TRACED_SYSCALLS.len(), FD_SYSCALLS.len());
-    // Instruction indices relative to the first `jeq`.
-    let allow = a + f;
-    let fdcheck = allow + 1;
-    let trace = fdcheck + 3;
-    for (i, nr) in TRACED_SYSCALLS.iter().enumerate() {
-        prog.push(jump(BPF_JMP_JEQ_K, *nr as u32, (trace - i - 1) as u8, 0));
+impl Program {
+    /// Compose one program from `filters`. A syscall in any `always` list is always traced; one
+    /// only in `vfd` lists is traced when `arg0 >= VFD_BASE`. Layout:
+    /// ```text
+    ///   ld arch; jeq x86_64 else KILL
+    ///   ld nr
+    ///   jeq <always traced>  -> TRACE      (one per entry)
+    ///   jeq <fd syscall>     -> FDCHECK    (one per entry)
+    ///   ret ALLOW
+    /// FDCHECK: ld arg0; jge VFD_BASE -> TRACE; ret ALLOW
+    /// TRACE:   ret TRACE
+    /// ```
+    pub fn compose(filters: &[Filter]) -> Self {
+        let mut always: Vec<libc::c_long> = Vec::new();
+        let mut vfd: Vec<libc::c_long> = Vec::new();
+        for f in filters {
+            for nr in f.always {
+                if !always.contains(nr) {
+                    always.push(*nr);
+                }
+            }
+        }
+        for f in filters {
+            for nr in f.vfd {
+                if !always.contains(nr) && !vfd.contains(nr) {
+                    vfd.push(*nr);
+                }
+            }
+        }
+        let (a, f) = (always.len(), vfd.len());
+        assert!(a + f + 4 < 256, "filter too large for 8-bit BPF jumps");
+        let mut insns = vec![
+            stmt(BPF_LD_W_ABS, 4),
+            jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+            stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+            stmt(BPF_LD_W_ABS, 0),
+        ];
+        // Instruction indices relative to the first `jeq`.
+        let allow = a + f;
+        let fdcheck = allow + 1;
+        let trace = fdcheck + 3;
+        for (i, nr) in always.iter().enumerate() {
+            insns.push(jump(BPF_JMP_JEQ_K, *nr as u32, (trace - i - 1) as u8, 0));
+        }
+        for (i, nr) in vfd.iter().enumerate() {
+            let at = a + i;
+            insns.push(jump(BPF_JMP_JEQ_K, *nr as u32, (fdcheck - at - 1) as u8, 0));
+        }
+        insns.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        insns.push(stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0));
+        insns.push(jump(BPF_JMP_JGE_K, VFD_BASE as u32, 1, 0));
+        insns.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        insns.push(stmt(BPF_RET_K, SECCOMP_RET_TRACE));
+        Self { insns }
     }
-    for (i, nr) in FD_SYSCALLS.iter().enumerate() {
-        let at = a + i;
-        prog.push(jump(BPF_JMP_JEQ_K, *nr as u32, (fdcheck - at - 1) as u8, 0));
+
+    pub fn len(&self) -> usize {
+        self.insns.len()
     }
-    prog.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-    prog.push(stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARG0));
-    prog.push(jump(BPF_JMP_JGE_K, VFD_BASE as u32, 1, 0));
-    prog.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-    prog.push(stmt(BPF_RET_K, SECCOMP_RET_TRACE));
-    prog
+
+    pub fn is_empty(&self) -> bool {
+        self.insns.is_empty()
+    }
 }
 
-/// Install the filter in the current process (async-signal-safe; called between fork and exec).
-pub fn install() -> io::Result<()> {
-    let prog = program();
+/// Install `prog` in the current process. Allocation-free, so it is safe between fork and exec.
+pub fn install(prog: &Program) -> io::Result<()> {
     let fprog = libc::sock_fprog {
-        len: prog.len() as u16,
-        filter: prog.as_ptr() as *mut libc::sock_filter,
+        len: prog.insns.len() as u16,
+        filter: prog.insns.as_ptr() as *mut libc::sock_filter,
     };
     unsafe {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -162,9 +153,17 @@ pub fn install() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        model::Model,
+        models::{Entropy, Net, Time},
+    };
+
+    fn filters() -> [Filter; 4] {
+        [CORE, Time::FILTER, Entropy::FILTER, Net::FILTER]
+    }
 
     fn evaluate(arch: u32, nr: u32, arg0: u32) -> u32 {
-        let prog = program();
+        let prog = Program::compose(&filters()).insns;
         let mut acc = 0u32;
         let mut pc = 0usize;
         loop {
@@ -201,13 +200,17 @@ mod tests {
 
     #[test]
     fn traces_only_modelled_syscalls() {
-        for nr in TRACED_SYSCALLS {
+        let always: Vec<libc::c_long> = filters().iter().flat_map(|f| f.always).copied().collect();
+        let vfd: Vec<libc::c_long> = filters().iter().flat_map(|f| f.vfd).copied().collect();
+        assert!(always.contains(&libc::SYS_futex) && always.contains(&libc::SYS_socket));
+        assert!(vfd.contains(&libc::SYS_read));
+        for nr in &always {
             assert_eq!(
                 evaluate(AUDIT_ARCH_X86_64, *nr as u32, 0),
                 SECCOMP_RET_TRACE
             );
         }
-        for nr in FD_SYSCALLS {
+        for nr in &vfd {
             assert_eq!(
                 evaluate(AUDIT_ARCH_X86_64, *nr as u32, 3),
                 SECCOMP_RET_ALLOW

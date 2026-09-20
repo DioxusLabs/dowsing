@@ -1,16 +1,37 @@
-//! The network world model: the target's sockets, epoll instances and eventfds exist only here.
+//! The network model: the target's sockets, epoll instances and eventfds exist only here.
 //!
 //! Descriptors handed to the target are numbered from [`VFD_BASE`] so the seccomp filter can
 //! tell them from real kernel fds by the first syscall argument alone; everything the target
-//! does with one is emulated by the session, and nothing about them lives in the kernel, which
+//! does with one is emulated in [`syscalls`], and nothing about them lives in the kernel, which
 //! is what keeps a snapshot restorable. The peers are modelled clients: each opens one
 //! connection to the target's listener, sends one request (chosen from the corpus), possibly in
 //! pieces, and closes. *When* any of that happens is a schedule decision, offered next to the
-//! target's own threads.
+//! target's own threads. What a complete request or response looks like, and which responses
+//! are failures, is the [`Protocol`]'s business ([`http1::Http1`] by default).
 
-use std::collections::{BTreeMap, VecDeque};
+mod http1;
+mod syscalls;
 
-pub const VFD_BASE: i32 = 4096;
+pub use crate::model::VFD_BASE;
+pub use http1::Http1;
+
+use crate::world::Outcome;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+    sync::Arc,
+};
+
+/// Framing and verdicts of the bytes a client exchanges with the target.
+pub trait Protocol: fmt::Debug + Send + Sync {
+    /// `req` is a complete request: a server holding the connection without answering has hung.
+    fn request_complete(&self, req: &[u8]) -> bool;
+    /// `resp` is a complete response.
+    fn response_complete(&self, resp: &[u8]) -> bool;
+    /// A failure the response itself reveals, checked on every write.
+    fn verdict(&self, resp: &[u8]) -> Option<Outcome>;
+}
+
 /// Address a modelled client connects from: `127.0.0.1:CLIENT_PORT_BASE + id`.
 pub const CLIENT_PORT_BASE: u16 = 50000;
 /// Address a listener bound to port 0 gets.
@@ -95,12 +116,6 @@ impl Client {
     pub fn remaining(&self) -> usize {
         self.request.len() - self.sent
     }
-
-    /// Whether the request is syntactically complete HTTP/1.x (headers terminated, body as long
-    /// as declared), so a server holding the connection without answering has hung.
-    pub fn request_complete(&self) -> bool {
-        http_request_complete(&self.request)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -113,7 +128,10 @@ pub enum ClientEvent {
     Close(usize),
 }
 
-#[derive(Debug, Clone, Default)]
+/// What a client sends when the run has no corpus.
+const DEFAULT_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+#[derive(Debug, Clone)]
 pub struct Net {
     pub fds: BTreeMap<i32, ObjId>,
     pub objs: BTreeMap<ObjId, (Obj, u32)>,
@@ -122,13 +140,40 @@ pub struct Net {
     pub clients: Vec<Client>,
     /// Connections the run may open.
     pub max_clients: usize,
+    /// Requests a client may send (a `Payload` decision picks one).
+    pub requests: Arc<Vec<Vec<u8>>>,
+    pub protocol: Arc<dyn Protocol>,
+}
+
+impl Default for Net {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl Net {
+    /// HTTP/1 peers sending the default request.
     pub fn new(max_clients: usize) -> Self {
+        Self::with(max_clients, Vec::new(), Arc::new(Http1))
+    }
+
+    /// `max_clients` peers of `protocol`, each sending one request from `requests` (empty = a
+    /// default GET).
+    pub fn with(max_clients: usize, requests: Vec<Vec<u8>>, protocol: Arc<dyn Protocol>) -> Self {
+        let requests = if requests.is_empty() {
+            vec![DEFAULT_REQUEST.to_vec()]
+        } else {
+            requests
+        };
         Self {
+            fds: BTreeMap::new(),
+            objs: BTreeMap::new(),
+            next_obj: 0,
+            next_port: 0,
+            clients: Vec::new(),
             max_clients,
-            ..Self::default()
+            requests: Arc::new(requests),
+            protocol,
         }
     }
 
@@ -448,8 +493,8 @@ impl Net {
                     && !c.server_closed
                     && c.remaining() == 0
                     && c.rx.is_empty()
-                    && c.request_complete()
-                    && !http_response_complete(&c.response)
+                    && self.protocol.request_complete(&c.request)
+                    && !self.protocol.response_complete(&c.response)
             })
             .map(|(i, _)| i)
             .collect()
@@ -512,70 +557,19 @@ impl Net {
     }
 }
 
+/// HTTP/1.x request completeness (see [`Http1`]).
 pub fn http_request_complete(req: &[u8]) -> bool {
-    let Some(end) = find(req, b"\r\n\r\n") else {
-        return false;
-    };
-    let head = &req[..end];
-    let body = &req[end + 4..];
-    if let Some(len) = header_usize(head, b"content-length:") {
-        return body.len() >= len;
-    }
-    if header_contains(head, b"transfer-encoding:", b"chunked") {
-        return find(body, b"0\r\n\r\n").is_some();
-    }
-    true
+    Http1.request_complete(req)
 }
 
+/// HTTP/1.x response completeness (see [`Http1`]).
 pub fn http_response_complete(resp: &[u8]) -> bool {
-    if !resp.starts_with(b"HTTP/") {
-        return false;
-    }
-    let Some(end) = find(resp, b"\r\n\r\n") else {
-        return false;
-    };
-    let head = &resp[..end];
-    let body = &resp[end + 4..];
-    if let Some(len) = header_usize(head, b"content-length:") {
-        return body.len() >= len;
-    }
-    if header_contains(head, b"transfer-encoding:", b"chunked") {
-        return find(body, b"0\r\n\r\n").is_some();
-    }
-    true
+    Http1.response_complete(resp)
 }
 
 /// Status code of the first response line in `bytes`, if one starts there.
 pub fn http_status(bytes: &[u8]) -> Option<u16> {
-    let rest = bytes.strip_prefix(b"HTTP/1.")?;
-    let rest = rest.get(2..5)?;
-    std::str::from_utf8(rest).ok()?.parse().ok()
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-fn header_lines(head: &[u8]) -> impl Iterator<Item = &[u8]> {
-    head.split(|b| *b == b'\n')
-        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-}
-
-fn header_usize(head: &[u8], name: &[u8]) -> Option<usize> {
-    header_lines(head).find_map(|l| {
-        let lower: Vec<u8> = l.to_ascii_lowercase();
-        let v = lower.strip_prefix(name)?;
-        std::str::from_utf8(v).ok()?.trim().parse().ok()
-    })
-}
-
-fn header_contains(head: &[u8], name: &[u8], value: &[u8]) -> bool {
-    header_lines(head).any(|l| {
-        let lower: Vec<u8> = l.to_ascii_lowercase();
-        lower
-            .strip_prefix(name)
-            .is_some_and(|v| find(v, value).is_some())
-    })
+    http1::status(bytes)
 }
 
 #[cfg(test)]

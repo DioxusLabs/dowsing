@@ -1,15 +1,21 @@
 //! Supervisor-owned state of one execution: everything about the target that is not memory or
 //! registers. Plain data, cloned into every snapshot and swapped back on restore.
+//!
+//! [`World`] is the composition: the scheduler ([`crate::sched::Sched`]), the path's coverage
+//! and trace, the decision log, the oracle's evidence, and one field per installed model.
 
 use crate::{
-    net::{ClientEvent, Net},
-    ptrace::{Pid, Regs},
-    shm::Bitmap,
+    model::{Coverage, Ext, ModelId},
+    models::{entropy::Entropy, net::Net},
+    oracle::Oracle,
+    ptrace::Pid,
+    sched::Sched,
 };
 use std::fmt;
 
-/// `TraceEvent::thread` of an event caused by a modelled client rather than a target thread.
-pub const CLIENT_THREAD: usize = usize::MAX;
+pub use crate::model::WORLD_THREAD;
+pub use crate::sched::{Thread, ThreadState};
+
 /// Choices of a `Chunk` decision: deliver the rest, half of it, all but the last byte, or one
 /// byte. The two edge splits are the segment boundaries real stacks mishandle: a body (or a
 /// frame) whose last byte arrives late, and a header parser fed one byte at a time.
@@ -19,24 +25,19 @@ pub const CHUNK_CHOICES: u32 = 4;
 /// before it is preempted; 0 = run to its next natural stop. `n` is this bound.
 pub const BUDGET_MAX: u32 = 1 << 24;
 
-/// Virtual `CLOCK_MONOTONIC` at process start (1 s, so it is never zero).
-pub const CLOCK_START_NS: u64 = 1_000_000_000;
-/// Virtual time consumed by one clock read.
-pub const CLOCK_TICK_NS: u64 = 1_000;
-/// Virtual `CLOCK_REALTIME` base: 2026-01-01T00:00:00Z.
-pub const REALTIME_BASE_NS: u64 = 1_767_225_600 * 1_000_000_000;
-
+/// The decision vocabulary. Small and closed on purpose: a decision sequence is the test case,
+/// and replay and shrinking only need to know a decision's arity, not its meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
-    /// Which runnable thread runs next (or which timed waiter's timeout fires).
+    /// Which runnable thread runs next, which timer fires, or which external event happens.
     Schedule,
     /// How many coverage edges the chosen thread runs before forced preemption (exact).
     Budget,
     /// The target's own `dowsing_target_rt::variant(n)`.
     Variant,
-    /// Which corpus request a newly connected client sends.
+    /// Which corpus input an external actor (a peer) feeds the target.
     Payload,
-    /// How much of its remaining request a client delivers in one piece.
+    /// How much of its remaining input the actor delivers in one piece.
     Chunk,
 }
 
@@ -81,14 +82,14 @@ pub enum Outcome {
     /// A thread panicked (the default hook's message appeared on stderr); the process may
     /// have survived it, as a runtime that catches task panics does.
     Panic,
-    /// Every thread waits on the outside world and these clients' complete requests are
+    /// Every thread waits on the outside world and these peers' complete requests are
     /// unanswered with their connections still open.
     Hang {
         clients: Vec<usize>,
     },
-    /// The target answered a request with this 5xx status.
-    HttpError(u16),
-    /// Every thread waits on the outside world and the clients are done: a server's normal
+    /// A protocol-level failure in what the target sent (e.g. an HTTP 5xx status).
+    Protocol(String),
+    /// Every thread waits on the outside world and the peers are done: a server's normal
     /// end state.
     Quiescent,
 }
@@ -108,12 +109,13 @@ impl fmt::Display for Outcome {
             Outcome::Timeout => write!(f, "timeout"),
             Outcome::Panic => write!(f, "panic"),
             Outcome::Hang { clients } => write!(f, "hang(clients {clients:?})"),
-            Outcome::HttpError(code) => write!(f, "http({code})"),
+            Outcome::Protocol(what) => write!(f, "protocol({what})"),
             Outcome::Quiescent => write!(f, "quiescent"),
         }
     }
 }
 
+/// Where a thread's segment ended (see [`TraceEvent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Point {
     Start,
@@ -167,103 +169,37 @@ pub struct TraceEvent {
     pub guard: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadState {
-    /// In a ptrace stop, runnable.
-    Stopped,
-    Running,
-    /// Emulated futex wait; the syscall was skipped with `rax = 0` already written.
-    FutexWait {
-        addr: u64,
-        val: u32,
-        bitset: u32,
-        deadline: Option<u64>,
-        seq: u64,
-    },
-    /// Emulated `nanosleep`.
-    Sleep {
-        deadline: u64,
-        seq: u64,
-    },
-    /// Called `exit`; the syscall was skipped and the task is frozen forever. Kept so that
-    /// snapshots taken while it was alive stay restorable.
-    Parked,
-    /// Emulated `epoll_wait` with nothing to report yet.
-    EpollWait {
-        epfd: i32,
-        events: u64,
-        maxevents: usize,
-        deadline: Option<u64>,
-        seq: u64,
-    },
-    /// A blocking socket/eventfd/poll operation (registers in `Thread::blocked`) that would
-    /// block; retried whenever the network world changes, or timed out at `deadline`.
-    IoWait {
-        deadline: Option<u64>,
-        seq: u64,
-    },
-}
-
-impl ThreadState {
-    pub fn deadline(&self) -> Option<u64> {
-        match self {
-            ThreadState::FutexWait { deadline, .. }
-            | ThreadState::EpollWait { deadline, .. }
-            | ThreadState::IoWait { deadline, .. } => *deadline,
-            ThreadState::Sleep { deadline, .. } => Some(*deadline),
-            _ => None,
-        }
-    }
-
-    pub fn seq(&self) -> u64 {
-        match self {
-            ThreadState::FutexWait { seq, .. }
-            | ThreadState::Sleep { seq, .. }
-            | ThreadState::EpollWait { seq, .. }
-            | ThreadState::IoWait { seq, .. } => *seq,
-            _ => 0,
-        }
-    }
-
-    /// Waiting for something only the modelled outside world can provide.
-    pub fn waits_on_world(&self) -> bool {
-        matches!(
-            self,
-            ThreadState::EpollWait { .. } | ThreadState::IoWait { .. }
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Thread {
-    pub tid: Pid,
-    pub state: ThreadState,
-    /// `CLONE_CHILD_CLEARTID` address: zeroed and woken when the thread exits.
-    pub clear_tid: u64,
-    /// `child_tid` of a `clone` this thread is in the middle of.
-    pub pending_clone_ctid: u64,
-    /// Registers of the syscall an `IoWait` retries.
-    pub blocked: Option<Regs>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One option of a `Schedule` decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Candidate {
     /// Resume this runnable thread.
     Run(usize),
     /// Advance the clock to this waiter's deadline and wake it with a timeout.
     Fire(usize),
-    /// A modelled client acts.
-    Client(ClientEvent),
+    /// The world acts (a model injects an event).
+    Ext(Ext),
 }
 
 /// A decision the session is waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pending {
-    Schedule { candidates: Vec<Candidate> },
-    Budget { thread: usize },
-    Variant { thread: usize, n: u32 },
-    Payload { client: usize, n: u32 },
-    Chunk { client: usize },
+    Schedule {
+        candidates: Vec<Candidate>,
+    },
+    Budget {
+        thread: usize,
+    },
+    Variant {
+        thread: usize,
+        n: u32,
+    },
+    /// A model's own decision about one of its actors; answered by `Model::choose`.
+    Model {
+        model: ModelId,
+        kind: Kind,
+        actor: usize,
+        n: u32,
+    },
 }
 
 impl Pending {
@@ -272,8 +208,7 @@ impl Pending {
             Pending::Schedule { .. } => Kind::Schedule,
             Pending::Budget { .. } => Kind::Budget,
             Pending::Variant { .. } => Kind::Variant,
-            Pending::Payload { .. } => Kind::Payload,
-            Pending::Chunk { .. } => Kind::Chunk,
+            Pending::Model { kind, .. } => *kind,
         }
     }
 
@@ -281,106 +216,37 @@ impl Pending {
         match self {
             Pending::Schedule { candidates } => candidates.len() as u32,
             Pending::Budget { .. } => BUDGET_MAX,
-            Pending::Variant { n, .. } | Pending::Payload { n, .. } => *n,
-            Pending::Chunk { .. } => CHUNK_CHOICES,
+            Pending::Variant { n, .. } | Pending::Model { n, .. } => *n,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct World {
-    pub threads: Vec<Thread>,
-    pub current: Option<usize>,
-    pub last_ran: Option<usize>,
-    pub clock_ns: u64,
-    pub wait_seq: u64,
-    pub entropy_seq: u64,
-    /// Coverage bits set along this path.
-    pub coverage: Bitmap,
-    pub edges: u64,
-    pub edges_at_last_event: u64,
-    /// Id of the most recently executed edge (mirrors the shared mapping).
-    pub guard: u32,
+    pub sched: Sched,
+    pub cov: Coverage,
     pub trace: Vec<TraceEvent>,
     pub decisions: Vec<Decision>,
     pub pending: Option<Pending>,
     pub outcome: Option<Outcome>,
+    pub oracle: Oracle,
+    pub entropy: Entropy,
     pub net: Net,
-    /// A panic message has appeared on the target's stderr.
-    pub panicked: bool,
-    /// Timeouts fired with nothing runnable since the last time a thread ran; bounds the
-    /// virtual time an idle server with periodic timers can burn before a run ends.
-    pub idle_fires: u32,
 }
 
 impl World {
-    pub fn new(leader: Pid, max_clients: usize) -> Self {
+    pub fn new(leader: Pid, net: Net) -> Self {
         Self {
-            threads: vec![Thread {
-                tid: leader,
-                state: ThreadState::Stopped,
-                clear_tid: 0,
-                pending_clone_ctid: 0,
-                blocked: None,
-            }],
-            current: None,
-            last_ran: None,
-            clock_ns: CLOCK_START_NS,
-            wait_seq: 0,
-            entropy_seq: 0,
-            coverage: Bitmap::default(),
-            edges: 0,
-            edges_at_last_event: 0,
-            guard: 0,
+            sched: Sched::new(leader),
+            cov: Coverage::default(),
             trace: Vec::new(),
             decisions: Vec::new(),
             pending: None,
             outcome: None,
-            net: Net::new(max_clients),
-            panicked: false,
-            idle_fires: 0,
+            oracle: Oracle::default(),
+            entropy: Entropy::default(),
+            net,
         }
-    }
-
-    pub fn thread_index(&self, tid: Pid) -> Option<usize> {
-        self.threads.iter().position(|t| t.tid == tid)
-    }
-
-    pub fn runnable(&self) -> Vec<usize> {
-        self.threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.state == ThreadState::Stopped)
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    pub fn timed_waiters(&self) -> Vec<usize> {
-        let mut v: Vec<(u64, u64, usize)> = self
-            .threads
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.state.deadline().map(|d| (d, t.state.seq(), i)))
-            .collect();
-        v.sort();
-        v.into_iter().map(|(_, _, i)| i).collect()
-    }
-
-    pub fn waiters(&self) -> Vec<usize> {
-        self.threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| {
-                matches!(
-                    t.state,
-                    ThreadState::FutexWait { .. }
-                        | ThreadState::Sleep { .. }
-                        | ThreadState::EpollWait { .. }
-                        | ThreadState::IoWait { .. }
-                )
-            })
-            .map(|(i, _)| i)
-            .collect()
     }
 
     pub fn trace_hash(&self) -> u64 {
