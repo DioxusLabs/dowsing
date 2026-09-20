@@ -1,7 +1,9 @@
 # Spike `shrink-quality`: why `cautious()` stalls on `buggy_stack`, and how to fix it
 
-Status: design memo (no prototype yet). Branch `devin/spike/shrink-quality`, based on
-`devin/1789863721-linux-rtld-default` (`84b80ef`).
+Status: design memo, followed by the prototype on this branch. Branch `devin/spike/shrink-quality`,
+based on `devin/1789863721-linux-rtld-default` (`84b80ef`). Sections 1–6 are the original memo;
+§7 records where the prototype deviated from it and why. Final numbers are in `RESULTS.md`, build
+and run commands in `README.md`.
 
 ## TL;DR
 
@@ -355,3 +357,44 @@ public API addition and should be flagged).
 * `curious()` is untouched. `fork_case()` on the failing curious RNG carries the prefix and
   all spans into `cautious().with_case(case)`, so the structured spans recorded during
   discovery are what the reducer shrinks.
+
+## 7. What the prototype changed relative to this memo
+
+Commits: `039e8c9` (bench harness), `73d20dc` (example), `170ade2` (library), plus docs.
+
+* **Root-cause ranking was wrong in §TL;DR.** The memo put pass order + restart policy first and
+  byte-granular `adjust_first` second. The ablation (RESULTS.md) shows the opposite: with the old
+  pass order and always-reset, switching `adjust_first` to draw granularity alone takes
+  unstructured+cost from 1/10 to 8/10 seeds; the reorder alone (bytes-only adjust) moves 1/10 →
+  2/10. Reordering and the restart rule matter for *how fast* the reducer converges (max
+  `last_improvement_at` 4092 → 2106 → 1460 executions), not for whether it does.
+* **§1.1 "structured only" row.** The memo measured 6/5/5/5/6/6/6/6/6/6 for structured sampling
+  with `coverage()`. The committed harness measures 5 on all 10 seeds on the *base* library too.
+  The memo's scratch harness (uncommitted) is not reproducible, so the committed harness is the
+  reference. The ordering issue the memo described (a fewer-features case outranking a smaller
+  one) is real and is exactly what keeps seed 7 at 52 ops in the unstructured+`coverage()` row —
+  see RESULTS.md.
+* **`ResetKind` enum not added.** Same behaviour, simpler plumbing: `rng.rs` computes
+  `is_structural_improvement(previous_best, candidate)` (cost or byte length changed) and calls
+  either `reset_cautious_reducer_to_best` or the new `retarget_cautious_reducer_to_best`, which
+  swaps in the new best prefix/spans but keeps `pass_index`/`cursor`. No change to `run.rs`.
+* **`DeleteRange.adjust_first` alternatives** are emitted by `DrawDelete` and `TailTrim` (1 draw,
+  draws in window, window/2, deleted bytes, deduplicated). `WeightedBlockDelete` keeps the byte
+  count because its windows are not draw-aligned. The numeric adjustment is folded into
+  `ReductionId::target` so alternatives with different amounts are distinct candidates.
+* **Per-pass caps (step 4) were not needed.** Once deletion runs first, the shipped example and the
+  unstructured+cost row converge by execution ≤ 1460 of 4096; capping `DrawLength`/
+  `DictionaryRepair` would only save wall time after convergence.
+* **cmp8 pointer filter (step 5) not implemented.** With the new reducer, ASLR-on matrices were
+  identical to ASLR-off matrices on every seed and configuration tried, and three consecutive
+  ASLR-on runs of seed 3 (the memo's flaky seed) produced identical feature/weight/improvement
+  counts. There was no observable nondeterminism left to fix, so the change to `record_cmp` was
+  deferred to keep root-crate edits minimal.
+* **Tests.** Instead of a `ScriptedCapture` end-to-end shrink test, seven unit tests in
+  `src/iter/shrink.rs` pin the new pass order, `LengthProbe` first-draw-only behaviour (targets
+  `[0,1,2,3]`), the draw-granular alternatives and their dedup, numeric `adjust_first`
+  materialisation, the structural/cosmetic classifier, and that `retarget` keeps the cursor while
+  `reset` restarts it. The existing `cautious_draw_spans_prioritize_length_like_first_draw` test
+  passes unchanged.
+* **Root `README.md`** gained two short paragraphs (why `coverage_with_cost`, prefer
+  `range`/`variant` over raw `% n` draws) rather than a new section.

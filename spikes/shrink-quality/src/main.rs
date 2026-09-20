@@ -12,7 +12,8 @@
 //! - `HAVOC` (0/1, default 1): `CautiousOptions::with_havoc`.
 //! - `SEMANTIC` (0/1, default 1): `CautiousOptions::with_semantic_reductions`.
 //! - `DISCOVERY_CASES` (default 8192), `MINIMIZATION_CASES` (default 4096): budgets.
-//! - `VERBOSE` (0/1, default 0): print every accepted improvement during minimization.
+//! - `VERBOSE` (0/1, default 0): print every accepted improvement, the first 60 failing-but-not-better
+//!   candidates, and how many single-op deletions of the final case still fail.
 
 mod stack;
 

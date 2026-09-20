@@ -104,6 +104,10 @@ let coverage = variant
 Use `coverage_with_cost` for stable value-level preferences such as operation count, input length,
 or AST node count. Use `discard()` for variants that do not reproduce the target behavior at all.
 
+Without a cost, `cautious()` ranks by feature count before RNG bytes, so a case that fails early
+(and therefore runs less code) can beat a shorter case that fails late, and deletion can stall in
+that local minimum even when a much smaller reproducer exists.
+
 ## Structured Generation
 
 Generators can use typed structure builders around the bytes they draw from a `CaseRng`:
@@ -135,7 +139,9 @@ let reversed: Vec<u8> = items
 ```
 
 `cautious()` uses this structure to try length, item, and variant reductions before
-falling back to generic byte shrinking. Larger harnesses can tune this with
+falling back to generic byte shrinking. Plain `rng.random::<u8>() % n` draws still shrink, but each
+one costs 4 RNG bytes and carries no span, so prefer `range`/`variant` for sequence lengths and
+discriminants. Larger harnesses can tune this with
 `tuning::CautiousOptions::builder()` and `cautious().with_options(...)`, including reducer budget,
 candidate caps, draw/span limits, semantic reductions, and havoc fallback.
 
