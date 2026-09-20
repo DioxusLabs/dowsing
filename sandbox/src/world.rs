@@ -10,8 +10,10 @@ use std::fmt;
 
 /// `TraceEvent::thread` of an event caused by a modelled client rather than a target thread.
 pub const CLIENT_THREAD: usize = usize::MAX;
-/// Choices of a `Chunk` decision: deliver the rest, half of it, or one byte.
-pub const CHUNK_CHOICES: u32 = 3;
+/// Choices of a `Chunk` decision: deliver the rest, half of it, all but the last byte, or one
+/// byte. The two edge splits are the segment boundaries real stacks mishandle: a body (or a
+/// frame) whose last byte arrives late, and a header parser fed one byte at a time.
+pub const CHUNK_CHOICES: u32 = 4;
 
 /// A `Budget` decision's choice is the exact number of instrumented edges the thread runs
 /// before it is preempted; 0 = run to its next natural stop. `n` is this bound.
@@ -194,9 +196,10 @@ pub enum ThreadState {
         deadline: Option<u64>,
         seq: u64,
     },
-    /// A blocking socket/eventfd operation (registers in `Thread::blocked`) that would block;
-    /// retried whenever the network world changes.
+    /// A blocking socket/eventfd/poll operation (registers in `Thread::blocked`) that would
+    /// block; retried whenever the network world changes, or timed out at `deadline`.
     IoWait {
+        deadline: Option<u64>,
         seq: u64,
     },
 }
@@ -204,9 +207,9 @@ pub enum ThreadState {
 impl ThreadState {
     pub fn deadline(&self) -> Option<u64> {
         match self {
-            ThreadState::FutexWait { deadline, .. } | ThreadState::EpollWait { deadline, .. } => {
-                *deadline
-            }
+            ThreadState::FutexWait { deadline, .. }
+            | ThreadState::EpollWait { deadline, .. }
+            | ThreadState::IoWait { deadline, .. } => *deadline,
             ThreadState::Sleep { deadline, .. } => Some(*deadline),
             _ => None,
         }
@@ -217,7 +220,7 @@ impl ThreadState {
             ThreadState::FutexWait { seq, .. }
             | ThreadState::Sleep { seq, .. }
             | ThreadState::EpollWait { seq, .. }
-            | ThreadState::IoWait { seq } => *seq,
+            | ThreadState::IoWait { seq, .. } => *seq,
             _ => 0,
         }
     }

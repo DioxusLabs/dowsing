@@ -50,11 +50,16 @@ mode. Measured stop cost ≈ 10 µs; a stop is also a scheduling point, so cost 
 not per syscall.
 
 Traced set today: `futex clone clone3 sched_yield nanosleep clock_nanosleep clock_gettime
-gettimeofday time getrandom rseq exit exit_group munmap poll ppoll select pselect6 epoll_*`
-and the harness marker (`getppid(MAGIC, kind, n)`, which is how the target's
-`dowsing::variant` reaches the supervisor). `rseq` is refused with `ENOSYS` (per-task kernel
-state a snapshot cannot carry); `munmap` is traced for the retention rule in §4; the polling
-family is traced so that a blocking poll is *reported* as uncontrolled rather than silently
+gettimeofday time getrandom rseq exit exit_group munmap poll ppoll select pselect6 epoll_wait
+epoll_pwait epoll_pwait2 socket epoll_create epoll_create1 eventfd2 sched_getaffinity`, the
+harness marker (`getppid(MAGIC, kind, n)`, which is how the target's `dowsing::variant`
+reaches the supervisor), and the descriptor family (`read write readv writev recvfrom sendto
+recvmsg sendmsg close fcntl ioctl bind listen accept accept4 connect shutdown getsockname
+getpeername setsockopt getsockopt epoll_ctl dup dup3 fstat`) *only when `args[0]` is a virtual
+descriptor* (`>= 4096`, §9) — the BPF program compares the descriptor, so the target's ordinary
+files never stop. `rseq` is refused with `ENOSYS` (per-task kernel state a snapshot cannot
+carry); `munmap` is traced for the retention rule in §4; `select`/`pselect6` are traced but not
+modelled, so a target using them is *reported* as uncontrolled rather than silently
 nondeterministic. The mapping table is read from `/proc/pid/maps` at snapshot time, not
 tracked through `mmap`.
 
@@ -215,3 +220,65 @@ on two-thread targets (lost update, deadlock, timeout-dependent bug). Acceptance
 
 Not in milestone 1: net/fs models (they are `Syscall` decisions and a fd model in `world`, slot
 already there), parallel supervisors, musl/static targets, signals as decisions.
+
+## 9. Milestone 2: the network is part of the world
+
+Goal: run an unmodified axum/tokio server and find bugs through its socket API. The kernel's
+network stack is state the target can observe and a snapshot cannot carry (inv. 4), so it is
+replaced, not wrapped: `world.net` owns every descriptor the target gets from `socket`,
+`accept`, `epoll_create1`, `eventfd2` and `dup`, and everything those descriptors refer to.
+
+**Descriptors.** Virtual descriptors are numbered from 4096 so the BPF filter can tell them
+from the target's real files by one compare on `args[0]`; the kernel never sees them. Objects
+(`Socket { Fresh | Listening{backlog} | Connected{client, shut_wr} }`, `Epoll{interests}`,
+`EventFd{count}`) are reference counted so `dup`/`dup3`/`F_DUPFD` and close-the-last-one
+behave. `epoll_ctl` interests are per descriptor with edge-triggered state (`EPOLLET` arms on
+readiness *change*, level reports current readiness); `eventfd` is a counter with `EPOLLIN`
+when nonzero — that is all tokio's `mio` waker needs.
+
+**Clients** are the fuzzer's side of each connection: a request byte string, how much of it has
+been delivered (`rx`), whether FIN has been sent, and the bytes the server wrote back. They
+appear in the tree as decisions:
+
+- `Schedule` candidates now include `Client(Connect | Send(c) | Close(c))` next to `Run(t)` and
+  `Fire(timer)`, with PCT priorities of their own, so *when* a connection arrives relative to
+  the workers' progress is a searched choice;
+- `Payload(n)`: which corpus request a new connection carries (`--corpus dir`, one file per
+  request; `--request` for literals);
+- `Chunk`: how much of the remaining request `Send` delivers — all, half, all but one byte, or
+  one byte — so a body split across `read()`s is one decision, not a network accident. A partial
+  delivery demotes the client's priority, so the server gets to run on the fragment.
+
+`Close` is only offered after the whole request is delivered (a client that closes early is a
+legitimate but different test, and it dominated the early rollouts).
+
+**Blocking.** `read`/`recvfrom`/`accept` on an empty blocking socket, `epoll_wait` with nothing
+ready and `poll`/`ppoll` on virtual descriptors park the thread as `IoWait { deadline, seq }` /
+`EpollWait { .. }` with the entry registers saved; a network change (`deliver`, `connect`, FIN,
+server write) re-runs the emulation of every parked call and completes the ones now satisfied;
+a deadline is a timer candidate like any `FutexWait` deadline, and firing it completes the call
+with the timeout result. So a std server that `poll(fds, 1, 50ms)`s in a loop is a sequence of
+`IoWait → Fire | Client(..)` decisions with no wall-clock sleeping. `poll` over kernel
+descriptors is left alone when it cannot block (timeout 0) and reported as uncontrolled
+otherwise; a mixed set is reported.
+
+**Oracles**, all on the world: a `panicked at` line on the target's stderr (`Outcome::Panic`);
+an HTTP status ≥ 500 in a client's response (`Outcome::HttpError`); a client whose request was
+fully read but that never got a response once nothing is runnable and the idle timers have been
+fired (`Outcome::Hang { clients }`). Repeated equivalent failures (same outcome and first
+stderr line) get no novelty credit, so `--keep-going` keeps searching for a *different* one.
+
+**Snapshot/restore** is unchanged: `world.net` is plain data in `World: Clone`, restored with
+the rest of the supervisor state; nothing about a connection lives in the kernel.
+
+Measured (`sandbox/compare/README.md`, "axum" section): an unmodified axum 0.8 server on a
+2-worker tokio runtime, ~13 000 instrumented edges, runs at 65–105 searches/s with 32-decision
+snapshot spacing; the check-then-act lost update across an `await` is found in 5 / 28 / 26 runs
+and the split-body 500 in 66 / 8 / 3 runs (three seeds), each replaying with one trace hash.
+The same race *without* an await (a few dozen instructions between two uncontended atomics)
+is found by one seed in three, after 10 856 runs / 364 s; the other two find nothing in
+~14 400 runs / 600 s (native stress finds it in 21–204 rounds): the preemption has to land on
+a handful of edges in a syscall-free segment of hundreds to thousands, and the budget fan-out
+samples 8 of them per node. That is the next search problem — preempt where the segment
+touches shared memory (atomics, lock words), not uniformly — and it is measured here so the
+gap is not hidden.

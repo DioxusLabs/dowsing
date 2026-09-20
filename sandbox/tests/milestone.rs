@@ -2,7 +2,7 @@
 //! `build-targets.sh`). Sessions share `waitpid(-1)`, so tests that spawn a target serialize
 //! on a mutex.
 
-use dowsing_sandbox::{Budget, Event, Kind, Options, Outcome, Search, Session};
+use dowsing_sandbox::{Budget, Event, Kind, Options, Outcome, Point, Search, Session};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, Once};
@@ -324,8 +324,10 @@ fn axum_serves_a_request_through_virtual_sockets() {
     );
 }
 
-/// Two `POST /inc` and a `GET /check` from three clients: the search finds the schedule that
-/// loses an update (the server's own assertion), replays it bit-identically and shrinks it.
+/// Two `POST /inc` and a `GET /check` from three clients: the search finds the schedule
+/// (connection order, delivery, worker interleaving, timer firing) that loses an update
+/// across the handler's await, which the server's own assertion reports; then replays it
+/// bit-identically and shrinks it.
 #[test]
 fn axum_lost_update_found_via_sockets_replayed_and_shrunk() {
     let (_g, bin) = target("axum_counter");
@@ -374,4 +376,62 @@ fn axum_lost_update_found_via_sockets_replayed_and_shrunk() {
         search.replay(&small_choices).unwrap().outcome,
         Outcome::Panic
     );
+}
+
+/// A blocking std server that `poll`s its listener with a timeout: the poll blocks on the
+/// world, its timeout is a schedulable timer, a connection makes it ready, and the
+/// blocking accept/read/write complete against the virtual socket. The search then finds the
+/// request that panics the server.
+#[test]
+fn poll_server_served_through_virtual_sockets_and_search_finds_the_panic() {
+    let (_g, bin) = target("poll_server");
+    let ok: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    let boom: &[u8] = b"GET /boom HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    {
+        let mut s = spawn_axum(&bin, 1, &[ok]);
+        let (outcome, _, _) = run_default(&mut s);
+        assert_eq!(outcome, Outcome::Quiescent);
+        assert!(s.uncontrolled.is_empty(), "{:?}", s.uncontrolled);
+        let c = &s.world.net.clients[0];
+        assert_eq!(dowsing_sandbox::net::http_status(&c.response), Some(200));
+        assert!(c.response.ends_with(b"GET / HTTP/1.1\n"));
+        let points: Vec<Point> = s.world.trace.iter().map(|e| e.point).collect();
+        assert!(
+            points.contains(&Point::IoWait),
+            "poll never blocked: {points:?}"
+        );
+        assert!(
+            points.contains(&Point::IoWoken),
+            "poll never woke: {points:?}"
+        );
+        assert!(
+            points.contains(&Point::Timeout),
+            "poll never timed out: {points:?}"
+        );
+    }
+
+    let mut search = Search::new(spawn_axum(&bin, 1, &[ok, boom]), 1).expect("root");
+    let budget = Budget {
+        runs: 50,
+        wall: Duration::from_secs(60),
+        stop_on_failure: true,
+    };
+    search.run(&budget).expect("search");
+    let failure = search.stats.failures.first().expect("panic not found");
+    assert_eq!(failure.outcome, Outcome::Exited(101));
+    assert!(
+        failure.stderr.contains("boom requested"),
+        "{}",
+        failure.stderr
+    );
+    let choices: Vec<u32> = failure.decisions.iter().map(|d| d.choice).collect();
+    let hashes: HashSet<u64> = (0..3)
+        .map(|_| {
+            let r = search.replay(&choices).expect("replay");
+            assert_eq!(r.outcome, Outcome::Exited(101));
+            r.trace_hash
+        })
+        .collect();
+    assert_eq!(hashes.len(), 1, "replay is not deterministic");
 }

@@ -1,5 +1,6 @@
-//! Uses a syscall the supervisor traces but does not model (`poll`), so the run is reported
-//! as uncontrolled rather than silently treated as deterministic.
+//! Uses a syscall the supervisor traces but does not model (a blocking `poll` on a kernel
+//! descriptor), so the run is reported as uncontrolled rather than silently treated as
+//! deterministic.
 
 use std::os::fd::AsRawFd;
 

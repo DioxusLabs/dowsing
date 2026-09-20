@@ -16,4 +16,4 @@ pub mod world;
 
 pub use session::{Event, Options, Session};
 pub use tree::{Budget, Search, Stats};
-pub use world::{Decision, Kind, Outcome};
+pub use world::{Decision, Kind, Outcome, Point};

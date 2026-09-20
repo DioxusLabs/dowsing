@@ -30,6 +30,8 @@ pub const TRACED_SYSCALLS: &[libc::c_long] = &[
     libc::SYS_epoll_pwait2,
     libc::SYS_poll,
     libc::SYS_ppoll,
+    // Not modelled (no Rust runtime uses them); traced so a target that does is reported
+    // as uncontrolled instead of blocking in the kernel on a virtual descriptor.
     libc::SYS_select,
     libc::SYS_pselect6,
     libc::SYS_socket,

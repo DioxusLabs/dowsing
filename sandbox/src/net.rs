@@ -175,10 +175,10 @@ impl Net {
         self.objs.get_mut(&id).map(|(o, _)| o)
     }
 
-    /// Close one descriptor; when the last one goes the object is dropped. Returns the
-    /// affected client if a connection was closed.
-    pub fn close(&mut self, fd: i32) -> Result<Option<usize>, ()> {
-        let id = self.fds.remove(&fd).ok_or(())?;
+    /// Close one descriptor; when the last one goes the object is dropped. `None` for an
+    /// unknown descriptor (EBADF); otherwise the affected client if a connection was closed.
+    pub fn close(&mut self, fd: i32) -> Option<Option<usize>> {
+        let id = self.fds.remove(&fd)?;
         for (o, _) in self.objs.values_mut() {
             if let Obj::Epoll { interests } = o {
                 interests.remove(&fd);
@@ -187,10 +187,10 @@ impl Net {
         let (_, refs) = self.objs.get_mut(&id).expect("dangling fd");
         *refs -= 1;
         if *refs > 0 {
-            return Ok(None);
+            return Some(None);
         }
         let (obj, _) = self.objs.remove(&id).expect("object");
-        Ok(match obj {
+        Some(match obj {
             Obj::Socket {
                 state: SockState::Connected { client, .. },
                 ..
@@ -640,7 +640,7 @@ mod tests {
         net.clients[c].fin = true;
         net.signal(sobj, EPOLLIN | EPOLLRDHUP);
         assert_eq!(net.epoll_poll(ep, 16), vec![(EPOLLIN | EPOLLRDHUP, 9)]);
-        assert_eq!(net.close(s), Ok(Some(c)));
+        assert_eq!(net.close(s), Some(Some(c)));
         assert!(net.clients[c].server_closed);
         assert!(
             matches!(net.get(ep), Some(Obj::Epoll { interests }) if !interests.contains_key(&s))
@@ -659,9 +659,9 @@ mod tests {
         let ep2 = net.dup(ep, VFD_BASE).unwrap();
         assert_ne!(ep, ep2);
         assert_eq!(net.obj_of(ep), net.obj_of(ep2));
-        assert_eq!(net.close(ep), Ok(None));
+        assert_eq!(net.close(ep), Some(None));
         assert!(net.get(ep2).is_some());
-        assert_eq!(net.close(ep2), Ok(None));
+        assert_eq!(net.close(ep2), Some(None));
         assert!(net.objs.is_empty());
     }
 
@@ -686,6 +686,77 @@ mod tests {
             .extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
         assert!(net.hung_clients().is_empty());
         assert_eq!(http_status(&net.clients[c].response), Some(200));
+    }
+
+    #[test]
+    fn eventfd_readiness_follows_the_counter() {
+        let mut net = Net::new(0);
+        let ev = net.create(
+            Obj::EventFd {
+                count: 0,
+                nonblock: true,
+            },
+            VFD_BASE,
+        );
+        let ep = net.create(
+            Obj::Epoll {
+                interests: BTreeMap::new(),
+            },
+            VFD_BASE,
+        );
+        assert_eq!(net.ready(ev), EPOLLOUT);
+        assert_eq!(
+            net.epoll_ctl(ep, libc::EPOLL_CTL_ADD, ev, EPOLLIN | EPOLLET, 1),
+            0
+        );
+        assert!(net.epoll_poll(ep, 16).is_empty());
+        let obj = net.obj_of(ev).unwrap();
+        match net.get_mut(ev) {
+            Some(Obj::EventFd { count, .. }) => *count += 1,
+            _ => unreachable!(),
+        }
+        net.signal(obj, EPOLLIN);
+        assert_eq!(net.ready(ev), EPOLLIN | EPOLLOUT);
+        assert_eq!(net.epoll_poll(ep, 16), vec![(EPOLLIN, 1)]);
+        assert!(net.epoll_poll(ep, 16).is_empty(), "edge consumed");
+        match net.get_mut(ev) {
+            Some(Obj::EventFd { count, .. }) => *count = 0,
+            _ => unreachable!(),
+        }
+        assert_eq!(net.ready(ev), EPOLLOUT);
+        assert_eq!(net.epoll_ctl(ep, libc::EPOLL_CTL_MOD, ev, EPOLLIN, 2), 0);
+        assert!(net.epoll_poll(ep, 16).is_empty(), "level, not readable");
+    }
+
+    #[test]
+    fn connection_readiness_through_fin_and_shutdown() {
+        let mut net = Net::new(1);
+        let l = listener(&mut net);
+        let (c, _) = net.connect(b"GET / HTTP/1.1\r\n\r\n".to_vec()).unwrap();
+        let (s, _) = net.accept(l, false).unwrap();
+        assert!(!net.nonblock(s));
+        assert_eq!(net.ready(s), EPOLLOUT, "nothing to read yet");
+        net.deliver(c, 3);
+        assert_eq!(net.clients[c].rx.len(), 3);
+        assert_eq!(net.ready(s), EPOLLIN | EPOLLOUT);
+        net.clients[c].rx.clear();
+        net.clients[c].fin = true;
+        assert_eq!(
+            net.ready(s),
+            EPOLLIN | EPOLLOUT | EPOLLRDHUP,
+            "EOF is readable"
+        );
+        match net.get_mut(s) {
+            Some(Obj::Socket {
+                state: SockState::Connected { shut_wr, .. },
+                ..
+            }) => *shut_wr = true,
+            _ => unreachable!(),
+        }
+        assert_eq!(net.ready(s), EPOLLIN | EPOLLRDHUP | EPOLLHUP);
+        assert_eq!(net.close(s), Some(Some(c)));
+        assert_eq!(net.close(s), None, "EBADF on the second close");
+        assert_eq!(net.ready(s), 0);
     }
 
     #[test]

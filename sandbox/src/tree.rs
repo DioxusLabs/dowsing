@@ -236,6 +236,22 @@ impl Policy {
         self.lowest -= 1;
         self.prio[thread] = self.lowest;
     }
+
+    /// A timer that fired goes to the back: a periodic timer wins over the clients at most
+    /// once per rollout unless the search picks it again explicitly.
+    fn demote_timer(&mut self, rng: &mut SmallRng, thread: usize) {
+        self.ensure(rng, thread);
+        self.lowest -= 1;
+        self.timer_prio[thread] = self.lowest;
+    }
+
+    /// A segment boundary is the network preempting the client: the rest of its request
+    /// arrives after everything else that is ready has run.
+    fn demote_client(&mut self, rng: &mut SmallRng, client: usize) {
+        self.ensure_client(rng, client);
+        self.lowest -= 1;
+        self.client_prio[client] = self.lowest;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -332,6 +348,9 @@ pub struct Search {
     pub nodes: Vec<Node>,
     seen: Bitmap,
     sched_seen: HashSet<u64>,
+    /// Failures already found, by outcome and panic message: rediscovering one earns no credit,
+    /// so the search moves on instead of enumerating schedules that all end the same way.
+    failures_seen: HashSet<String>,
     /// Largest edge total of any completed run: the PCT horizon `k`.
     k_est: u64,
     /// Per thread, the most edges it has executed in one run.
@@ -388,6 +407,7 @@ impl Search {
             nodes: vec![root],
             seen: Bitmap::default(),
             sched_seen: HashSet::new(),
+            failures_seen: HashSet::new(),
             k_est: 64,
             thread_est: Vec::new(),
             rng: SmallRng::seed_from_u64(seed),
@@ -579,13 +599,10 @@ impl Search {
                 self.rng.random_range(0..*n)
             }
             // Mostly whole requests; the search, not the rollout, is what tries fragments.
-            Some(Pending::Chunk { .. }) => {
-                if self.rng.random_range(0..4) == 0 {
-                    self.rng.random_range(1..CHUNK_CHOICES)
-                } else {
-                    0
-                }
+            Some(Pending::Chunk { .. }) if self.rng.random_range(0..4) == 0 => {
+                self.rng.random_range(1..CHUNK_CHOICES)
             }
+            Some(Pending::Chunk { .. }) => 0,
             None => 0,
         }
     }
@@ -680,6 +697,17 @@ impl Search {
         );
         loop {
             let mark = self.session.world.trace.len();
+            match self.session.world.pending.as_ref() {
+                Some(Pending::Chunk { client }) if choice != 0 => {
+                    policy.demote_client(&mut self.rng, *client);
+                }
+                Some(Pending::Schedule { candidates }) => {
+                    if let Some(Candidate::Fire(thread)) = candidates.get(choice as usize) {
+                        policy.demote_timer(&mut self.rng, *thread);
+                    }
+                }
+                _ => {}
+            }
             self.session.choose(choice)?;
             let ev = self.session.step()?;
             self.stats.executed_decisions += 1;
@@ -711,13 +739,22 @@ impl Search {
                     self.close_upwards(node);
                     // The first run's features are the program's baseline, not a merit of
                     // the path it happened to take.
-                    let credit = if self.stats.runs == 1 { 0 } else { fresh_total };
+                    let decisions = self.session.decisions().to_vec();
+                    let stderr = self.session.take_stderr();
+                    let known = !outcome.is_ok()
+                        && !self.failures_seen.insert(format!(
+                            "{outcome} {}",
+                            stderr.trim().lines().nth(1).unwrap_or("")
+                        ));
+                    let credit = if self.stats.runs == 1 || known {
+                        0
+                    } else {
+                        fresh_total
+                    };
                     for n in &path {
                         self.nodes[*n].visits += 1;
                         self.nodes[*n].novelty += credit;
                     }
-                    let decisions = self.session.decisions().to_vec();
-                    let stderr = self.session.take_stderr();
                     if !outcome.is_ok() {
                         self.stats.failures.push(Failure {
                             outcome: outcome.clone(),

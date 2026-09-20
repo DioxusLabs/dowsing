@@ -1,0 +1,6 @@
+POST /sum HTTP/1.1
+Host: x
+Content-Type: application/json
+Content-Length: 20
+
+{"xs":[1,2,3,4,5,6]}

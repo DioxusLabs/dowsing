@@ -86,6 +86,61 @@ stack pages as dirty) it was 33/s on T1 and 30/s on T4; the fix is what makes th
   the minimal interleaving is ~4 decisions; the shrinker does not yet merge adjacent
   preemption budgets (DESIGN.md §8).
 
+## A real program: axum through the socket API
+
+`sandbox/targets/src/bin/axum_counter.rs` is an unmodified axum 0.8 service on a 2-worker
+tokio runtime (~13 000 instrumented edges; the only sandbox-specific line is
+`dowsing_target_rt::init()`, which keeps the sancov callbacks linked). The sandbox plays the
+HTTP clients: connection order, which corpus request each carries, how the bytes are split
+across `read()`s, when a client closes, plus the workers' interleaving and the runtime's timers
+are all decisions in one tree; the kernel network stack is never involved (`docs/DESIGN.md` §9).
+Oracles: the server's own `assert!` (panic on stderr), any HTTP 5xx, an unanswered request.
+
+Three bugs, `./run.sh axum`, seeds 1–3, raw lines in `results.txt`:
+
+| bug | native (real sockets, python client: 2 concurrent POSTs + GET /check per round) | sandbox: runs to first failure, wall | replay | shrink (non-default choices) |
+|---|---|---|---|---|
+| A1 `POST /inc`: read counter, `await` an audit call, write counter+1 (lost update) | found in round 1 (3 requests), 3/3 tries — the await makes it near-certain | **5 / 28 / 26 runs, 0.05 / 0.40 / 0.39 s** | 10/10 one trace hash, 3–4 ms each | 61→50 / 65→64 / 104→93 |
+| A2 `POST /sum`: parses the first body frame as the whole JSON body (500 on a split body) | not found: over loopback a 20-byte body is always one segment; needs a client that fragments | **66 / 8 / 3 runs, 0.92 / 0.12 / 0.04 s** (the `Chunk` decision delivers half / all-but-one / one byte) | 10/10 one trace hash, 1–4 ms each | 37→20 / 64→22 / 85→84 |
+| A3 `POST /inc_nowait`: same as A1 with no await — a few dozen instructions between two atomics | found in 21 / 99 / 204 rounds (63–612 requests), ≤0.2 s | **0 in 14 505 runs / 600 s; 0 in 14 375 / 600 s; found on run 10 856 (364 s)** | 10/10 one trace hash (seed 3), 17 ms each | 64→48 |
+
+Throughput 65–105 runs/s at `--snapshot-every 32` for the short searches (a run is a full
+request/response exchange on a fresh restore), 24–30/s over the 600 s ones as the tree deepens,
+against 400–780/s on the two-thread targets: the axum runs are 50–200 decisions deep and each
+restore rewrites more pages.
+
+Reading it:
+
+- **A2 is the case that needs this kind of tool**: no amount of native load finds a framing
+  bug that loopback never triggers, and it is not a schedule bug either. Here it is one
+  `Chunk` decision, found in 3–66 runs, and the shrunk case says exactly which delivery split
+  it (`explore ... --corpus sandbox/corpus/axum --seed 3` prints it).
+- **A1 shows the search working on a real runtime** — two workers, hyper, tokio's timer wheel
+  and I/O driver, mio's eventfd waker, all under the supervisor with zero uncontrolled
+  syscalls — but the bug itself is easy: the await hands the worker back to the scheduler, and
+  the other connection's handler runs in the gap. Native finds it in one round.
+- **A3 is where the sandbox loses, and by a lot.** The window is a handful of edges inside a
+  syscall-free segment that spans hyper's parse, the handler and hyper's encode (hundreds to
+  thousands of edges; the whole binary has 13 075); the preemption must land there *and* the
+  other worker must be holding the second request. Budget candidates are one per
+  distinct edge of the segment and `--fanout 8` samples eight of them per node, so most rollouts
+  preempt somewhere useless and the interleaving-novelty signal is spread over thousands of
+  equally-new points; one seed in three gets there after ~11 000 runs. The kernel scheduler, by
+  contrast, preempts on timer ticks and the two hyper tasks are genuinely parallel on two
+  cores, so ~1 in 100 rounds hits. What would close
+  this: preempt only where the segment touches shared memory (atomic RMW / lock words, which
+  the target runtime can flag next to the edge id) instead of uniformly over edges — the same
+  observation as T1's 60→5 runs, one level down.
+- **Shrink on a 50–100-decision case reduces the non-default choices by 1–65 %** within its
+  400-run budget and sometimes leaves the total longer (a different path has more decision
+  points): the objective is non-default choices, and deleting a decision shifts every later
+  one. Adequate for A2 (20 choices), not for A1.
+- **Cost of running the real thing**: 24–105 runs/s means a 600 s budget is ~15 000–60 000
+  runs; native stress does that many requests in a few seconds. The sandbox pays this for determinism
+  (one trace hash on every replay above) and for control over the protocol; it only wins where
+  that control is what the bug needs (A2) or where the schedule is reachable in its tree (A1,
+  T1–T3).
+
 ## Not in the matrix
 
 - **AFL++ / libFuzzer / cargo-fuzz**: input-byte fuzzers. These targets take no input; the task
@@ -102,7 +157,9 @@ stack pages as dirty) it was 33/s on T1 and 30/s on T4; the fix is what makes th
 sandbox/build-targets.sh
 cd sandbox/compare
 ./run.sh                          # all sections → results.txt
-./run.sh sandbox snapshot         # subsets: native rr sandbox loom shuttle snapshot tsan
+./run.sh sandbox snapshot         # subsets: native rr sandbox loom shuttle snapshot tsan axum
+./run.sh axum                     # axum rows (needs python3; ~30 min, most of it the A3 600 s budgets)
+python3 axum_native_stress.py ../targets/target/release/axum_counter 60 /inc_nowait   # native A1/A3 baseline
 HERMIT=/path/to/hermit ./hermit_sweep.sh 100   # hermit row (build notes in the script header)
 ../sweep.sh 10 2000 [--pct-depth D --fanout N --ucb C]   # sandbox runs-to-failure over 10 seeds
 CRIU=/path/to/criu ./run.sh snapshot   # CRIU ≥ 4.x (Ubuntu's 3.16 segfaults on restore); needs passwordless sudo

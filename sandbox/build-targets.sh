@@ -5,7 +5,7 @@
 # __sanitizer_cov_* callbacks) and std stay uninstrumented. Binaries: targets/target/release/.
 set -euo pipefail
 cd "$(dirname "$0")/targets"
-BINS="${*:-lost_update deadlock sleep_race uncontrolled slow_setup axum_counter}"
+BINS="${*:-lost_update deadlock sleep_race uncontrolled slow_setup axum_counter poll_server}"
 for bin in $BINS; do
     cargo rustc --release --bin "$bin" -- \
         -Cpasses=sancov-module \

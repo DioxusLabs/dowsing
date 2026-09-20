@@ -479,12 +479,13 @@ impl Session {
         if candidates.is_empty() && clients.is_empty() {
             return self.handle_idle();
         }
-        // Timers stop being offered once they have fired MAX_IDLE_FIRES times with no client
-        // action: a periodic timer must not let a run outlast its clients.
+        candidates.extend(clients.into_iter().map(Candidate::Client));
+        // Timers come after the clients so the default choice drives the protocol forward, and
+        // stop being offered once they have fired MAX_IDLE_FIRES times with no client action: a
+        // periodic timer must not let a run outlast its clients.
         if self.world.idle_fires < net::MAX_IDLE_FIRES {
             candidates.extend(self.world.timed_waiters().into_iter().map(Candidate::Fire));
         }
-        candidates.extend(clients.into_iter().map(Candidate::Client));
         if candidates.len() >= 2 {
             self.world.pending = Some(Pending::Schedule { candidates });
             return Ok(());
@@ -974,8 +975,6 @@ impl Session {
                 self.world.outcome = Some(Outcome::Exited((regs.rdi & 0xff) as i32));
                 Ok(())
             }
-            // Non-blocking poll (std's startup fd check) cannot reorder anything.
-            n if n == libc::SYS_poll && regs.rdx == 0 => ptrace::cont(tid, 0),
             n if net::is_net_syscall(n) => self.handle_net(index, &mut regs),
             n => {
                 self.uncontrolled

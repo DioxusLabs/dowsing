@@ -6,7 +6,8 @@
 
 use super::*;
 use crate::net::{
-    CLIENT_PORT_BASE, ClientEvent, EPOLLIN, EPOLLRDHUP, Net, Obj, SockState, http_status,
+    CLIENT_PORT_BASE, ClientEvent, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLRDHUP, Net, Obj, SockState,
+    http_status,
 };
 
 /// Result of emulating one syscall.
@@ -17,6 +18,8 @@ enum Emu {
     Block,
     /// Not modelled: let the kernel run it and report it.
     Pass,
+    /// Touches only kernel descriptors and cannot block: let the kernel run it, nothing to report.
+    Kernel,
 }
 
 const SOCK_NONBLOCK_FLAG: u64 = 0o4000;
@@ -39,9 +42,14 @@ pub(super) fn is_net_syscall(nr: i64) -> bool {
             libc::SYS_epoll_wait,
             libc::SYS_epoll_pwait,
             libc::SYS_epoll_pwait2,
+            libc::SYS_poll,
+            libc::SYS_ppoll,
         ]
         .contains(&nr)
 }
+
+const POLLFD_BYTES: usize = 8;
+const POLLNVAL: u16 = 0x20;
 
 impl Session {
     /// Seccomp stop on a network syscall: emulate it, then either let the thread run on (the
@@ -55,6 +63,7 @@ impl Session {
                 Emu::Ret(v) => format!("{v}"),
                 Emu::Block => "block".into(),
                 Emu::Pass => "pass".into(),
+                Emu::Kernel => "kernel".into(),
             };
             eprintln!(
                 "[sandbox] T{index} net syscall {nr}({}, {:#x}, {}) -> {r}",
@@ -92,6 +101,7 @@ impl Session {
                 }
             }
             Emu::Block => {
+                let entry = *regs;
                 self.skip_syscall(tid, regs, 0)?;
                 self.world.wait_seq += 1;
                 let seq = self.world.wait_seq;
@@ -111,8 +121,9 @@ impl Session {
                         Point::EpollWait
                     }
                     _ => {
-                        self.world.threads[index].blocked = Some(*regs);
-                        self.world.threads[index].state = ThreadState::IoWait { seq };
+                        let deadline = self.poll_deadline(nr, regs)?;
+                        self.world.threads[index].blocked = Some(entry);
+                        self.world.threads[index].state = ThreadState::IoWait { deadline, seq };
                         Point::IoWait
                     }
                 };
@@ -125,6 +136,7 @@ impl Session {
                     .push(format!("syscall {nr} passed through on T{index}"));
                 ptrace::cont(tid, 0)
             }
+            Emu::Kernel => ptrace::cont(tid, 0),
         }
     }
 
@@ -142,6 +154,74 @@ impl Session {
         }
         let ms = regs.r10 as i32;
         Ok((ms >= 0).then(|| self.world.clock_ns.saturating_add(ms as u64 * 1_000_000)))
+    }
+
+    /// Deadline of a blocking `poll`/`ppoll`; every other blocking call waits indefinitely.
+    fn poll_deadline(&self, nr: i64, regs: &Regs) -> io::Result<Option<u64>> {
+        if nr == libc::SYS_poll {
+            let ms = regs.rdx as i32;
+            return Ok((ms >= 0).then(|| self.world.clock_ns.saturating_add(ms as u64 * 1_000_000)));
+        }
+        if nr == libc::SYS_ppoll && regs.rdx != 0 {
+            let ns = self.read_timespec_ns(regs.rdx)?;
+            return Ok(Some(self.world.clock_ns.saturating_add(ns)));
+        }
+        Ok(None)
+    }
+
+    /// `poll`/`ppoll` over a set of virtual descriptors: readiness is the same as epoll's.
+    /// A set of kernel descriptors that cannot block (zero timeout, e.g. std's startup check
+    /// of fds 0-2) is the kernel's; a set mixing virtual and kernel descriptors cannot be
+    /// split, so it passes through unmodelled.
+    fn do_poll(&mut self, regs: &Regs) -> io::Result<Emu> {
+        let nfds = (regs.rsi as usize).min(1024);
+        let mut buf = vec![0u8; nfds * POLLFD_BYTES];
+        ptrace::read_mem(self.leader, regs.rdi, &mut buf)?;
+        let zero_timeout = if regs.orig_rax as i64 == libc::SYS_poll {
+            regs.rdx as i32 == 0
+        } else {
+            regs.rdx != 0 && self.read_timespec_ns(regs.rdx)? == 0
+        };
+        let (pollfds, _) = buf.as_chunks_mut::<POLLFD_BYTES>();
+        let fds = pollfds
+            .iter()
+            .map(|pfd| i32::from_ne_bytes(pfd[..4].try_into().unwrap()));
+        let (mut virtual_fds, mut kernel_fds) = (false, false);
+        for fd in fds.filter(|fd| *fd >= 0) {
+            if Net::is_virtual(fd) {
+                virtual_fds = true;
+            } else {
+                kernel_fds = true;
+            }
+        }
+        if kernel_fds {
+            return Ok(if virtual_fds || !zero_timeout {
+                Emu::Pass
+            } else {
+                Emu::Kernel
+            });
+        }
+        let mut ready = 0;
+        for pfd in pollfds.iter_mut() {
+            let fd = i32::from_ne_bytes(pfd[..4].try_into().unwrap());
+            let events = u16::from_ne_bytes(pfd[4..6].try_into().unwrap()) as u32;
+            let revents = if fd < 0 {
+                0
+            } else if self.world.net.get(fd).is_none() {
+                POLLNVAL as u32
+            } else {
+                self.world.net.ready(fd) & (events | EPOLLERR | EPOLLHUP)
+            };
+            if revents != 0 {
+                ready += 1;
+            }
+            pfd[6..8].copy_from_slice(&(revents as u16).to_ne_bytes());
+        }
+        if ready == 0 && !zero_timeout {
+            return Ok(Emu::Block);
+        }
+        ptrace::write_mem(self.leader, regs.rdi, &buf)?;
+        Ok(Emu::Ret(ready))
     }
 
     /// The network world changed: complete the waits it satisfies.
@@ -170,7 +250,7 @@ impl Session {
                     let ret = match self.emulate(i, &regs)? {
                         Emu::Ret(v) => v,
                         Emu::Block => continue,
-                        Emu::Pass => -(libc::EBADF as i64),
+                        Emu::Pass | Emu::Kernel => -(libc::EBADF as i64),
                     };
                     self.set_return(i, ret)?;
                     self.world.threads[i].blocked = None;
@@ -226,7 +306,9 @@ impl Session {
         let mut buf = vec![0u8; count * 16];
         ptrace::read_mem(self.leader, iov, &mut buf)?;
         Ok(buf
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     u64::from_ne_bytes(c[..8].try_into().unwrap()),
@@ -385,6 +467,7 @@ impl Session {
                 },
                 crate::net::VFD_BASE,
             ) as i64),
+            n if n == libc::SYS_poll || n == libc::SYS_ppoll => self.do_poll(regs)?,
             n if n == libc::SYS_sched_getaffinity => {
                 if regs.rsi < 8 {
                     return Ok(Emu::Ret(-(libc::EINVAL as i64)));
@@ -399,8 +482,8 @@ impl Session {
             }
             _ if !Net::is_virtual(fd) || self.world.net.get(fd).is_none() => Emu::Pass,
             n if n == libc::SYS_close => match self.world.net.close(fd) {
-                Ok(_) => Emu::Ret(0),
-                Err(()) => Emu::Ret(-(libc::EBADF as i64)),
+                Some(_) => Emu::Ret(0),
+                None => Emu::Ret(-(libc::EBADF as i64)),
             },
             n if n == libc::SYS_fcntl => match regs.rsi {
                 c if c == libc::F_DUPFD as u64 || c == F_DUPFD_CLOEXEC => {
@@ -649,12 +732,13 @@ impl Session {
         self.world.net.clients[client].request = self.requests[choice as usize].clone();
     }
 
-    /// Deliver the next piece of `client`'s request: all of it, half, or one byte.
+    /// Deliver the next piece of `client`'s request (see `CHUNK_CHOICES`).
     pub(super) fn deliver_chunk(&mut self, client: usize, choice: u32) -> io::Result<()> {
         let rem = self.world.net.clients[client].remaining();
         let n = match choice {
             0 => rem,
             1 => (rem / 2).max(1),
+            2 => (rem - 1).max(1),
             _ => 1,
         };
         self.world.net.deliver(client, n);

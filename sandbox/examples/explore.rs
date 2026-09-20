@@ -19,6 +19,7 @@ fn main() {
     let mut snapshot_every = 8;
     let mut keep_going = false;
     let mut replays = 20;
+    let mut wall = 120;
     let mut tuning = Tuning::default();
     let mut clients = 0;
     let mut requests: Vec<Vec<u8>> = Vec::new();
@@ -39,6 +40,7 @@ fn main() {
                 }
             }
             "--runs" => runs = args.next().unwrap().parse().unwrap(),
+            "--wall" => wall = args.next().unwrap().parse().unwrap(),
             "--seed" => seed = args.next().unwrap().parse().unwrap(),
             "--snapshot-every" => snapshot_every = args.next().unwrap().parse().unwrap(),
             "--replays" => replays = args.next().unwrap().parse().unwrap(),
@@ -51,7 +53,7 @@ fn main() {
             _ => target_args.push(a),
         }
     }
-    let program = program.expect("usage: explore <target> [--runs N] [--seed S]");
+    let program = program.expect("usage: explore <target> [--runs N] [--wall SECS] [--seed S]");
     let t = std::time::Instant::now();
     let session = Session::spawn(
         &program,
@@ -74,7 +76,7 @@ fn main() {
     search.tuning = tuning;
     let budget = Budget {
         runs,
-        wall: Duration::from_secs(120),
+        wall: Duration::from_secs(wall),
         stop_on_failure: !keep_going,
     };
     search.run(&budget).expect("search");
@@ -95,6 +97,24 @@ fn main() {
         println!("no failure found");
         return;
     };
+    if keep_going {
+        let mut distinct: Vec<(String, usize, usize)> = Vec::new();
+        for f in &search.stats.failures {
+            let key = format!(
+                "{} {}",
+                f.outcome,
+                f.stderr.trim().lines().nth(1).unwrap_or("")
+            );
+            match distinct.iter_mut().find(|(k, _, _)| *k == key) {
+                Some((_, _, count)) => *count += 1,
+                None => distinct.push((key, f.run, 1)),
+            }
+        }
+        println!("\ndistinct failures:");
+        for (key, first, count) in distinct {
+            println!("  first on run {first}, {count}x: {key}");
+        }
+    }
     println!("\nfailure on run {}: {}", failure.run, failure.outcome);
     println!(
         "decisions ({}): {}",
@@ -102,10 +122,9 @@ fn main() {
         format_decisions(&failure.decisions)
     );
     if !failure.stderr.trim().is_empty() {
-        println!(
-            "stderr: {}",
-            failure.stderr.trim().lines().next().unwrap_or("")
-        );
+        for line in failure.stderr.trim().lines().take(2) {
+            println!("stderr: {line}");
+        }
     }
 
     let choices: Vec<u32> = failure.decisions.iter().map(|d| d.choice).collect();
@@ -128,11 +147,14 @@ fn main() {
     let (small, used) = search
         .shrink(&failure.decisions, &failure.outcome, 400)
         .expect("shrink");
+    let non_default =
+        |d: &[dowsing_sandbox::world::Decision]| d.iter().filter(|d| d.choice != 0).count();
     println!(
-        "shrink: {} -> {} decisions ({} non-default) in {} runs, {:.2?}",
+        "shrink: {} -> {} non-default choices ({} -> {} decisions total) in {} runs, {:.2?}",
+        non_default(&failure.decisions),
+        non_default(&small),
         failure.decisions.len(),
         small.len(),
-        small.iter().filter(|d| d.choice != 0).count(),
         used,
         t.elapsed()
     );

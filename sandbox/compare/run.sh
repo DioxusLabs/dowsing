@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Measures every tool on the same three bugs + the snapshot/restore task and writes one line
 # per measurement to compare/results.txt. Usage: run.sh [section...]
-# Sections: native rr sandbox loom shuttle snapshot tsan   (default: all)
+# Sections: native rr sandbox loom shuttle snapshot tsan axum   (default: all)
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 TGT="$ROOT/sandbox/targets/target/release"
 OUT="${OUT:-$HERE/results.txt}"
-SECTIONS="${*:-native rr sandbox loom shuttle snapshot tsan}"
+SECTIONS="${*:-native rr sandbox loom shuttle snapshot tsan axum}"
 SEEDS="${SEEDS:-1 2 3}"
 
 say() { echo "$*" | tee -a "$OUT"; }
@@ -72,6 +72,34 @@ if has sandbox; then
             say "tool=sandbox target=$t seed=$s | ${fail:-no failure} | ${first} | ${replay:-} | ${shrink:-} | $snap | $rest"
         done
     done
+fi
+
+# One sandbox search over the axum server driven through virtual sockets; prints the same
+# summary line as the sandbox section. axum <label> <corpus-dir> <seed> [extra explore flags]
+axum() {
+    local label=$1 corpus=$2 s=$3; shift 3
+    local out first fail replay shrink
+    out=$(cd "$ROOT" && timeout 700 ./target/release/examples/explore "$TGT/axum_counter" --clients 3 --corpus "$corpus" --snapshot-every 32 --replays 10 --seed "$s" "$@" 2>&1 | grep -vE '^\[sandbox\]')
+    first=$(echo "$out" | grep -E '^runs [0-9]+ in' | head -1)
+    fail=$(echo "$out" | grep -oE '^failure on run [0-9]+: .*' | head -1)
+    stderr=$(echo "$out" | grep -oE 'lost update: .*' | head -1)
+    replay=$(echo "$out" | grep -oE '^replay x10: .*' | head -1)
+    shrink=$(echo "$out" | grep -oE '^shrink: .*' | head -1)
+    say "tool=sandbox target=axum_counter case=$label seed=$s | ${fail:-no failure} ${stderr:+($stderr)} | ${first} | ${replay:-} | ${shrink:-}"
+}
+
+if has axum; then
+    say "## axum 0.8 + tokio (2 workers), unmodified binary, driven through the virtual socket API"
+    say "## native: python client, 2 concurrent POSTs then GET /check per round, 60 s budget"
+    for p in /inc /inc_nowait; do
+        python3 "$HERE/axum_native_stress.py" "$TGT/axum_counter" 60 "$p" 2>&1 | grep -E '^native' | tee -a "$OUT"
+    done
+    say "## sandbox: explore axum_counter --clients 3 --corpus <dir> --runs 3000 (stop on first failure)"
+    for s in $SEEDS; do axum inc_await "$ROOT/sandbox/corpus/axum_await" "$s" --runs 3000; done
+    say "## sandbox: /sum framing bug (HTTP 500 when the JSON body is split across reads), corpus/axum"
+    for s in $SEEDS; do axum sum_split "$ROOT/sandbox/corpus/axum" "$s" --runs 3000; done
+    say "## sandbox: /inc_nowait (no await between the two lock() calls), --runs 50000 --wall 600"
+    for s in $SEEDS; do axum inc_nowait "$ROOT/sandbox/corpus/axum_hard" "$s" --runs 50000 --wall 600; done
 fi
 
 if has loom; then
