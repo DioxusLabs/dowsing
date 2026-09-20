@@ -305,9 +305,24 @@ where
     Ok(unsafe { mem::transmute_copy(&pointer) })
 }
 
-#[cfg(unix)]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 fn rtld_default() -> *mut c_void {
     (-2_isize) as *mut c_void
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn rtld_default() -> *mut c_void {
+    std::ptr::null_mut()
 }
 
 fn counter_coverage(
