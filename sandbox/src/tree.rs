@@ -16,10 +16,14 @@
 //! the frontier pointed at unexplored preemption points.
 
 use crate::{
+    net::ClientEvent,
     session::{Event, Session},
     shm::Bitmap,
     snapshot::SnapshotId,
-    world::{BUDGET_MAX, Candidate, Decision, Kind, Outcome, Pending, Point, TraceEvent},
+    world::{
+        BUDGET_MAX, CHUNK_CHOICES, CLIENT_THREAD, Candidate, Decision, Kind, Outcome, Pending,
+        Point, TraceEvent,
+    },
 };
 use rand::{Rng, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 use std::{
@@ -141,6 +145,9 @@ struct Policy {
     prio: Vec<u32>,
     /// Priority of a thread's pending timeout when it is offered as a `Fire` candidate.
     timer_prio: Vec<u32>,
+    /// Priority of each modelled client's next action (send/close), and of a new connection.
+    client_prio: Vec<u32>,
+    connect_prio: u32,
     /// Global edge counts at which the running thread is demoted, ascending.
     change_points: Vec<u64>,
     lowest: u32,
@@ -163,8 +170,16 @@ impl Policy {
         Self {
             prio,
             timer_prio,
+            client_prio: Vec::new(),
+            connect_prio: rng.random_range(1000..2000),
             change_points,
             lowest: 1000,
+        }
+    }
+
+    fn ensure_client(&mut self, rng: &mut SmallRng, client: usize) {
+        while self.client_prio.len() <= client {
+            self.client_prio.push(rng.random_range(1000..2000));
         }
     }
 
@@ -188,6 +203,14 @@ impl Policy {
                     self.ensure(rng, t);
                     self.timer_prio[t]
                 }
+                Candidate::Client(ClientEvent::Connect) => self.connect_prio,
+                Candidate::Client(ClientEvent::Send(c)) => {
+                    self.ensure_client(rng, c);
+                    self.client_prio[c]
+                }
+                // A client hangs up only once nothing else can happen; closing early is left
+                // to the search, which tries it as an untried sibling.
+                Candidate::Client(ClientEvent::Close(_)) => 0,
             };
             if i == 0 || p > best_p {
                 best = i;
@@ -404,10 +427,12 @@ impl Search {
         let mut per_thread: Vec<u64> = Vec::new();
         for w in trace.windows(2) {
             let (a, b) = (w[0], w[1]);
-            if per_thread.len() <= a.thread {
-                per_thread.resize(a.thread + 1, 0);
+            if a.thread != CLIENT_THREAD {
+                if per_thread.len() <= a.thread {
+                    per_thread.resize(a.thread + 1, 0);
+                }
+                per_thread[a.thread] += a.edges;
             }
-            per_thread[a.thread] += a.edges;
             if a.thread == b.thread {
                 continue;
             }
@@ -417,7 +442,9 @@ impl Search {
                 fresh += 1;
             }
         }
-        if let Some(last) = trace.last() {
+        if let Some(last) = trace.last()
+            && last.thread != CLIENT_THREAD
+        {
             if per_thread.len() <= last.thread {
                 per_thread.resize(last.thread + 1, 0);
             }
@@ -548,7 +575,17 @@ impl Search {
                 policy.schedule(&mut self.rng, &candidates)
             }
             Some(Pending::Budget { .. }) => policy.budget(self.session.world.edges),
-            Some(Pending::Variant { n, .. }) => self.rng.random_range(0..*n),
+            Some(Pending::Variant { n, .. } | Pending::Payload { n, .. }) => {
+                self.rng.random_range(0..*n)
+            }
+            // Mostly whole requests; the search, not the rollout, is what tries fragments.
+            Some(Pending::Chunk { .. }) => {
+                if self.rng.random_range(0..4) == 0 {
+                    self.rng.random_range(1..CHUNK_CHOICES)
+                } else {
+                    0
+                }
+            }
             None => 0,
         }
     }

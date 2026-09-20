@@ -1,8 +1,17 @@
 //! Supervisor-owned state of one execution: everything about the target that is not memory or
 //! registers. Plain data, cloned into every snapshot and swapped back on restore.
 
-use crate::{ptrace::Pid, shm::Bitmap};
+use crate::{
+    net::{ClientEvent, Net},
+    ptrace::{Pid, Regs},
+    shm::Bitmap,
+};
 use std::fmt;
+
+/// `TraceEvent::thread` of an event caused by a modelled client rather than a target thread.
+pub const CLIENT_THREAD: usize = usize::MAX;
+/// Choices of a `Chunk` decision: deliver the rest, half of it, or one byte.
+pub const CHUNK_CHOICES: u32 = 3;
 
 /// A `Budget` decision's choice is the exact number of instrumented edges the thread runs
 /// before it is preempted; 0 = run to its next natural stop. `n` is this bound.
@@ -23,6 +32,10 @@ pub enum Kind {
     Budget,
     /// The target's own `dowsing_target_rt::variant(n)`.
     Variant,
+    /// Which corpus request a newly connected client sends.
+    Payload,
+    /// How much of its remaining request a client delivers in one piece.
+    Chunk,
 }
 
 impl fmt::Display for Kind {
@@ -31,6 +44,8 @@ impl fmt::Display for Kind {
             Kind::Schedule => "sched",
             Kind::Budget => "budget",
             Kind::Variant => "variant",
+            Kind::Payload => "payload",
+            Kind::Chunk => "chunk",
         })
     }
 }
@@ -61,11 +76,24 @@ pub enum Outcome {
     },
     /// The running thread did not reach a stop within the watchdog.
     Timeout,
+    /// A thread panicked (the default hook's message appeared on stderr); the process may
+    /// have survived it, as a runtime that catches task panics does.
+    Panic,
+    /// Every thread waits on the outside world and these clients' complete requests are
+    /// unanswered with their connections still open.
+    Hang {
+        clients: Vec<usize>,
+    },
+    /// The target answered a request with this 5xx status.
+    HttpError(u16),
+    /// Every thread waits on the outside world and the clients are done: a server's normal
+    /// end state.
+    Quiescent,
 }
 
 impl Outcome {
     pub fn is_ok(&self) -> bool {
-        matches!(self, Outcome::Exited(0))
+        matches!(self, Outcome::Exited(0) | Outcome::Quiescent)
     }
 }
 
@@ -76,6 +104,10 @@ impl fmt::Display for Outcome {
             Outcome::Signaled(sig) => write!(f, "signal({sig})"),
             Outcome::Deadlock { waiting } => write!(f, "deadlock(threads {waiting:?})"),
             Outcome::Timeout => write!(f, "timeout"),
+            Outcome::Panic => write!(f, "panic"),
+            Outcome::Hang { clients } => write!(f, "hang(clients {clients:?})"),
+            Outcome::HttpError(code) => write!(f, "http({code})"),
+            Outcome::Quiescent => write!(f, "quiescent"),
         }
     }
 }
@@ -100,6 +132,18 @@ pub enum Point {
     Exit,
     ExitGroup,
     Signal(i32),
+    Accept,
+    EpollWait,
+    EpollReady,
+    EpollWoken,
+    Wake,
+    IoWait,
+    IoWoken,
+    Connect,
+    ClientSend,
+    ClientClose,
+    /// Stopped because an oracle ended the run (e.g. a 5xx response).
+    Oracle,
 }
 
 impl fmt::Display for Point {
@@ -142,12 +186,27 @@ pub enum ThreadState {
     /// Called `exit`; the syscall was skipped and the task is frozen forever. Kept so that
     /// snapshots taken while it was alive stay restorable.
     Parked,
+    /// Emulated `epoll_wait` with nothing to report yet.
+    EpollWait {
+        epfd: i32,
+        events: u64,
+        maxevents: usize,
+        deadline: Option<u64>,
+        seq: u64,
+    },
+    /// A blocking socket/eventfd operation (registers in `Thread::blocked`) that would block;
+    /// retried whenever the network world changes.
+    IoWait {
+        seq: u64,
+    },
 }
 
 impl ThreadState {
     pub fn deadline(&self) -> Option<u64> {
         match self {
-            ThreadState::FutexWait { deadline, .. } => *deadline,
+            ThreadState::FutexWait { deadline, .. } | ThreadState::EpollWait { deadline, .. } => {
+                *deadline
+            }
             ThreadState::Sleep { deadline, .. } => Some(*deadline),
             _ => None,
         }
@@ -155,9 +214,20 @@ impl ThreadState {
 
     pub fn seq(&self) -> u64 {
         match self {
-            ThreadState::FutexWait { seq, .. } | ThreadState::Sleep { seq, .. } => *seq,
+            ThreadState::FutexWait { seq, .. }
+            | ThreadState::Sleep { seq, .. }
+            | ThreadState::EpollWait { seq, .. }
+            | ThreadState::IoWait { seq } => *seq,
             _ => 0,
         }
+    }
+
+    /// Waiting for something only the modelled outside world can provide.
+    pub fn waits_on_world(&self) -> bool {
+        matches!(
+            self,
+            ThreadState::EpollWait { .. } | ThreadState::IoWait { .. }
+        )
     }
 }
 
@@ -169,6 +239,8 @@ pub struct Thread {
     pub clear_tid: u64,
     /// `child_tid` of a `clone` this thread is in the middle of.
     pub pending_clone_ctid: u64,
+    /// Registers of the syscall an `IoWait` retries.
+    pub blocked: Option<Regs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +249,8 @@ pub enum Candidate {
     Run(usize),
     /// Advance the clock to this waiter's deadline and wake it with a timeout.
     Fire(usize),
+    /// A modelled client acts.
+    Client(ClientEvent),
 }
 
 /// A decision the session is waiting on.
@@ -185,6 +259,8 @@ pub enum Pending {
     Schedule { candidates: Vec<Candidate> },
     Budget { thread: usize },
     Variant { thread: usize, n: u32 },
+    Payload { client: usize, n: u32 },
+    Chunk { client: usize },
 }
 
 impl Pending {
@@ -193,6 +269,8 @@ impl Pending {
             Pending::Schedule { .. } => Kind::Schedule,
             Pending::Budget { .. } => Kind::Budget,
             Pending::Variant { .. } => Kind::Variant,
+            Pending::Payload { .. } => Kind::Payload,
+            Pending::Chunk { .. } => Kind::Chunk,
         }
     }
 
@@ -200,7 +278,8 @@ impl Pending {
         match self {
             Pending::Schedule { candidates } => candidates.len() as u32,
             Pending::Budget { .. } => BUDGET_MAX,
-            Pending::Variant { n, .. } => *n,
+            Pending::Variant { n, .. } | Pending::Payload { n, .. } => *n,
+            Pending::Chunk { .. } => CHUNK_CHOICES,
         }
     }
 }
@@ -223,16 +302,23 @@ pub struct World {
     pub decisions: Vec<Decision>,
     pub pending: Option<Pending>,
     pub outcome: Option<Outcome>,
+    pub net: Net,
+    /// A panic message has appeared on the target's stderr.
+    pub panicked: bool,
+    /// Timeouts fired with nothing runnable since the last time a thread ran; bounds the
+    /// virtual time an idle server with periodic timers can burn before a run ends.
+    pub idle_fires: u32,
 }
 
 impl World {
-    pub fn new(leader: Pid) -> Self {
+    pub fn new(leader: Pid, max_clients: usize) -> Self {
         Self {
             threads: vec![Thread {
                 tid: leader,
                 state: ThreadState::Stopped,
                 clear_tid: 0,
                 pending_clone_ctid: 0,
+                blocked: None,
             }],
             current: None,
             last_ran: None,
@@ -247,6 +333,9 @@ impl World {
             decisions: Vec::new(),
             pending: None,
             outcome: None,
+            net: Net::new(max_clients),
+            panicked: false,
+            idle_fires: 0,
         }
     }
 
@@ -281,7 +370,10 @@ impl World {
             .filter(|(_, t)| {
                 matches!(
                     t.state,
-                    ThreadState::FutexWait { .. } | ThreadState::Sleep { .. }
+                    ThreadState::FutexWait { .. }
+                        | ThreadState::Sleep { .. }
+                        | ThreadState::EpollWait { .. }
+                        | ThreadState::IoWait { .. }
                 )
             })
             .map(|(i, _)| i)

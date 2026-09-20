@@ -284,3 +284,94 @@ fn unmodelled_syscalls_are_reported_not_hidden() {
         s.uncontrolled
     );
 }
+
+const INC: &[u8] = b"POST /inc HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n";
+const CHECK: &[u8] = b"GET /check HTTP/1.1\r\nHost: x\r\n\r\n";
+
+fn spawn_axum(bin: &str, clients: usize, requests: &[&[u8]]) -> Session {
+    Session::spawn(
+        bin,
+        &[],
+        Options {
+            max_clients: clients,
+            requests: requests.iter().map(|r| r.to_vec()).collect(),
+            ..Options::default()
+        },
+    )
+    .expect("spawn")
+}
+
+/// An unmodified axum + tokio (2 workers) server, driven entirely through the virtual socket
+/// API: the request is accepted, read and answered, then every thread waits on the world.
+#[test]
+fn axum_serves_a_request_through_virtual_sockets() {
+    let (_g, bin) = target("axum_counter");
+    let mut s = spawn_axum(&bin, 1, &[b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"]);
+    let (outcome, _, kinds) = run_default(&mut s);
+    assert_eq!(outcome, Outcome::Quiescent);
+    assert!(
+        kinds.contains(&Kind::Chunk),
+        "no delivery decision: {kinds:?}"
+    );
+    assert!(s.uncontrolled.is_empty(), "{:?}", s.uncontrolled);
+    let c = &s.world.net.clients[0];
+    assert!(c.accepted && c.fin && c.server_closed);
+    assert_eq!(dowsing_sandbox::net::http_status(&c.response), Some(200));
+    assert!(
+        c.response.ends_with(b"ok\n"),
+        "{:?}",
+        String::from_utf8_lossy(&c.response)
+    );
+}
+
+/// Two `POST /inc` and a `GET /check` from three clients: the search finds the schedule that
+/// loses an update (the server's own assertion), replays it bit-identically and shrinks it.
+#[test]
+fn axum_lost_update_found_via_sockets_replayed_and_shrunk() {
+    let (_g, bin) = target("axum_counter");
+    let mut search = Search::new(spawn_axum(&bin, 3, &[INC, CHECK]), 1).expect("root");
+    search.snapshot_every = 32;
+    let budget = Budget {
+        runs: 3000,
+        wall: Duration::from_secs(120),
+        stop_on_failure: true,
+    };
+    search.run(&budget).expect("search");
+    let failure = search
+        .stats
+        .failures
+        .first()
+        .cloned()
+        .expect("lost update not found");
+    assert_eq!(failure.outcome, Outcome::Panic);
+    assert!(failure.stderr.contains("lost update"), "{}", failure.stderr);
+    assert_eq!(search.stats.divergences, 0);
+    assert!(
+        failure
+            .decisions
+            .iter()
+            .filter(|d| d.kind == Kind::Payload)
+            .count()
+            >= 2,
+        "{:?}",
+        failure.decisions
+    );
+
+    let choices: Vec<u32> = failure.decisions.iter().map(|d| d.choice).collect();
+    let mut hashes = HashSet::new();
+    for _ in 0..5 {
+        let r = search.replay(&choices).expect("replay");
+        assert_eq!(r.outcome, Outcome::Panic);
+        hashes.insert(r.trace_hash);
+    }
+    assert_eq!(hashes.len(), 1, "replay is not deterministic");
+
+    let (small, _) = search
+        .shrink(&failure.decisions, &failure.outcome, 200)
+        .expect("shrink");
+    let small_choices: Vec<u32> = small.iter().map(|d| d.choice).collect();
+    assert_eq!(
+        search.replay(&small_choices).unwrap().outcome,
+        Outcome::Panic
+    );
+}

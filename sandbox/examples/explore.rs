@@ -4,6 +4,8 @@
 //!
 //! Flags: --runs N  --seed S  --verbose  --snapshot-every K  --keep-going  --replays N
 //!        --fanout N  --pct-depth D  --ucb C
+//!        --clients N  --request 'GET /x HTTP/1.1\r\n...'  (repeatable; `\r\n` escapes)
+//!        --corpus DIR  (every file is one request)
 
 use dowsing_sandbox::{Budget, Options, Search, Session, tree::Tuning, tree::format_decisions};
 use std::time::Duration;
@@ -18,9 +20,24 @@ fn main() {
     let mut keep_going = false;
     let mut replays = 20;
     let mut tuning = Tuning::default();
+    let mut clients = 0;
+    let mut requests: Vec<Vec<u8>> = Vec::new();
     let mut target_args = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--clients" => clients = args.next().unwrap().parse().unwrap(),
+            "--request" => requests.push(unescape(&args.next().unwrap())),
+            "--corpus" => {
+                let dir = args.next().unwrap();
+                let mut files: Vec<_> = std::fs::read_dir(&dir)
+                    .expect("corpus dir")
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                files.sort();
+                for f in files {
+                    requests.push(std::fs::read(f).unwrap());
+                }
+            }
             "--runs" => runs = args.next().unwrap().parse().unwrap(),
             "--seed" => seed = args.next().unwrap().parse().unwrap(),
             "--snapshot-every" => snapshot_every = args.next().unwrap().parse().unwrap(),
@@ -41,6 +58,8 @@ fn main() {
         &target_args,
         Options {
             verbose,
+            max_clients: clients,
+            requests,
             ..Options::default()
         },
     )
@@ -119,4 +138,22 @@ fn main() {
     );
     println!("minimal: {}", format_decisions(&small));
     println!("{}", search.stats());
+}
+
+fn unescape(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.extend(c.to_string().as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('r') => out.push(b'\r'),
+            Some('n') => out.push(b'\n'),
+            Some(o) => out.extend(o.to_string().as_bytes()),
+            None => out.push(b'\\'),
+        }
+    }
+    out
 }

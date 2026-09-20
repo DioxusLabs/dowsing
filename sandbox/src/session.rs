@@ -23,6 +23,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod net;
+
+/// What a client sends when the run has no corpus.
+const DEFAULT_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Decision { kind: Kind, n: u32 },
@@ -49,6 +54,12 @@ pub struct Options {
     pub capture_stderr: bool,
     /// Send the target's stdout to `/dev/null`.
     pub silence_stdout: bool,
+    /// Modelled clients that may connect to the target's listener over a run.
+    pub max_clients: usize,
+    /// Requests a client may send (a `Payload` decision picks one). Empty = one default GET.
+    pub requests: Vec<Vec<u8>>,
+    /// CPUs `sched_getaffinity` reports (runtimes size their thread pools by it).
+    pub cpus: u32,
 }
 
 impl Default for Options {
@@ -58,6 +69,9 @@ impl Default for Options {
             verbose: false,
             capture_stderr: true,
             silence_stdout: true,
+            max_clients: 0,
+            requests: Vec::new(),
+            cpus: 2,
         }
     }
 }
@@ -119,6 +133,10 @@ pub struct Session {
     /// Coverage bits first seen on this path since the last `take_new_coverage`.
     new_coverage: Vec<u32>,
     pub alive: bool,
+    /// Requests a client may send; `Options::requests` or the default.
+    requests: Vec<Vec<u8>>,
+    /// Stderr read from the target but not yet handed out by `take_stderr`.
+    stderr_buf: Vec<u8>,
 }
 
 impl Drop for Session {
@@ -258,13 +276,18 @@ impl Session {
         }
         // The leader is stopped at the exec event; the first stop after resuming it is a
         // seccomp stop, which gives us a syscall instruction address.
+        let requests = if opts.requests.is_empty() {
+            vec![DEFAULT_REQUEST.to_vec()]
+        } else {
+            opts.requests.clone()
+        };
         let mut session = Session {
             shm,
             leader: pid,
+            world: World::new(pid, opts.max_clients),
             opts,
             stderr,
             syscall_insn: 0,
-            world: World::new(pid),
             store: Store::default(),
             head: None,
             zombies: Vec::new(),
@@ -273,6 +296,8 @@ impl Session {
             uncontrolled: Vec::new(),
             new_coverage: Vec::new(),
             alive: true,
+            requests,
+            stderr_buf: Vec::new(),
         };
         session.world.threads[0].state = ThreadState::Stopped;
         session.record(0, Point::Start);
@@ -289,14 +314,27 @@ impl Session {
 
     /// Stderr the target wrote since the last call.
     pub fn take_stderr(&mut self) -> String {
+        self.poll_stderr();
+        String::from_utf8_lossy(&std::mem::take(&mut self.stderr_buf)).into_owned()
+    }
+
+    /// Drain the (non-blocking) stderr pipe and notice a panic message.
+    fn poll_stderr(&mut self) {
         let Some(fd) = &self.stderr else {
-            return String::new();
+            return;
         };
         let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
-        let mut buf = Vec::new();
-        let _ = file.read_to_end(&mut buf);
+        let before = self.stderr_buf.len();
+        let _ = file.read_to_end(&mut self.stderr_buf);
         std::mem::forget(file);
-        String::from_utf8_lossy(&buf).into_owned()
+        if self.stderr_buf.len() != before
+            && !self.world.panicked
+            && self.stderr_buf[before.saturating_sub(16)..]
+                .windows(11)
+                .any(|w| w == b"panicked at")
+        {
+            self.world.panicked = true;
+        }
     }
 
     pub fn take_new_coverage(&mut self) -> Vec<u32> {
@@ -330,6 +368,7 @@ impl Session {
     }
 
     fn record(&mut self, thread: usize, point: Point) {
+        self.poll_stderr();
         let edges_now = self.shm.edges();
         let edges = edges_now - self.world.edges_at_last_event;
         self.world.edges_at_last_event = edges_now;
@@ -402,6 +441,11 @@ impl Session {
                 self.world.threads[thread].state = ThreadState::Stopped;
                 Ok(())
             }
+            Pending::Payload { client, .. } => {
+                self.set_payload(client, choice);
+                Ok(())
+            }
+            Pending::Chunk { client } => self.deliver_chunk(client, choice),
         }
     }
 
@@ -431,10 +475,16 @@ impl Session {
                 .filter(|i| Some(*i) != self.world.last_ran)
                 .map(Candidate::Run),
         );
-        if candidates.is_empty() {
+        let clients = self.world.net.client_events();
+        if candidates.is_empty() && clients.is_empty() {
             return self.handle_idle();
         }
-        candidates.extend(self.world.timed_waiters().into_iter().map(Candidate::Fire));
+        // Timers stop being offered once they have fired MAX_IDLE_FIRES times with no client
+        // action: a periodic timer must not let a run outlast its clients.
+        if self.world.idle_fires < net::MAX_IDLE_FIRES {
+            candidates.extend(self.world.timed_waiters().into_iter().map(Candidate::Fire));
+        }
+        candidates.extend(clients.into_iter().map(Candidate::Client));
         if candidates.len() >= 2 {
             self.world.pending = Some(Pending::Schedule { candidates });
             return Ok(());
@@ -454,6 +504,7 @@ impl Session {
                 }
             }
             Candidate::Fire(thread) => self.fire_timeout(thread),
+            Candidate::Client(ev) => self.client_act(ev),
         }
     }
 
@@ -467,6 +518,8 @@ impl Session {
         };
         self.set_return(thread, ret)?;
         self.world.threads[thread].state = ThreadState::Stopped;
+        self.world.threads[thread].blocked = None;
+        self.world.idle_fires += 1;
         self.record(thread, Point::Timeout);
         Ok(())
     }
@@ -481,19 +534,36 @@ impl Session {
         Ok(())
     }
 
-    /// Nothing runnable: the earliest timeout fires, or the run is deadlocked.
+    /// Nothing runnable and no client with anything left to do: the earliest timeout fires,
+    /// or the run is over: a panic message was seen (a runtime that survives a task's panic
+    /// never exits 101), a request went unanswered, everything waits on the outside world
+    /// (quiescent) or threads wait only on each other (deadlock).
     fn handle_idle(&mut self) -> io::Result<()> {
         if self.recheck_futex_words()? {
             return Ok(());
         }
-        if let Some(first) = self.world.timed_waiters().first().copied() {
+        if self.world.idle_fires < net::MAX_IDLE_FIRES
+            && let Some(first) = self.world.timed_waiters().first().copied()
+        {
             return self.fire_timeout(first);
         }
         let waiting = self.world.waiters();
         if waiting.is_empty() {
             return Err(io::Error::other("no threads left but no outcome"));
         }
-        self.world.outcome = Some(Outcome::Deadlock { waiting });
+        let hung = self.world.net.hung_clients();
+        self.world.outcome = Some(if self.world.panicked {
+            Outcome::Panic
+        } else if !hung.is_empty() {
+            Outcome::Hang { clients: hung }
+        } else if waiting
+            .iter()
+            .any(|i| self.world.threads[*i].state.waits_on_world())
+        {
+            Outcome::Quiescent
+        } else {
+            Outcome::Deadlock { waiting }
+        });
         Ok(())
     }
 
@@ -633,6 +703,7 @@ impl Session {
                     state: ThreadState::Stopped,
                     clear_tid: ctid,
                     pending_clone_ctid: 0,
+                    blocked: None,
                 });
                 self.world.threads[parent].state = ThreadState::Stopped;
                 self.world.current = None;
@@ -905,6 +976,7 @@ impl Session {
             }
             // Non-blocking poll (std's startup fd check) cannot reorder anything.
             n if n == libc::SYS_poll && regs.rdx == 0 => ptrace::cont(tid, 0),
+            n if net::is_net_syscall(n) => self.handle_net(index, &mut regs),
             n => {
                 self.uncontrolled
                     .push(format!("syscall {n} passed through on T{index}"));
@@ -1229,12 +1301,14 @@ impl Session {
         self.shm.set_guard(self.world.guard);
         self.shm.drain_bitmap(&mut crate::shm::Bitmap::default());
         self.new_coverage.clear();
+        let threads = snap.regs.len();
+        self.take_stderr();
         snapshot::clear_soft_dirty(self.leader)?;
         self.head = Some(id);
         Ok(RestoreStats {
             pages_written: written,
             map_ops: ops.len(),
-            threads: snap.regs.len(),
+            threads,
             wall: start.elapsed(),
         })
     }

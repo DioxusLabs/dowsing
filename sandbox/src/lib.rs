@@ -5,6 +5,7 @@
 //! itself, and can snapshot/restore the process with soft-dirty page tracking. A
 //! [`tree::Search`] explores the tree of decisions from restored states.
 
+pub mod net;
 pub mod ptrace;
 pub mod seccomp;
 pub mod session;
