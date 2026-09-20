@@ -3,7 +3,7 @@ use super::{
     mutate::{corpus_energy, refresh_corpus_energies},
     prelude::{
         Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
-        MAX_PREFIX_LEN, MinPathScore, Mode, SemanticKind, SemanticSpan, SequenceItemSpan,
+        MAX_PREFIX_LEN, MinPathScore, Mode, RawCase, SemanticKind, SemanticSpan, SequenceItemSpan,
         SequenceSpan, State,
     },
     run::min_path_schedule_energy,
@@ -131,6 +131,63 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     /// Exclude this execution from coverage feedback when the RNG is dropped.
     pub fn discard(mut self) {
         let _ = self.finish(false, CaseCost::zero());
+    }
+
+    /// Peek at the bytes this RNG would hand out next, without consuming them.
+    ///
+    /// Fills `out` with the remaining prefix followed by the fallback stream (or zeros for a
+    /// zero-tail case), byte for byte what `next_byte` would produce. Out-of-process runners ship
+    /// this budget to the child and later call [`Self::absorb_trace`] with what the child consumed.
+    /// Starting a capture happens here so coverage tokens line up with the remote execution.
+    #[doc(hidden)]
+    pub fn fill_budget(&mut self, out: &mut [u8]) {
+        self.ensure_started();
+        let mut filled = 0;
+        if let Some(rest) = self.prefix.get(self.cursor..) {
+            let take = rest.len().min(out.len());
+            out[..take].copy_from_slice(&rest[..take]);
+            filled = take;
+        }
+        let tail = &mut out[filled..];
+        if self.zero_tail {
+            tail.fill(0);
+        } else {
+            let mut fallback = self.fallback.clone();
+            for byte in tail {
+                let mut one = [0];
+                fallback.fill_bytes(&mut one);
+                *byte = one[0];
+            }
+        }
+    }
+
+    /// Record an RNG path that was consumed on this RNG's behalf elsewhere.
+    ///
+    /// `raw.prefix` must be a prefix of the budget returned by [`Self::fill_budget`]; the spans
+    /// must have been recorded by a `CaseRng` replaying that budget. Afterwards this RNG is
+    /// indistinguishable from one that executed the harness in-process, so `fork_case`, corpus
+    /// bookkeeping, mutation, and `cautious()` reduction all see the remote execution.
+    #[doc(hidden)]
+    pub fn absorb_trace(&mut self, mut raw: RawCase) {
+        self.ensure_started();
+        let base = self.trace.len();
+        for span in raw.draws.iter_mut().chain(raw.semantics.iter_mut()) {
+            span.start += base;
+        }
+        for sequence in &mut raw.sequences {
+            sequence.length_start += base;
+            for item in &mut sequence.items {
+                item.0 += base;
+            }
+        }
+        let case = Case::from_raw(raw);
+        let consumed = case.prefix.len();
+        self.trace.extend_from_slice(&case.prefix);
+        self.cursor = self.cursor.saturating_add(consumed);
+        self.bytes_consumed = self.bytes_consumed.saturating_add(consumed);
+        self.draws.extend(case.draws);
+        self.semantics.extend(case.semantics);
+        self.sequences.extend(case.sequences);
     }
 }
 

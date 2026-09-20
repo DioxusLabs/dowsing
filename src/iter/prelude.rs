@@ -45,6 +45,104 @@ impl Case {
         engine.next().expect("seeded replay case should yield")
     }
 
+    /// Split this case into plain, dependency-free parts.
+    ///
+    /// Out-of-process runners use this to ship a recorded RNG path across a process boundary.
+    #[doc(hidden)]
+    pub fn into_raw(self) -> RawCase {
+        RawCase {
+            seed: self.seed,
+            prefix: self.prefix,
+            zero_tail: self.zero_tail,
+            draws: self
+                .draws
+                .into_iter()
+                .map(|span| RawSpan {
+                    start: span.start,
+                    len: span.len,
+                    kind: match span.kind {
+                        DrawKind::Word => RawSpan::WORD,
+                        DrawKind::Bytes => RawSpan::BYTES,
+                    },
+                })
+                .collect(),
+            semantics: self
+                .semantics
+                .into_iter()
+                .map(|span| RawSpan {
+                    start: span.start,
+                    len: span.len,
+                    kind: match span.kind {
+                        SemanticKind::Length => RawSpan::LENGTH,
+                        SemanticKind::Item => RawSpan::ITEM,
+                        SemanticKind::Variant => RawSpan::VARIANT,
+                    },
+                })
+                .collect(),
+            sequences: self
+                .sequences
+                .into_iter()
+                .map(|sequence| RawSequence {
+                    length_start: sequence.length_start,
+                    length_len: sequence.length_len,
+                    items: sequence
+                        .items
+                        .into_iter()
+                        .map(|item| (item.start, item.len))
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild a case from [`Case::into_raw`] parts. Unknown span kinds are dropped.
+    #[doc(hidden)]
+    pub fn from_raw(raw: RawCase) -> Self {
+        Self {
+            seed: raw.seed,
+            prefix: raw.prefix,
+            zero_tail: raw.zero_tail,
+            draws: raw
+                .draws
+                .into_iter()
+                .filter_map(|span| {
+                    let kind = match span.kind {
+                        RawSpan::WORD => DrawKind::Word,
+                        RawSpan::BYTES => DrawKind::Bytes,
+                        _ => return None,
+                    };
+                    Some(DrawSpan::new(span.start, span.len, kind))
+                })
+                .collect(),
+            semantics: raw
+                .semantics
+                .into_iter()
+                .filter_map(|span| {
+                    let kind = match span.kind {
+                        RawSpan::LENGTH => SemanticKind::Length,
+                        RawSpan::ITEM => SemanticKind::Item,
+                        RawSpan::VARIANT => SemanticKind::Variant,
+                        _ => return None,
+                    };
+                    Some(SemanticSpan::new(span.start, span.len, kind))
+                })
+                .collect(),
+            sequences: raw
+                .sequences
+                .into_iter()
+                .map(|sequence| SequenceSpan {
+                    length_start: sequence.length_start,
+                    length_len: sequence.length_len,
+                    items: sequence
+                        .items
+                        .into_iter()
+                        .map(|(start, len)| SequenceItemSpan { start, len })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_raw_parts(seed: u64, prefix: Vec<u8>, zero_tail: bool) -> Self {
         Self {
@@ -86,6 +184,44 @@ impl Case {
             sequences: Vec::new(),
         }
     }
+}
+
+/// Dependency-free view of a [`Case`] for out-of-process runners.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawCase {
+    pub seed: u64,
+    pub prefix: Vec<u8>,
+    pub zero_tail: bool,
+    pub draws: Vec<RawSpan>,
+    pub semantics: Vec<RawSpan>,
+    pub sequences: Vec<RawSequence>,
+}
+
+/// One recorded draw or semantic span; `kind` uses the [`RawSpan`] constants.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawSpan {
+    pub start: usize,
+    pub len: usize,
+    pub kind: u8,
+}
+
+impl RawSpan {
+    pub const WORD: u8 = 0;
+    pub const BYTES: u8 = 1;
+    pub const LENGTH: u8 = 0;
+    pub const ITEM: u8 = 1;
+    pub const VARIANT: u8 = 2;
+}
+
+/// One recorded [`crate::CaseRng::range`] sequence as `(start, len)` item spans.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawSequence {
+    pub length_start: usize,
+    pub length_len: usize,
+    pub items: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

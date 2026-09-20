@@ -231,15 +231,59 @@ fn counter_coverage() -> ExecutionFeedback {
     for range in &state.counters {
         let len = range.end.saturating_sub(range.start);
         let counters = unsafe { std::slice::from_raw_parts(range.start as *const u8, len) };
-        for counter in counters.iter().copied() {
-            if counter != 0 {
-                let bucket = hit_count_bucket(counter);
-                ids.push(feature_id(EDGE_NAMESPACE, (index << 8) | u64::from(bucket)));
-                hit_count_weight = hit_count_weight.saturating_add(1 + u64::from(bucket));
-            }
-            index = index.wrapping_add(1);
-        }
+        decode_counter_slice(counters, &mut index, &mut ids, &mut hit_count_weight);
     }
+    ExecutionFeedback {
+        features: CoverageSet::from_unsorted(ids),
+        hit_count_weight,
+        dictionary: Vec::new(),
+    }
+}
+
+fn decode_counter_slice(
+    counters: &[u8],
+    index: &mut u64,
+    ids: &mut Vec<CoverageId>,
+    hit_count_weight: &mut u64,
+) {
+    for counter in counters.iter().copied() {
+        if counter != 0 {
+            let bucket = hit_count_bucket(counter);
+            ids.push(feature_id(
+                EDGE_NAMESPACE,
+                (*index << 8) | u64::from(bucket),
+            ));
+            *hit_count_weight = hit_count_weight.saturating_add(1 + u64::from(bucket));
+        }
+        *index = index.wrapping_add(1);
+    }
+}
+
+/// Registered inline 8-bit counter ranges as `(start, end)` addresses, in registration order.
+///
+/// Out-of-process runners copy these bytes out of a child; [`decode_counters`] turns the
+/// concatenated copy back into the feedback `SancovCoverage` would have produced in-process.
+#[doc(hidden)]
+pub fn counter_ranges() -> Vec<(usize, usize)> {
+    state()
+        .lock()
+        .map(|state| {
+            state
+                .counters
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Decode a concatenated copy of every registered counter range into edge features.
+#[doc(hidden)]
+pub fn decode_counters(counters: &[u8]) -> ExecutionFeedback {
+    let mut ids = Vec::new();
+    let mut hit_count_weight = 0_u64;
+    let mut index = 0_u64;
+    decode_counter_slice(counters, &mut index, &mut ids, &mut hit_count_weight);
     ExecutionFeedback {
         features: CoverageSet::from_unsorted(ids),
         hit_count_weight,

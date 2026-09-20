@@ -11,7 +11,7 @@ pub use api::{Cases, ParallelCases};
 pub(crate) use mutate::test_dictionary_mutation;
 pub use no_coverage::NoCoverage;
 pub use prelude::{
-    Case, CaseCost, CaseCoverage, Cautious, CautiousOptions, Curious, SearchStats, cautious,
-    curious,
+    Case, CaseCost, CaseCoverage, Cautious, CautiousOptions, Curious, RawCase, RawSequence,
+    RawSpan, SearchStats, cautious, curious,
 };
 pub use rng::{CaseRng, ChildRng, RangeIter};
