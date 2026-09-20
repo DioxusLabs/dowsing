@@ -100,6 +100,9 @@ pub struct Sandbox {
     shared: Arc<Shared>,
     fuzz_tid: u32,
     saved_env: Vec<(String, Option<std::ffi::OsString>)>,
+    /// Per-case tmpfs trees are removed by an unfiltered janitor thread: `remove_dir_all` on the
+    /// fuzz thread would pay the trap tax on every `statx`/`openat` it issues.
+    janitor: mpsc::Sender<PathBuf>,
 }
 
 impl Sandbox {
@@ -113,6 +116,14 @@ impl Sandbox {
             .spawn(move || {
                 let shared = rx.recv().expect("sandbox handed over");
                 run_loop(shared);
+            })?;
+        let (janitor, trash) = mpsc::channel::<PathBuf>();
+        thread::Builder::new()
+            .name("dowsing-janitor".into())
+            .spawn(move || {
+                for root in trash {
+                    let _ = std::fs::remove_dir_all(root);
+                }
             })?;
         let listener = bpf::install()?;
         let shared = Arc::new(Shared {
@@ -128,6 +139,7 @@ impl Sandbox {
             shared,
             fuzz_tid,
             saved_env: Vec::new(),
+            janitor,
         })
     }
 
@@ -202,8 +214,9 @@ impl Sandbox {
         let case_id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id() as libc::pid_t;
         let mut spec = Arc::clone(spec);
-        let mut vfs = Vfs::new(crate::vfs::case_root(case_id));
-        std::fs::create_dir_all(vfs.root()).expect("create per-case tmpfs dir");
+        // Nothing is created on disk until the target touches a virtual path: every filesystem
+        // call made here runs on the filtered fuzz thread and would pay the ~10 us trap tax.
+        let vfs = Vfs::new(crate::vfs::case_root(case_id));
 
         let applied = crate::env::apply(draw.as_mut(), &spec, &mut self.saved_env);
         let report = CaseReport {
@@ -214,13 +227,10 @@ impl Sandbox {
             let blob = crate::env::environ_blob();
             let spec_mut = Arc::make_mut(&mut spec);
             for path in ["/proc/self/environ".to_string(), format!("/proc/{pid}/environ")] {
-                let path = PathBuf::from(path);
-                vfs.insert_fixed_file(&path, &blob)
-                    .expect("materialize /proc/self/environ");
                 spec_mut.nodes.push((
-                    path,
+                    PathBuf::from(path),
                     crate::spec::NodeSpec::File {
-                        content: crate::spec::Content::Fixed(Vec::new()),
+                        content: crate::spec::Content::Fixed(blob.clone()),
                         may_fail: false,
                     },
                 ));
@@ -251,15 +261,15 @@ impl Sandbox {
             .nodes()
             .iter()
             .filter_map(|(path, node)| match node {
-                crate::vfs::Node::File { .. } => {
-                    session.vfs.read_file(path).ok().map(|bytes| (path.clone(), bytes))
-                }
+                crate::vfs::Node::File { bytes } => Some((path.clone(), bytes.clone())),
                 _ => None,
             })
             .collect();
         files.sort();
         report.files = files;
-        session.vfs.cleanup();
+        if !session.vfs.nodes().is_empty() {
+            let _ = self.janitor.send(session.vfs.root().to_path_buf());
+        }
         (session.draw, report)
     }
 }

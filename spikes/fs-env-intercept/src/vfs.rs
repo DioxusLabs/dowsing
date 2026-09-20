@@ -16,7 +16,7 @@ use crate::spec::{Content, NodeSpec, Spec};
 
 #[derive(Debug, Clone)]
 pub enum Node {
-    File { bytes: usize },
+    File { bytes: Vec<u8> },
     Dir,
     Symlink { target: PathBuf },
     Missing { errno: i32 },
@@ -70,18 +70,6 @@ impl Vfs {
             .map(|rest| Path::new("/").join(rest))
     }
 
-    /// Fixed content for implicit files (e.g. `/proc/self/environ`).
-    pub fn insert_fixed_file(&mut self, virtual_path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let real = self.real_path(virtual_path);
-        if let Some(parent) = real.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&real, bytes)?;
-        self.nodes
-            .insert(virtual_path.to_path_buf(), Node::File { bytes: bytes.len() });
-        Ok(())
-    }
-
     /// Materialize `virtual_path` (and, for directories, its children) if not done yet.
     pub fn materialize(
         &mut self,
@@ -105,7 +93,7 @@ impl Vfs {
                         let bytes = generate(content, draw);
                         std::fs::write(&real, &bytes)?;
                         self.materialized_bytes += bytes.len();
-                        Node::File { bytes: bytes.len() }
+                        Node::File { bytes }
                     }
                     1 => {
                         self.non_default_variants += 1;
@@ -137,7 +125,7 @@ impl Vfs {
                         let bytes = draw.bytes(0..=16);
                         std::fs::write(self.real_path(&child), &bytes)?;
                         self.materialized_bytes += bytes.len();
-                        self.nodes.insert(child, Node::File { bytes: bytes.len() });
+                        self.nodes.insert(child, Node::File { bytes });
                     }
                 }
                 Node::Dir
@@ -207,15 +195,6 @@ impl Vfs {
         &self.nodes
     }
 
-    /// Read back the materialized bytes of a virtual file.
-    pub fn read_file(&self, virtual_path: &Path) -> io::Result<Vec<u8>> {
-        std::fs::read(self.real_path(virtual_path))
-    }
-
-    /// Remove the per-case tree.
-    pub fn cleanup(&self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
 }
 
 pub enum Resolved {
