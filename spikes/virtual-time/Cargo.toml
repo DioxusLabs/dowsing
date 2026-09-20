@@ -1,0 +1,35 @@
+[package]
+name = "virtual-time"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }
+# Only used by the `backoff_tokio_target` demo binary: the spike has to report how tokio timers
+# behave under the virtual clock, so the target must be a real tokio program.
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net"] }
+
+[[bin]]
+name = "backoff_target"
+path = "src/bin/backoff_target.rs"
+
+[[bin]]
+name = "backoff_tokio_target"
+path = "src/bin/backoff_tokio_target.rs"
+
+[[bin]]
+name = "probe_target"
+path = "src/bin/probe_target.rs"
+
+[[bin]]
+name = "backoff_sandbox"
+path = "src/bin/backoff_sandbox.rs"
+
+[[bin]]
+name = "vt_run"
+path = "src/bin/vt_run.rs"
