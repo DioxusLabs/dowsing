@@ -1,0 +1,10 @@
+[package]
+name = "dowsing-sandbox"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic tree search over decisions: ptrace supervisor, one-thread-at-a-time scheduler, virtual clock, soft-dirty memory snapshots"
+
+[dependencies]
+iterator-fuzz = { path = ".." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }

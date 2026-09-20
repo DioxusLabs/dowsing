@@ -50,10 +50,13 @@ mode. Measured stop cost ≈ 10 µs; a stop is also a scheduling point, so cost 
 not per syscall.
 
 Traced set today: `futex clone clone3 sched_yield nanosleep clock_nanosleep clock_gettime
-gettimeofday time getrandom getpid gettid exit exit_group mmap munmap mremap brk mprotect` and
-the harness marker (`getppid(MAGIC, kind, n)`, which is how the target's `dowsing::variant`
-reaches the supervisor). `mmap`-family is traced only to keep the mapping table for snapshots
-(§4); it always passes through.
+gettimeofday time getrandom rseq exit exit_group munmap poll ppoll select pselect6 epoll_*`
+and the harness marker (`getppid(MAGIC, kind, n)`, which is how the target's
+`dowsing::variant` reaches the supervisor). `rseq` is refused with `ENOSYS` (per-task kernel
+state a snapshot cannot carry); `munmap` is traced for the retention rule in §4; the polling
+family is traced so that a blocking poll is *reported* as uncontrolled rather than silently
+nondeterministic. The mapping table is read from `/proc/pid/maps` at snapshot time, not
+tracked through `mmap`.
 
 ## 3. Scheduler and clock
 
@@ -77,7 +80,8 @@ A state is `(pages, regs[tid], world)`:
   (`/proc/pid/clear_refs ← "4"`, then bit 55 of `/proc/pid/pagemap`; unprivileged; measured here:
   scan 2.2 ms per 512 MB, copy via `process_vm_readv` ≈ 1.4 GB/s, restore via `process_vm_writev`
   ≈ 1.1 µs/page).
-- `regs[tid]`: `PTRACE_GETREGS` + `GETFPREGS` for every live thread; all are stopped.
+- `regs[tid]`: `PTRACE_GETREGS` + `GETREGSET(NT_X86_XSTATE)` for every live thread; all are
+  stopped.
 - `world`: the supervisor's own structs — thread table, futex waiters, clock, mapping table,
   fd model — cloned as data.
 
@@ -97,6 +101,19 @@ Restore to snapshot S from live state L (both on one root-to-leaf path, S an anc
 Cost is proportional to pages touched between S and L, not to RSS. Fd state is not an issue
 because the target holds no observable kernel fd state (§1 inv. 4); stdout/stderr are
 append-only and are simply not rewound.
+
+Two things the kernel does that the implementation has to work around:
+
+- Soft-dirty is also a *VMA* flag (`VM_SOFTDIRTY`, set on every new mapping). A new anonymous
+  mapping that lands adjacent to an old one — a thread stack below a big table, say — merges
+  with it, and from then on `pagemap` reports every page of the merged range dirty. The snapshot
+  therefore compares each reported page against the copy the parent snapshot already holds and
+  keeps only real changes; the false positives cost a read, not storage or restore writes.
+- A run typically frees its setup on the way out (`munmap` of the table when `main` returns).
+  Restoring would then have to re-map and rewrite the whole range. Instead `munmap` of memory
+  that exists in the current snapshot is turned into `mprotect(PROT_NONE)`: contents stay,
+  faults still fault, and restore is one `mprotect` back plus the truly dirty pages. The cost is
+  address space, which glibc does not reuse anyway.
 
 ## 5. Search
 
@@ -164,11 +181,19 @@ in-process filters, LD_PRELOAD.
 Supervisor + scheduler + virtual clock + soft-dirty snapshots + tree search + tree-aware shrink,
 on two-thread targets (lost update, deadlock, timeout-dependent bug). Acceptance:
 
-- 100/100 identical traces replaying a `Case`;
-- search finds each bug and reports the `Case`; shrink returns ≤ 4 decisions;
-- restore-from-snapshot measured against re-execution on a target with an expensive prefix,
-  with the number of pages written per restore reported;
-- `cargo test`/`clippy` green for the root crate and `sandbox/`.
+- 100/100 identical traces replaying a `Case` — met (`explore lost_update --replays 100`:
+  1 distinct trace hash);
+- search finds each bug and reports the `Case`; shrink returns a short `Case` — bugs found
+  (lost update in 60–160 runs, deadlock in 20–70, timeout race in 2–30, three seeds each);
+  shrink returns 5 decisions for the deadlock but 14 (6 non-default) for the lost update: the
+  race needs both threads inside the read/write window and the current shrinker only deletes
+  and zeroes decisions, it does not merge adjacent `Budget` preemptions into one. Open;
+- restore-from-snapshot measured against re-execution on a target with an expensive prefix
+  (`slow_setup`: 64 MB table, ~95 ms to first decision) — replay from snapshot 8–11 ms vs
+  ~95 ms fresh, search 28–43 runs/s vs 11/s re-executing; restores write ~1–2.5k pages
+  (most of them the VMA-merge false positives above), snapshots along a rollout copy ~0 pages
+  but spend ~55 ms comparing the falsely-dirty 64 MB;
+- `cargo test`/`clippy` green for the root crate and `sandbox/` — met.
 
 Not in milestone 1: net/fs models (they are `Syscall` decisions and a fd model in `world`, slot
 already there), parallel supervisors, musl/static targets, signals as decisions.

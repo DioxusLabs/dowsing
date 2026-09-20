@@ -1,0 +1,8 @@
+[package]
+name = "dowsing-target-rt"
+version = "0.1.0"
+edition = "2024"
+description = "Runtime linked into sandboxed targets: trace-pc-guard -> shared bitmap + edge budget, harness decisions via marker syscall"
+
+[dependencies]
+libc = "0.2"

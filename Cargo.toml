@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 rand = { version = "0.9", features = ["small_rng"] }
 rayon = "1.10"
+
+[workspace]
+members = ["sandbox", "sandbox/target-rt"]
+exclude = ["sandbox/targets"]
