@@ -528,3 +528,73 @@ transcript: `connect Ok; Data [len=2, kind=2, n=65, b]; Close`.
 (`SECCOMP_IOCTL_NOTIF_SET_FLAGS`, `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`), `pidfd_getfd(2)`,
 `process_vm_readv(2)`, `ptrace(2)` (`PTRACE_SYSEMU`, `PTRACE_O_TRACESYSGOOD`,
 `PTRACE_GET_SYSCALL_INFO`), `epoll(7)`, `socketpair(2)`, `unix(7)`, `resolv.conf(5)`.
+
+## 10. What the prototype changed relative to this memo (post-implementation)
+
+Everything below was decided by running the code on the host described in §1; the README has the
+commands and numbers.
+
+1. **No `epoll_ctl` mirror.** The plan (§4.3, step 4) kept a supervisor-side copy of every epoll
+   interest list. strace of the tokio target showed mio `dup`s the epoll fd (`Registry::try_clone`
+   for the waker) and registers fd 1000 through the duplicate, so a per-fd-number mirror missed
+   registrations and `epoll_wait` gates saw an empty set (symptom: tokio reads timed out after a
+   successful connect). The gate now reads `/proc/<pid>/fdinfo/<epfd>` (`tfd: N events: HEX`
+   lines) at every `epoll_wait`, i.e. the kernel's own interest list, and `epoll_ctl` is no longer
+   in the filter. Cost: one small `/proc` read per wait (~10 µs), no state to keep coherent.
+2. **Async connect: plain masking, no placeholder/replace trick.** Risk 7's `ADDFD`-replace under an
+   outstanding epoll registration was not needed. The socketpair is injected at `socket()`, a
+   nonblocking `connect` returns `EINPROGRESS` and records the drawn outcome as `pending_error`; the
+   fresh pair is `EPOLLOUT`-ready so mio sees the connect "complete" on its next wait and
+   `getsockopt(SO_ERROR)` returns the drawn result. "Connect still pending for k steps" is thus not
+   modelled; the peer's *timing* is expressed only on the read side. This was enough for
+   `TcpStream::connect` + `tokio::time::timeout`; a stricter model would `EINTR` the wait.
+3. **Infinite waits are forced, timed waits are skipped.** Instead of answering `EINTR` (risk 1),
+   an infinite `epoll_wait`/`poll` whose gated fake fds all have nothing pending forces the first
+   gated peer to draw a non-`WouldBlock` event (index range excludes it), so the target cannot hang
+   and no target sees `EINTR`. For finite timeouts, if every gated peer drew `WouldBlock` and no
+   fake fd is already readable, the supervisor answers `0` ("timeout elapsed") directly instead of
+   letting the kernel sleep: the target's timeout logic runs in zero wall time (`time_skips` in the
+   `Verdict`). Before this a `--kind-byte` tokio run had 22 timeouts in 3885 cases; after, 0 in
+   30 000. Real fds in the same set (tokio's eventfd) are not affected because their readiness is
+   reported by the target's next wait.
+4. **Blocking `connect` on `std::net`** goes through the same path: `TcpStream::connect_timeout`
+   is itself nonblocking-connect + `poll` + `SO_ERROR`, so the transcript shows `(EINPROGRESS)`
+   for the std client too; plain `TcpStream::connect` (used by the `--dns` path) is answered
+   `0`/errno directly.
+5. **Coverage handoff uses `catch_unwind` + the root crate's `SancovCoverage`**, not a signal
+   handler copying raw counters (§4.6, risk 9): the child runs the target under `SancovCoverage`
+   (its sancov callbacks are process-global) and serialises `ExecutionFeedback` features and the
+   panic message into the `MAP_SHARED` region before `_exit`. `counter_coverage` therefore did not
+   need to be factored out of `src/sancov.rs`; the root crate is unchanged. Panics are reported as
+   `Outcome::Panicked(Some(msg))`; real crashes (`SIGSEGV`) still lose coverage.
+6. **DNS source address (risk 2) did not bite glibc 2.35** on this host: the resolver accepted the
+   reply from the AF_UNIX socketpair (empty peer name) — the `--dns` transcripts show A + AAAA
+   queries answered and the connect proceeding to `10.66.66.1`/`fd66::1`. The `recvfrom`
+   emulation fallback was not implemented. Netlink passthrough was not needed (no `AF_NETLINK`
+   socket observed with `AI_ADDRCONFIG` unset by `ToSocketAddrs`).
+7. **`select`/`pselect6` are passed through ungated** (logged as unhandled) and the `dup` family on
+   fake fds returns `EMFILE` (logged). None of the demo targets issue either.
+8. **Unhandled syscalls are `CONTINUE`d, not `ENOSYS`ed** (§7 "what will be measured"): with the
+   fd-range filter every notified syscall is on a fd we own, so letting the kernel run it on the
+   socketpair is the safer default; the supervisor records what it did not model.
+9. **Injected-bug shrink target.** The memo predicted `Data[kind=2, n=65]`. `cautious()` reliably
+   reaches the 3-decision structure (connect Ok, send accepted, one data event; the trailing
+   `Close` is deleted), but leaves `n` wherever discovery found it (72–255): dowsing simplifies
+   variants toward index 0 and deletes range items, and there is no gradient toward 65 because
+   smaller `n` is *benign*. A value-bisecting simplifier for range items would close the gap.
+10. **Coverage did not speed up discovery for this bug** (18 cases with `NoCoverage` vs 236–692 with
+    sancov at seed 1): the bug is one frame away from the entry point, so uniform random exploration
+    hits it first while the coverage-guided iterator spends its early budget on novelty. The
+    integration is still exercised end to end (23–249 features per case cross the fork).
+11. **Dependencies.** `libc` and `rand` only; `nix` and `rayon` were not needed. `tokio` (`rt`,
+    `net`, `io-util`, `time`, `macros`) is a *dev-dependency* used solely by `examples/tokio_client.rs`
+    — the whole point of that example is to run the unmodified tokio/mio networking stack under
+    the sandbox, which cannot be done without it.
+12. **Measurements vs §2.** Rust reimplementation reproduces the C numbers: 2.6 µs/notification
+    with `SYNC_WAKE_UP` or same-CPU, 8.3 µs unpinned without; `RET_ALLOW` filter overhead 44 ns;
+    `ADDFD` 3.3 µs pinned / 8.4 µs unpinned; fork + filter + handoff + exit + reap 199 µs at 2 MiB
+    RSS (§2.3 said 308 µs at 10 MiB). End-to-end: ~1300–1900 cases/s single-threaded for the demo
+    targets (9 notifications per std_client case, 5 `CONTINUE`d).
+13. **Not done from the plan:** the thread scheduler `variant` (§4.4; notifications are served in
+    arrival order), persistent-child mode, `ParallelCoverageCapture`, netlink synthesis,
+    `select` gating, `SCM_RIGHTS`/`/proc/self/fd` handling. Listed as next steps in the README.
