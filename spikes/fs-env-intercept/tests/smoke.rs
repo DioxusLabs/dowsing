@@ -39,6 +39,42 @@ fn getpid_is_answered_by_the_sandbox() {
 }
 
 #[test]
+fn threads_spawned_by_the_target_are_filtered_and_attributed() {
+    let mut sandbox = Sandbox::install().expect("install sandbox");
+    let spec = spec(false);
+    let fuzz_tid = sandbox.fuzz_tid();
+    let rng = curious().with_coverage(NoCoverage).next().unwrap();
+    let (rng, report, (child_tid, conf)) = sandbox.run_case(rng, &spec, || {
+        std::fs::read_to_string("/etc/app/app.conf").expect("virtual config on fuzz thread");
+        std::thread::spawn(|| {
+            // SAFETY: plain syscall.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            let conf = std::fs::read_to_string("/etc/app/app.conf").expect("virtual config on child");
+            (tid, conf)
+        })
+        .join()
+        .unwrap()
+    });
+    rng.discard();
+    assert_eq!(conf, "mode=strict\n");
+    assert_ne!(child_tid, fuzz_tid);
+    assert!(report.per_tid.contains_key(&fuzz_tid), "{:?}", report.per_tid);
+    // The child's own tid is a fuzzer variant, but the kernel reports the real tid in the
+    // notification; the child made at least the openat of the config.
+    let child_calls: u64 = report
+        .per_tid
+        .iter()
+        .filter(|(tid, _)| **tid != fuzz_tid)
+        .map(|(_, n)| *n)
+        .sum();
+    assert!(child_calls >= 1, "{:?}", report.per_tid);
+    if let Some(cpu) = sandbox.pinned_cpu() {
+        // SAFETY: plain syscall.
+        assert_eq!(unsafe { libc::sched_getcpu() } as usize, cpu, "fuzz thread stays pinned");
+    }
+}
+
+#[test]
 fn virtual_file_and_directory_are_served() {
     let mut sandbox = Sandbox::install().expect("install sandbox");
     let spec = spec(true);

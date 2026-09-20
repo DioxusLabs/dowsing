@@ -656,3 +656,45 @@ Estimated effort: steps 1–6 one session, 7–8 a second.
   proptest (`ValueTree::simplify/complicate`) — dowsing's `range`/`variant` spans already give the
   same "shrink the structured choice, not the bytes" property, so the sandbox must express every
   decision as such a choice.
+
+## 10. Prototype outcome (what changed relative to the plan)
+
+Built and measured; details, commands and tables are in [`README.md`](README.md).
+
+* **Standalone crate instead of `--features sandbox` in the root.** The spike rules require
+  `spikes/fs-env-intercept/` with its own `[workspace]`; the module layout of §8 is kept
+  (`bpf/notif/mem/supervisor/vfs/entropy/identity/env/spec` + `draw`, `fs`), and the root crate is
+  untouched. `rand` is a dependency (deterministic expansion of large entropy reads); `libc`
+  otherwise.
+* **CPU pinning is the biggest win, and was not in the plan.** The §2 numbers (~8 µs per trapped
+  call) were measured with fuzz thread and supervisor free to run on different CPUs. The same
+  round trip pinned to one CPU is ~2.4 µs (getpid), `CONTINUE` passthrough 4.4 µs instead of 9.5,
+  and the demo target runs 17k cases/s instead of 7.4k. `Sandbox::install()` pins by default;
+  `Options { pin: false }` opts out. Consequence for §3.6/§5: one fuzz/supervisor pair per CPU is
+  the natural `ParallelCases` layout. Risk R1 shrinks accordingly (passthrough tax 3.4 µs/open).
+* **Rust path unpinned is ~1.4× the C numbers** (12 µs vs 8.4 µs for getpid): epoll + mutex +
+  `ID_VALID` before writes. Pinned it is 3.4× faster than the C baseline, so the "≤ 1.2× C"
+  target in §8.3 is met only with pinning.
+* **`CaseCost` counts non-zero entropy bytes** in addition to §6.3's terms; without it `cautious()`
+  had no reason to zero served randomness (byte passes do not reduce trace length or features).
+  With it the minimized demo entropy is `[3, 0, 0, ...]` — `3` because the demo's `retries` default
+  is 3 and dropping the `retries=` line is cheaper than zeroing one byte, so the minimized file is
+  `mode=strict\n` (12 bytes) rather than §8.1's predicted 22.
+* **Per-sandbox urandom fd window** (`1000 + 8k .. +8`) instead of one fixed fd, so several
+  `Sandbox`es (one per test thread / worker) coexist in a process; the BPF program compares
+  `args[0]` against the window.
+* **In-memory copy of every materialized file** so replay assertions and the repro dump need no
+  filesystem read-back; per-case tmpfs trees are removed by an unfiltered janitor thread
+  (`remove_dir_all` on the filtered fuzz thread would pay a `CONTINUE` trap per `statx`/`openat`).
+* **`Draw::sequence`** was added to the harness-facing draw API so line-structured files shrink by
+  whole lines (`SequenceDelete` on the root crate's existing spans); the demo's `app.conf` is
+  generated this way.
+* **`--raw` (flat byte file) does not find the bug** in 200k cases: Rust string `==` is `bcmp`,
+  which `trace-compares` does not see and `src/sancov.rs` has no memcmp hooks. Root-crate follow-up.
+* **Not built (as planned for a second session): step 7 `Isolation::Fork`.** `TargetMem` is
+  pid-parameterized and the fork primitives were verified in §2.2, but the shared sancov counter
+  map needs a small root-crate hook.
+* `unotify` behaviour as predicted: `POLLHUP` arrives when the filtered thread exits, the demo
+  and time-to-bug runs reported `SEND retries = 0`, `ADDFD|SETFD|SEND` works for reopening the
+  same slot after `close`, and threads spawned by the target report through the same listener with
+  their own tid (`tests/smoke.rs`).
