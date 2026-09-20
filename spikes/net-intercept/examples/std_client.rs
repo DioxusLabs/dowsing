@@ -12,7 +12,8 @@
 //!
 //! Flags: `--no-coverage`, `--raw` (byte payloads instead of frame payloads), `--kind-byte`
 //! (frame kind drawn as a raw byte: needs trace-compares to find quickly), `--cases N`,
-//! `--seed S`, `--verbose`, `--once` (run the target once, print the transcript).
+//! `--seed S`, `--verbose`, `--once` (run the target once, print the transcript), `--dns`
+//! (connect to `fuzz.invalid:7000` so glibc's resolver runs and the fuzzer answers the DNS query).
 
 use std::{
     io::{Read, Write},
@@ -30,7 +31,16 @@ const SERVER: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(10
 
 /// The target. Everything here is ordinary std networking.
 fn client() {
-    let mut stream = match TcpStream::connect_timeout(&SERVER, Duration::from_secs(5)) {
+    talk(TcpStream::connect_timeout(&SERVER, Duration::from_secs(5)));
+}
+
+/// Same target, but the address goes through `getaddrinfo` (glibc: /etc/hosts, then UDP DNS).
+fn client_by_name() {
+    talk(TcpStream::connect("fuzz.invalid:7000"));
+}
+
+fn talk(connected: std::io::Result<TcpStream>) {
+    let mut stream = match connected {
         Ok(s) => s,
         Err(e) => {
             eprintln!("connect failed: {e}");
@@ -104,13 +114,15 @@ fn main() {
         sandbox.with_payload(frame_payload)
     };
 
+    let target: fn() = if flag("--dns") { client_by_name } else { client };
+
     if flag("--once") {
         let mut rng_iter = iterator_fuzz::curious()
             .with_coverage(iterator_fuzz::NoCoverage)
             .with_seed(value("--seed").unwrap_or(0))
             .take(1);
         let mut rng = rng_iter.next().unwrap();
-        let v = sandbox.run(&mut rng, client);
+        let v = sandbox.run(&mut rng, target);
         println!("{v:#?}");
         return;
     }
@@ -122,7 +134,7 @@ fn main() {
         seed: value("--seed"),
         verbose: flag("--verbose"),
     };
-    let report = fuzz(&mut sandbox, client, &opts);
+    let report = fuzz(&mut sandbox, target, &opts);
     report.print();
     if let Some((_, v)) = &report.best {
         for (fd, sent) in &v.sent {
