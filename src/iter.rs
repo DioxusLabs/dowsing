@@ -5,6 +5,8 @@ mod prelude;
 mod rng;
 mod run;
 mod shrink;
+#[doc(hidden)]
+pub mod snapshot_hooks;
 
 pub use api::{Cases, ParallelCases};
 #[cfg(test)]

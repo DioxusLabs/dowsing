@@ -1,6 +1,7 @@
 use super::{
     api::coverage_delta,
     mutate::{corpus_energy, refresh_corpus_energies},
+    snapshot_hooks::{Boundary, BoundaryHook, BoundaryKind, DetachedExecution, FinishHook},
     prelude::{
         Active, CandidateOrigin, Case, CaseCost, CaseCoverage, CorpusSeed, DrawKind, DrawSpan,
         MAX_PREFIX_LEN, MinPathScore, Mode, SemanticKind, SemanticSpan, SequenceItemSpan,
@@ -42,9 +43,26 @@ pub struct CaseRng<Capture: CoverageCapture = SancovCoverage> {
     pub(super) local_capture: Option<Capture>,
     pub(super) start_error: Option<String>,
     pub(super) finished: bool,
+    pub(super) boundary_hook: Option<BoundaryHook<Capture>>,
+    pub(super) finish_hook: Option<FinishHook>,
 }
 
 impl<Capture: CoverageCapture> CaseRng<Capture> {
+    pub(super) fn fire_boundary(&mut self, kind: BoundaryKind) {
+        if let Some(mut hook) = self.boundary_hook.take() {
+            hook(
+                self,
+                Boundary {
+                    kind,
+                    cursor: self.cursor,
+                },
+            );
+            if self.boundary_hook.is_none() {
+                self.boundary_hook = Some(hook);
+            }
+        }
+    }
+
     /// Seed backing this execution.
     pub fn seed(&self) -> u64 {
         self.seed
@@ -98,6 +116,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
     /// Generate a variant index in `0..upper`.
     pub fn variant(&mut self, upper: usize) -> usize {
         let upper = upper.max(1).min(u16::MAX as usize) as u16;
+        self.fire_boundary(BoundaryKind::Variant);
         self.mark_semantic(SemanticKind::Variant, |rng| {
             (rng.next_u32() as u16 % upper) as usize
         })
@@ -211,7 +230,11 @@ impl<'a, Capture: CoverageCapture> Iterator for RangeIter<'a, Capture> {
         let position = self.index;
         let index = self.order.get(position).copied().unwrap_or(position);
         self.index += 1;
-        let item_start = self.shared.rng.borrow().cursor;
+        let item_start = {
+            let mut rng = self.shared.rng.borrow_mut();
+            rng.fire_boundary(BoundaryKind::Item);
+            rng.cursor
+        };
         Some(ChildRng {
             shared: Rc::clone(&self.shared),
             index,
@@ -431,6 +454,9 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
             origin: self.origin.clone(),
         };
         let token = self.token.take();
+        if self.finish_hook.is_some() {
+            return self.finish_detached(active, token, record_coverage, case_cost);
+        }
         if let Some(mut capture) = self.local_capture.take() {
             let outcome = finish_capture(
                 &mut capture,
@@ -467,6 +493,70 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
                 }
             }
         }
+    }
+}
+
+impl<Capture: CoverageCapture> CaseRng<Capture> {
+    fn finish_detached(
+        &mut self,
+        active: Active,
+        token: Option<Capture::Token>,
+        record_coverage: bool,
+        case_cost: CaseCost,
+    ) -> Result<CaseCoverage, String> {
+        let start_error = self.start_error.take();
+        let outcome = if let Some(capture) = self.local_capture.as_mut() {
+            finish_capture(capture, token, start_error, record_coverage)
+        } else {
+            let mut state = self.shared.lock().expect("search state poisoned");
+            finish_capture(&mut state.capture, token, start_error, record_coverage)
+        };
+        let feedback = outcome?.feedback;
+        let coverage = CaseCoverage::with_cost(
+            case_cost,
+            feedback.as_ref().map_or(0, |feedback| feedback.features.len()),
+            feedback
+                .as_ref()
+                .map_or(0, |feedback| feedback.hit_count_weight),
+            active.bytes_consumed,
+        );
+        let execution = DetachedExecution {
+            trace: active.trace,
+            draws: active.draws,
+            semantics: active.semantics,
+            sequences: active.sequences,
+            bytes_consumed: active.bytes_consumed,
+            feedback,
+            case_cost,
+        };
+        if let Some(hook) = self.finish_hook.as_mut() {
+            hook(&execution);
+        }
+        Ok(coverage)
+    }
+
+    pub(super) fn merge_detached(
+        &mut self,
+        execution: DetachedExecution,
+    ) -> Result<CaseCoverage, String> {
+        let active = Active {
+            seed: self.seed,
+            trace: execution.trace,
+            draws: execution.draws,
+            semantics: execution.semantics,
+            sequences: execution.sequences,
+            bytes_consumed: execution.bytes_consumed,
+            origin: self.origin.clone(),
+        };
+        let mut state = self.shared.lock().expect("search state poisoned");
+        merge_finished_execution(
+            &mut state,
+            active,
+            FinishedCapture {
+                feedback: execution.feedback,
+            },
+            execution.case_cost,
+        )
     }
 }
 

@@ -58,6 +58,8 @@ where
             token: Some(token),
             local_capture: None,
             start_error: None,
+            boundary_hook: None,
+            finish_hook: None,
             finished: false,
         })
     }
@@ -137,6 +139,8 @@ where
         token: Some(token),
         local_capture: Some(capture),
         start_error: None,
+        boundary_hook: None,
+        finish_hook: None,
         finished: false,
     })
 }

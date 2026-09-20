@@ -29,3 +29,5 @@ pub use iter::{
     Case, CaseCost, CaseCoverage, CaseRng, Cases, Cautious, ChildRng, Curious, ParallelCases,
     RangeIter, cautious, curious,
 };
+#[doc(hidden)]
+pub use iter::snapshot_hooks;
