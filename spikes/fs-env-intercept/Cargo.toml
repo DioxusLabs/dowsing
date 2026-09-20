@@ -1,0 +1,15 @@
+[package]
+name = "fs-env-intercept"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }
+
+[profile.release]
+debug = 1
