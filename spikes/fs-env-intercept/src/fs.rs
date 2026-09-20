@@ -116,24 +116,23 @@ pub fn handle(session: &mut Session, ctx: &Ctx, n: &Notification) -> Answer {
 }
 
 fn open(session: &mut Session, dirfd: i64, path_addr: u64, flags: i32) -> Answer {
-    if session.spec.entropy.urandom {
-        if let Ok(raw) = session.mem.read_cstr(path_addr) {
-            if URANDOM_PATHS.iter().any(|p| p.as_bytes() == raw.as_slice()) {
-                let source = CString::new("/dev/urandom").unwrap();
-                // SAFETY: valid C string.
-                let fd = unsafe { libc::open(source.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-                if fd < 0 {
-                    return errno(io::Error::last_os_error());
-                }
-                let slot = session.entropy.allocate_slot();
-                session.report.virtual_opens += 1;
-                return Answer::AddFd {
-                    fd,
-                    newfd: Some(slot),
-                    cloexec: flags & libc::O_CLOEXEC != 0,
-                };
-            }
+    if session.spec.entropy.urandom
+        && let Ok(raw) = session.mem.read_cstr(path_addr)
+        && URANDOM_PATHS.iter().any(|p| p.as_bytes() == raw.as_slice())
+    {
+        let source = CString::new("/dev/urandom").unwrap();
+        // SAFETY: valid C string.
+        let fd = unsafe { libc::open(source.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return errno(io::Error::last_os_error());
         }
+        let slot = session.entropy.allocate_slot();
+        session.report.virtual_opens += 1;
+        return Answer::AddFd {
+            fd,
+            newfd: Some(slot),
+            cloexec: flags & libc::O_CLOEXEC != 0,
+        };
     }
     let path = match locate(session, dirfd, path_addr, false) {
         Ok(Located::Real) => return Answer::Continue,

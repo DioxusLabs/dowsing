@@ -15,12 +15,18 @@ mod demo_target;
 #[path = "demo_target/harness.rs"]
 mod harness;
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use fs_env_intercept::Sandbox;
 use harness::{is_bug, run_target, spec};
 use iterator_fuzz::backends::SancovCoverage;
-use iterator_fuzz::{Case, cautious, curious};
+use iterator_fuzz::{Case, CaseCoverage, cautious, curious};
+
+/// A failing case plus what the sandbox served it: (case, error, materialized files, entropy).
+type Found = (Case, String, Vec<(PathBuf, Vec<u8>)>, Vec<u8>);
+/// Best minimized case so far: (coverage, app.conf bytes, applied env, entropy).
+type Best = (CaseCoverage, Vec<u8>, Vec<(String, Option<String>)>, Vec<u8>);
 
 const DISCOVERY_CASES: usize = 200_000;
 const MINIMIZATION_CASES: usize = 3_000;
@@ -62,7 +68,7 @@ fn main() {
     let coverage = || SancovCoverage::new().with_cmp_feedback(args.dict);
 
     let started = Instant::now();
-    let mut found: Option<(Case, String, Vec<(std::path::PathBuf, Vec<u8>)>, Vec<u8>)> = None;
+    let mut found: Option<Found> = None;
     let mut executed = 0usize;
     let mut discarded = 0usize;
     let mut search = curious().with_coverage(coverage()).with_seed(args.seed);
@@ -82,7 +88,7 @@ fn main() {
         } else {
             rng.coverage_with_cost(report.cost()).expect("coverage");
         }
-        if executed % 1000 == 0 {
+        if executed.is_multiple_of(1000) {
             let stats = search.stats();
             eprintln!(
                 "  {executed} cases, {} in corpus, {} coverage ids, {:.0} cases/s",
@@ -121,8 +127,7 @@ fn main() {
     println!("replayed 3x: identical failure, files and entropy");
 
     let started = Instant::now();
-    let mut best: Option<(iterator_fuzz::CaseCoverage, Vec<u8>, Vec<(String, Option<String>)>, Vec<u8>)> =
-        None;
+    let mut best: Option<Best> = None;
     let mut minimization_cases = 0usize;
     let mut retries = 0u64;
     for rng in cautious()
@@ -161,7 +166,7 @@ fn main() {
         coverage.feature_count(),
         coverage.bytes_consumed(),
     );
-    let repro = std::path::Path::new("target/dowsing-repro");
+    let repro = Path::new("target/dowsing-repro");
     std::fs::create_dir_all(repro).ok();
     std::fs::write(repro.join("app.conf"), &conf).ok();
     println!("wrote {}", repro.join("app.conf").display());

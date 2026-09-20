@@ -129,7 +129,9 @@ pub fn read(session: &mut Session, ctx: &Ctx, n: &Notification) -> Answer {
                 return Answer::Errno(err.raw_os_error().unwrap_or(libc::EFAULT));
             }
             let iovs: Vec<(u64, usize)> = raw
-                .chunks_exact(16)
+                .as_chunks::<16>()
+                .0
+                .iter()
                 .map(|c| {
                     (
                         u64::from_ne_bytes(c[..8].try_into().unwrap()),

@@ -213,12 +213,12 @@ impl Spec {
     pub fn children(&self, dir: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = Vec::new();
         for (path, _) in &self.nodes {
-            if let Ok(rest) = path.strip_prefix(dir) {
-                if let Some(first) = rest.components().next() {
-                    let child = dir.join(first);
-                    if !out.contains(&child) {
-                        out.push(child);
-                    }
+            if let Ok(rest) = path.strip_prefix(dir)
+                && let Some(first) = rest.components().next()
+            {
+                let child = dir.join(first);
+                if !out.contains(&child) {
+                    out.push(child);
                 }
             }
         }

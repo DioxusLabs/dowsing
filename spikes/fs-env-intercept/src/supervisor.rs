@@ -62,9 +62,13 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// `materialized bytes + 16 x non-default variants`.
+    /// `materialized bytes + non-zero entropy bytes + 16 x non-default variants`.
+    ///
+    /// Zero entropy is the "simplest" entropy, so counting non-zero bytes lets `cautious()` drive
+    /// served randomness towards zeros once nothing else can shrink.
     pub fn cost(&self) -> CaseCost {
-        CaseCost::new(self.materialized_bytes + 16 * self.non_default_variants)
+        let nonzero_entropy = self.entropy.iter().filter(|b| **b != 0).count();
+        CaseCost::new(self.materialized_bytes + nonzero_entropy + 16 * self.non_default_variants)
     }
 
     /// True when the case should be excluded from feedback.
