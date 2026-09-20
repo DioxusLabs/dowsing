@@ -20,6 +20,7 @@ pub struct Stats {
 
 /// Parse one frame body. `kind == KIND_COMPRESSED` carries `[u8 n][byte]` and expands `n`
 /// copies of `byte` into a fixed 64-byte buffer without checking `n` (the injected bug).
+#[allow(clippy::needless_range_loop)]
 pub fn handle_frame(kind: u8, payload: &[u8], stats: &mut Stats) -> Result<(), String> {
     stats.frames += 1;
     match kind {
