@@ -7,24 +7,37 @@
 
 use rand::{RngCore, SeedableRng};
 
-use crate::bpf::{URANDOM_FD_BASE, URANDOM_FD_SLOTS};
+use crate::bpf::URANDOM_FD_SLOTS;
 use crate::notif::Notification;
 use crate::supervisor::{Answer, Ctx, Session};
 
 pub const MAX_DRAWN: usize = 64;
 
-#[derive(Default)]
 pub struct EntropyState {
+    /// First fd of this sandbox's urandom window (matches its BPF filter).
+    pub fd_base: u32,
     next_slot: u32,
     pub non_default: usize,
 }
 
 impl EntropyState {
+    pub fn new(fd_base: u32) -> Self {
+        Self {
+            fd_base,
+            next_slot: 0,
+            non_default: 0,
+        }
+    }
+
     /// Next fd number for an injected urandom fd.
     pub fn allocate_slot(&mut self) -> u32 {
-        let slot = URANDOM_FD_BASE + (self.next_slot % URANDOM_FD_SLOTS);
+        let slot = self.fd_base + (self.next_slot % URANDOM_FD_SLOTS);
         self.next_slot += 1;
         slot
+    }
+
+    pub fn owns_fd(&self, fd: u32) -> bool {
+        (self.fd_base..self.fd_base + URANDOM_FD_SLOTS).contains(&fd)
     }
 }
 
@@ -98,9 +111,7 @@ fn fill_single(session: &mut Session, ctx: &Ctx, buf: u64, len: usize) -> Answer
 /// `read`/`pread64`/`readv`/`preadv`/`preadv2` on an fd in the urandom window.
 pub fn read(session: &mut Session, ctx: &Ctx, n: &Notification) -> Answer {
     let fd = n.args[0] as u32;
-    if !(URANDOM_FD_BASE..URANDOM_FD_BASE + URANDOM_FD_SLOTS).contains(&fd)
-        || !session.spec.entropy.urandom
-    {
+    if !session.entropy.owns_fd(fd) || !session.spec.entropy.urandom {
         return Answer::Continue;
     }
     match n.nr {

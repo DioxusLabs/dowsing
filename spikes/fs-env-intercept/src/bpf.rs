@@ -6,8 +6,10 @@
 
 use std::io;
 
-/// First fd of the window into which `/dev/urandom` fds are injected. `read`/`pread` on fds in
-/// `URANDOM_FD_BASE..URANDOM_FD_BASE + URANDOM_FD_SLOTS` are trapped; all other reads are native.
+/// First fd of the window into which `/dev/urandom` fds are injected. Each sandbox in a process
+/// gets its own window (`URANDOM_FD_BASE + k * URANDOM_FD_SLOTS`, see [`install`]) because the fd
+/// table is process-wide; `read`/`pread` on fds in the window are trapped, all other reads are
+/// native.
 pub const URANDOM_FD_BASE: u32 = 1000;
 pub const URANDOM_FD_SLOTS: u32 = 8;
 
@@ -86,7 +88,7 @@ fn jump(code: u32, k: u32, jt: Target, jf: Target) -> Insn {
 }
 
 /// Build the filter program.
-pub fn program() -> Vec<libc::sock_filter> {
+pub fn program(urandom_base: u32) -> Vec<libc::sock_filter> {
     let mut insns = Vec::new();
     insns.push(stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, OFF_ARCH));
     insns.push(jump(
@@ -135,13 +137,13 @@ pub fn program() -> Vec<libc::sock_filter> {
     insns.push(stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, OFF_ARG0_LO));
     insns.push(jump(
         libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K,
-        URANDOM_FD_BASE,
+        urandom_base,
         Target::Next,
         Target::Allow,
     ));
     insns.push(jump(
         libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K,
-        URANDOM_FD_BASE + URANDOM_FD_SLOTS,
+        urandom_base + URANDOM_FD_SLOTS,
         Target::Allow,
         Target::Notif,
     ));
@@ -198,8 +200,8 @@ pub fn program() -> Vec<libc::sock_filter> {
 ///
 /// The filter is permanent for the lifetime of the thread and is inherited by threads it spawns
 /// afterwards. Sets `PR_SET_NO_NEW_PRIVS`.
-pub fn install() -> io::Result<i32> {
-    let mut program = program();
+pub fn install(urandom_base: u32) -> io::Result<i32> {
+    let mut program = program(urandom_base);
     let prog = libc::sock_fprog {
         len: program.len() as u16,
         filter: program.as_mut_ptr(),

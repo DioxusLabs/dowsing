@@ -99,6 +99,7 @@ struct Shared {
 pub struct Sandbox {
     shared: Arc<Shared>,
     fuzz_tid: u32,
+    urandom_base: u32,
     saved_env: Vec<(String, Option<std::ffi::OsString>)>,
     /// Per-case tmpfs trees are removed by an unfiltered janitor thread: `remove_dir_all` on the
     /// fuzz thread would pay the trap tax on every `statx`/`openat` it issues.
@@ -125,7 +126,10 @@ impl Sandbox {
                     let _ = std::fs::remove_dir_all(root);
                 }
             })?;
-        let listener = bpf::install()?;
+        static NEXT_WINDOW: AtomicU64 = AtomicU64::new(0);
+        let urandom_base =
+            bpf::URANDOM_FD_BASE + NEXT_WINDOW.fetch_add(1, Ordering::Relaxed) as u32 * bpf::URANDOM_FD_SLOTS;
+        let listener = bpf::install(urandom_base)?;
         let shared = Arc::new(Shared {
             session: Mutex::new(None),
             listener,
@@ -138,6 +142,7 @@ impl Sandbox {
         Ok(Self {
             shared,
             fuzz_tid,
+            urandom_base,
             saved_env: Vec::new(),
             janitor,
         })
@@ -242,7 +247,7 @@ impl Sandbox {
             vfs,
             mem: TargetMem::new(pid),
             identity: identity::IdentityState::new(pid as u32, self.fuzz_tid),
-            entropy: entropy::EntropyState::default(),
+            entropy: entropy::EntropyState::new(self.urandom_base),
             report,
         }
     }
