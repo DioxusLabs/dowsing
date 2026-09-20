@@ -148,7 +148,9 @@ invocations on this VM.
 | std_server `--no-coverage` | bug at case 16, 1560 cases/s | 2000 in 1.29 s, 65 reproduced | cost 3: `bind; listen; accept -> 1001; send; recv <- Compressed[n=225]; close` |
 | std_server sancov | bug at case 7, 1303 cases/s, 39 features | 2000 in 1.45 s, 89 reproduced | cost 3 |
 
-All runs: 0 timeouts, 0 supervisor errors, empty unhandled-syscall list (except the documented
+Cases-to-bug is not perfectly reproducible across runs even with the same seed (a fresh-clone
+re-run of `tokio_client --seed 1` found it at case 184 instead of 236; the `--no-coverage` runs
+repeated exactly). All runs: 0 timeouts, 0 supervisor errors, empty unhandled-syscall list (except the documented
 `select`/`dup` pass-throughs, which none of the targets issue). A single std_client case is 9
 notifications, 5 of them `CONTINUE`d (`--once` output). Per-case cost is dominated by fork/exit
 (~200 µs) plus ~10 notifications (~30 µs) plus the harness; ~0.5 ms/case ≈ 1300–1900 cases/s.
