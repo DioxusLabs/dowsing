@@ -73,6 +73,8 @@ pub struct Verdict {
     /// Notifications handled / of which continued into the kernel.
     pub syscalls: u64,
     pub continued: u64,
+    /// Timed poll/epoll waits answered `0` directly (no sleep) because every peer chose `WouldBlock`.
+    pub time_skips: u64,
     pub sync_wake_up: bool,
     /// Bytes the target sent per fake fd.
     pub sent: Vec<(i32, Vec<u8>)>,
@@ -152,6 +154,7 @@ impl Sandbox {
                     unhandled: Vec::new(),
                     syscalls: 0,
                     continued: 0,
+                    time_skips: 0,
                     sync_wake_up: false,
                     sent: Vec::new(),
                     coverage_features: 0,
@@ -177,6 +180,7 @@ impl Sandbox {
             unhandled: std::mem::take(&mut sup.unhandled),
             syscalls: sup.syscalls,
             continued: sup.continued,
+            time_skips: sup.time_skips,
             sync_wake_up,
             sent,
             coverage_features: report.feature_count,

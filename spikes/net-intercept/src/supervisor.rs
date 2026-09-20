@@ -37,6 +37,8 @@ pub struct NetSupervisor<'a, C: CoverageCapture> {
     pub unhandled: Vec<String>,
     pub syscalls: u64,
     pub continued: u64,
+    /// Timed readiness waits answered `0` directly instead of sleeping.
+    pub time_skips: u64,
     pub verbose: bool,
     /// Optional protocol-aware renderer for `Data` payloads in the transcript.
     pub describe_payload: Option<fn(&[u8]) -> String>,
@@ -78,6 +80,7 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
             unhandled: Vec::new(),
             syscalls: 0,
             continued: 0,
+            time_skips: 0,
             verbose,
             describe_payload: None,
         }
@@ -803,11 +806,34 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
                 Err(_) => return cont(),
             }
         }
+        let interested: Vec<RawFd> = fds
+            .iter()
+            .filter(|p| p.fd >= FAKE_FD_BASE as RawFd && p.events & libc::POLLIN != 0)
+            .map(|p| p.fd)
+            .collect();
+        self.readiness_wait(&interested, infinite, "poll")
+    }
+
+    /// Gate every interested fake socket, then either let the kernel run the wait or - when
+    /// the peers all chose `WouldBlock` on a timed wait and nothing fake is already ready -
+    /// answer `0` (timeout elapsed) directly so the target's own timeout logic runs without
+    /// the sandbox sleeping through it ("time skip"). Real fds in the same set are still
+    /// reported by the target's next wait; edge-triggered epoll keeps unreported edges.
+    fn readiness_wait(&mut self, interested: &[RawFd], infinite: bool, via: &str) -> Handled {
+        let already_ready = interested.iter().any(|fd| {
+            self.sockets.get(fd).is_some_and(|s| {
+                s.reset || s.eof_sent || s.target_unread() > 0 || s.listen_wakeups > 0
+            })
+        });
+        let before = self.decisions;
         let mut forced = false;
-        for p in fds {
-            if p.fd >= FAKE_FD_BASE as RawFd && p.events & libc::POLLIN != 0 {
-                self.gate_readable(p.fd, infinite, &mut forced, "poll");
-            }
+        for fd in interested {
+            self.gate_readable(*fd, infinite, &mut forced, via);
+        }
+        let drew_would_block = self.decisions > before && !forced;
+        if drew_would_block && !infinite && !already_ready {
+            self.time_skips += 1;
+            return ok(0);
         }
         cont()
     }
@@ -832,11 +858,7 @@ impl<'a, C: CoverageCapture> NetSupervisor<'a, C> {
             .map(|(fd, _)| fd)
             .collect();
         interested.sort_unstable();
-        let mut forced = false;
-        for fd in interested {
-            self.gate_readable(fd, infinite, &mut forced, "epoll_wait");
-        }
-        cont()
+        self.readiness_wait(&interested, infinite, "epoll_wait")
     }
 
     fn sys_ioctl(&mut self, n: &Notification<'_>) -> Handled {

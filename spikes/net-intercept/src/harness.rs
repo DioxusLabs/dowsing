@@ -44,6 +44,7 @@ pub struct FuzzReport {
     pub best: Option<(CaseCoverage, Verdict)>,
     pub syscalls: u64,
     pub continued: u64,
+    pub time_skips: u64,
     /// Distinct unhandled-syscall notes seen across all cases (capped).
     pub unhandled: Vec<String>,
 }
@@ -94,8 +95,8 @@ impl FuzzReport {
             }
         }
         println!(
-            "syscalls intercepted: {} ({} continued into the kernel)",
-            self.syscalls, self.continued
+            "syscalls intercepted: {} ({} continued into the kernel, {} timed waits skipped)",
+            self.syscalls, self.continued, self.time_skips
         );
         if !self.unhandled.is_empty() {
             println!("unhandled syscall notes:");
@@ -147,11 +148,13 @@ fn run<C: CoverageCapture>(
         best: None,
         syscalls: 0,
         continued: 0,
+        time_skips: 0,
         unhandled: Vec::new(),
     };
     let note = |report: &mut FuzzReport, v: &Verdict| {
         report.syscalls += v.syscalls;
         report.continued += v.continued;
+        report.time_skips += v.time_skips;
         for u in &v.unhandled {
             if !report.unhandled.contains(u) && report.unhandled.len() < 32 {
                 report.unhandled.push(u.clone());
