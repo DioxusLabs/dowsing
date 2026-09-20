@@ -128,7 +128,8 @@ logs of the same case (`vt_run --events`):
 
 Two runnable worker threads reach their next stop in kernel-scheduler order; because every clock
 read adds the quantum, the interleaving changes the virtual timestamps of everything after it, and
-in 10/100 replays the final virtual time differs (the panic still reproduced in 90/100). This is
+in 10–21/100 replays the final virtual time differs (the panic still reproduced in 79–90/100 across
+three fresh-clone runs). This is
 the risk (1) of the memo and is left to the deterministic-scheduling spike; `current_thread`
 programs and plain std programs whose threads only interact through supervised waits replay
 exactly.

@@ -106,7 +106,7 @@ Full numbers and raw output are in [RESULTS.md](RESULTS.md).
 | stops per failing run | 44 | 447 | ~510 |
 | `cautious()` 300 variants: reproduced / time | 65 / 358 ms | 42 / 722 ms | 90 / 1196 ms |
 | minimised case | 40 rng bytes, 0 jumps, cost 120 | 56 bytes, 0 jumps, cost 120 | 88 bytes, 0 jumps, cost 120 |
-| 100 replays identical (event-log hash) | **100/100** | **100/100** | 0/100 (90/100 same outcome+virtual time) |
+| 100 replays identical (event-log hash) | **100/100** | **100/100** | 0/100 (79–90/100 same outcome+virtual time across runs) |
 
 * `probe_target` (single run): 23.501 s virtual in 111 ms wall, 10 077 stops (10 030 of them the
   1 ms `Instant::now()` spin at a 100 ns quantum), every std API exact to the nanosecond.
@@ -139,8 +139,8 @@ Full numbers and raw output are in [RESULTS.md](RESULTS.md).
 * **Multi-thread replay.** The virtual clock is exact but *which* runnable thread hits the next
   stop first is still decided by the kernel scheduler: two tokio workers interleave their clock
   reads (each read advances `vnow` by the quantum) and `FUTEX_WAKE`s differently, so the event log
-  hash differs in 100/100 replays and 10 % of replays even get a different final virtual time. The
-  outcome (panic) reproduced in 90/100. Fixing this is the deterministic-scheduling spike
+  hash differs in 100/100 replays and 10–20 % of replays even end at a different final virtual
+  time. The outcome (panic) reproduced in 79–90/100 across runs. Fixing this is the deterministic-scheduling spike
   (resume exactly one runnable thread at a time).
 * **Unsupervised blocking syscalls** (`read` on a fifo/socket, `accept`, `waitpid`, `open` of a
   FIFO) are invisible to quiescence detection: the wall-clock watchdog reports `Hang` after
