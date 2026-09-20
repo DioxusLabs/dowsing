@@ -1,0 +1,10 @@
+[package]
+name = "sched-target-rt"
+version = "0.1.0"
+edition = "2024"
+description = "Tiny runtime linked into scheduled targets: sancov trace-pc-guard -> shared bitmap + edge budget"
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

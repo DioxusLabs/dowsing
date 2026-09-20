@@ -1,0 +1,14 @@
+[package]
+name = "sched-targets"
+version = "0.1.0"
+edition = "2024"
+description = "Plain std::thread demo programs that are run under the thread scheduler (no mocks)"
+
+[dependencies]
+sched-target-rt = { path = "../target-rt" }
+
+# Keep the demo code readable in disassembly / edge counts; the scheduler does not depend on it.
+[profile.release]
+debug = 1
+
+[workspace]

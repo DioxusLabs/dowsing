@@ -1,0 +1,12 @@
+[package]
+name = "thread-scheduler"
+version = "0.1.0"
+edition = "2024"
+description = "Spike: deterministic, fuzzer-controlled scheduling of multithreaded targets via ptrace + seccomp"
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }
+
+[workspace]
