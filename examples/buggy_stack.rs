@@ -9,13 +9,16 @@
 //! -Cllvm-args=-sanitizer-coverage-trace-compares`
 //!
 //! `./target/debug/examples/buggy_stack`
+//!
+//! Set `DOWSING_SEED=<u64>` to change the search seed.
 
-use iterator_fuzz::{cautious, curious};
-use rand::Rng;
+use iterator_fuzz::coverage::CoverageCapture;
+use iterator_fuzz::{CaseRng, cautious, curious};
 use std::collections::VecDeque;
 
 const DISCOVERY_CASES: usize = 8_192;
 const MINIMIZATION_CASES: usize = 4_096;
+const MAX_OPS: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
@@ -28,12 +31,13 @@ enum Op {
     Restore,
 }
 
-fn sample(rng: &mut impl Rng) -> Vec<Op> {
-    let len = usize::from(rng.random::<u8>() % 80);
-
-    (0..len)
-        .map(|_| match rng.random::<u8>() % 7 {
-            0 => Op::Push(i32::from(rng.random::<u8>() % 16)),
+/// Sample an op sequence with structured draws: `range` records the sequence length and one span
+/// per item, `variant` records each discriminant, so `cautious()` can delete or simplify whole ops
+/// instead of guessing where they start in the raw RNG byte stream.
+fn sample<C: CoverageCapture>(rng: &mut CaseRng<C>) -> Vec<Op> {
+    rng.range(0..MAX_OPS)
+        .map(|mut item| match item.variant(7) {
+            0 => Op::Push(item.variant(16) as i32),
             1 => Op::Pop,
             2 => Op::Flip,
             3 => Op::Spill,
@@ -164,19 +168,29 @@ fn check_stack(ops: &[Op]) -> Result<(), String> {
 }
 
 fn main() {
+    let seed = std::env::var("DOWSING_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+
     // Maximize code coverage between when rng is created and dropped in the body of the loop, to increase the chance of hitting the bug.
-    for mut rng in curious().take(DISCOVERY_CASES) {
+    for mut rng in curious().with_seed(seed).take(DISCOVERY_CASES) {
         let ops = sample(&mut rng);
         if let Err(_err) = check_stack(&ops) {
             let case = rng.fork_case();
             let _coverage = rng.coverage().expect("finish discovery coverage");
             // Minimize the code executed by the discovery loop, to increase the chance of hitting the bug in the minimization loop.
-            let mut cautious = cautious().with_case(case);
+            let mut cautious = cautious().with_seed(seed).with_case(case);
             let mut best = None;
             for mut variant in cautious.by_ref().take(MINIMIZATION_CASES) {
                 let ops = sample(&mut variant);
                 if let Err(error) = check_stack(&ops) {
-                    let coverage = variant.coverage().expect("finish minimization coverage");
+                    // The op count is the domain cost: it ranks ahead of coverage features and
+                    // RNG bytes, so the minimizer prefers shorter reproducers over ones that
+                    // merely execute fewer branches.
+                    let coverage = variant
+                        .coverage_with_cost(ops.len())
+                        .expect("finish minimization coverage");
                     if best
                         .as_ref()
                         .is_none_or(|(best_coverage, _, _)| coverage < *best_coverage)
@@ -191,7 +205,8 @@ fn main() {
 
             if let Some((coverage, ops, failure)) = best {
                 println!(
-                    "found stack bug with {} features and {} bytes: {:?}\nerror: {}",
+                    "found stack bug with {} ops, {} features and {} bytes: {:?}\nerror: {}",
+                    ops.len(),
                     coverage.feature_count(),
                     coverage.bytes_consumed(),
                     ops,
