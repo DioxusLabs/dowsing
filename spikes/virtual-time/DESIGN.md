@@ -377,6 +377,34 @@ Nothing about the `curious`/`cautious` engines changes; the only additions are t
 
 ## 7. Prototype plan
 
+> **As built (see [README.md](README.md) and [RESULTS.md](RESULTS.md)).** The prototype follows
+> §3 unchanged: seccomp `RET_TRACE` filter + ptrace supervisor, auxv `AT_SYSINFO_EHDR → AT_IGNORE`
+> at the exec stop, single-stop clock emulation, zero-timeout probes + parking, `pidfd_getfd` fd
+> mirroring, quiescence jumps from the `CaseRng`, sancov counters copied from tracee memory.
+> Deviations from the plan below:
+>
+> * Per the spike rules everything is a **standalone crate** (`spikes/virtual-time`, empty
+>   `[workspace]`, `iterator-fuzz = { path = "../.." }`) with `src/{sandbox,ptrace,seccomp,clock,
+>   waits,coverage}.rs` and `src/bin/*` instead of a `sandbox` feature + `examples/` in the root
+>   crate; the root crate is unmodified. The announce hook is compiled into the target binaries
+>   (`src/bin/announce.rs`) rather than `src/sancov.rs`. `tokio` is a regular dependency of the
+>   demo binary.
+> * Tracee memory is accessed with `process_vm_readv`/`writev` instead of `/proc/pid/mem`.
+> * Step 8 stretch goals: `timerfd_settime`/`gettime` **are** emulated (virtual timer queue, real
+>   1 ns arm on a `pidfd_getfd` mirror at the virtual deadline); the multi-thread tokio target was
+>   run and its nondeterminism measured (0/100 identical event logs, 90/100 same outcome); the
+>   shared-page vDSO fast path was **not** built (auxv hiding is the only vDSO strategy in use;
+>   `--no-hide-vdso` serves as the control and hangs the target as predicted).
+> * The backoff bug reproduces with **zero** non-natural jumps (the target's own jitter overshoots
+>   the deadline), so `cautious()` shrinks every discovered case down to the natural schedule.
+>   Overshoot jumps were still exercised during discovery.
+> * `Sandbox` reaps with `waitpid(-1, __WALL | __WNOTHREAD)` so several sandboxes can run on
+>   different threads of one harness process (the tests do); on `Hang` every thread group seen
+>   (targets may `fork`) is killed.
+> * Not emulated: `setitimer`/`alarm`/POSIX timers, CPU-time clocks (passed through), signal
+>   masks of `ppoll`/`pselect6`/`epoll_pwait*` (ignored); `timerfd` intervals re-arm but report
+>   one expiration per virtual firing (untested beyond one-shot).
+
 Everything lives in the existing crate behind a `sandbox` cargo feature (Linux x86-64 only), plus
 two examples. New dependency: `libc` (for `ptrace`, `seccomp`, `pidfd_*`, `user_regs_struct`);
 `tokio` as a dev-dependency for the second target only.

@@ -4,7 +4,7 @@
 //! replayed to check the event log hash is identical.
 //!
 //! `backoff_sandbox [--target PATH] [--no-coverage] [--runs N] [--shrink N] [--replays N]
-//!                  [--max-jumps N] [--quiet-target] [-- target args]`
+//!                  [--max-jumps N] [--show-target] [-- target args]`
 
 use std::{
     path::PathBuf,
@@ -182,18 +182,25 @@ fn main() {
 
     eprintln!("== replay: {} times", o.replays);
     let mut identical = 0;
+    let mut same_outcome = 0;
     let replay_sandbox = sandbox.clone().quiet(true);
     let started = Instant::now();
     for _ in 0..o.replays {
         let mut rng = best_case.clone().replay();
         let again = replay_sandbox.run(&mut rng);
         rng.discard();
+        if again.outcome == best_report.outcome
+            && again.virtual_elapsed.as_millis() == best_report.virtual_elapsed.as_millis()
+        {
+            same_outcome += 1;
+        }
         if again.event_hash == best_report.event_hash && again.outcome == best_report.outcome {
             identical += 1;
         }
     }
     eprintln!(
-        "replays identical: {identical}/{} ({:.2}ms each)",
+        "replays identical (event log hash): {identical}/{}; same outcome + virtual time: {same_outcome}/{} ({:.2}ms each)",
+        o.replays,
         o.replays,
         started.elapsed().as_secs_f64() * 1e3 / o.replays.max(1) as f64
     );
