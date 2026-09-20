@@ -26,14 +26,15 @@ it ran and did not find the bug.
 |---|---|---|---|---|---|---|
 | **native loop** | yes | 1/20 000 runs, 36.8 s (1.83 ms/run) | 0/2 000, 4.0 s | 0/2 000, 14.0 s | 41–46 ms/run (re-executes setup) | not reproducible (1 in 20 000) |
 | **rr 5.9 `record -h` (chaos)** | yes | 0/300, 90 s (300 ms/run) | 0/300, 64 s | 4/300, 77 s (256 ms/run) | — (record/replay only, no resume) | yes; `rr replay` 79.8 ms |
+| **hermit** (v1 @20622f9) default / `Random` / `StickyRandom` / `--chaos` pt=100k / pt=10k | yes | 0/100 each; 80 / 27 / 32 / 117 / 864 ms/run (plus 0/1000 `Random`, 0/20 pt=1000 at 5.3 s/run) | 0/100 each; 25 / 24 / 23 / 104 / 865 ms/run — harness `variant` is clock-seeded and hermit's clock is deterministic, so always the same variant | 0/100 each; 27 / 25 / 27 / 108 / 856 ms/run | — (no snapshot; re-executes) | yes; `--verify` (2 runs + log diff) 0.28 s, deterministic |
 | **loom 0.7** (exhaustive) | no — ported to `loom::sync` | 10 iterations, 0.4 ms | 17 iterations (4 variants), 89 ms | **—** `wait_timeout` never times out in loom; 7 iterations, no bug | — | yes (deterministic, by construction) |
 | **shuttle 0.8** random / PCT(2) / DFS | no — ported to `shuttle::sync` | 1 / 4 / 111 iterations, ≤0.8 ms | 4 / 56 / 182 iterations, ≤0.8 ms | **—** `sleep` is a yield; 100 000 / 100 000 / 40 (DFS exhausted) iterations, no bug | — | yes (schedule seed) |
 | **ThreadSanitizer** (nightly `-Zsanitizer=thread`) | recompiled | 0/200, 3.1 s (15.5 ms/run) — not a data race | not run | not run | — | — |
 | **fork/CoW** (single-thread holder) | yes | n/a (baseline only) | n/a | n/a | 38–45 ms setup once, then **1.8–1.9 ms/run** | — (holder cannot hold two live threads) |
 | **CRIU 4.1** | yes | n/a | n/a | n/a | dump 64–77 ms (65.7 MB image), **restore 39–41 ms/run** | full-process, not per-decision |
-| **dowsing sandbox (this PR)** | yes, plus 1 harness call for T2 | 62 / 66 / 155 runs, **0.16 / 0.11 / 0.25 s** | 20 / 45 / 70 runs, **0.03 / 0.06 / 0.10 s** | 2 / 9 / 31 runs, **0.006 / 0.014 / 0.052 s** | root 100 ms once, then **1.8 ms/restore**, 3.0 ms/run incl. supervision | 100/100 replays identical, 1.0–2.8 ms each; shrinks to 14 / 5 / 15–17 decisions |
+| **dowsing sandbox (this branch)** | yes, plus 1 harness call for T2 | 62 / 66 / 155 runs, **0.16 / 0.11 / 0.25 s** | 20 / 45 / 70 runs, **0.03 / 0.06 / 0.10 s** | 2 / 9 / 31 runs, **0.006 / 0.014 / 0.052 s** | root 100 ms once, then **1.8 ms/restore**, 3.0 ms/run incl. supervision | 100/100 replays identical, 1.0–2.8 ms each; shrinks to 14 / 5 / 15–17 decisions |
 
-Rates for the sandbox after the fix in this PR: 386–620 runs/s on T1, 659–784 on T2, 321–646 on T3,
+Rates for the sandbox after the soft-dirty fix: 386–620 runs/s on T1, 659–784 on T2, 321–646 on T3,
 262 on T4 (with the 64 MB image live). Before the fix (soft-dirty scan treating never-touched
 stack pages as dirty) it was 33/s on T1 and 30/s on T4; the fix is what makes the T4 restore
 (1.8 ms) match fork/CoW (1.9 ms) while keeping both threads.
@@ -51,6 +52,16 @@ stack pages as dirty) it was 33/s on T1 and 30/s on T4; the fix is what makes th
   find T1 or T2 in 300 runs at ~250 ms/run (the same wall time the sandbox used to find all three
   bugs on all seeds ~100× over). rr searches by re-recording from scratch; it has no notion of a
   decision node to return to, and no coverage feedback.
+- **Hermit is the closest design** — unmodified binary, ptrace+seccomp, one thread at a time,
+  virtual time, deterministic by construction (`--verify` agrees) — and it found none of the three
+  bugs in 1 500+ runs. Its schedule decisions happen at syscalls, and T1's window (between two uncontended
+  `Mutex` ops, no syscall) never contains one; `--chaos` adds branch-counter
+  preemption but at a 10 000-RCB quantum the run costs 0.86 s and still misses (one seed in 100
+  crashed hermit itself with SIGSTKFLT, not the target). Under hermit's virtual clock T3's `sleep(5ms)`
+  is always shorter than the `wait_timeout(50ms)` deadline (time is a function of the schedule,
+  not a search dimension), so the timeout branch was never taken in 500 runs; the sandbox treats "how far does the clock
+  jump" as a decision and finds T3 in 2–31 runs. Hermit also has no harness decision API: T2's
+  `variant(4)` falls back to a clock-seeded RNG that hermit makes constant.
 - **TSan does not find T1** and this is correct behaviour for TSan: every access is under the
   mutex. Detecting "the invariant was violated between two critical sections" needs an oracle
   (the target's own assert) plus a schedule that violates it — which is the search problem.
@@ -75,9 +86,10 @@ stack pages as dirty) it was 33/s on T1 and 30/s on T4; the fix is what makes th
 - **AFL++ / libFuzzer / cargo-fuzz**: input-byte fuzzers. These targets take no input; the task
   is schedule/time search, which they do not do (and the sandbox does not replace them for byte
   inputs — dowsing's existing in-process coverage-guided loop is that lane). Not measured.
-- **Hermit** (deterministic Linux process container with chaos scheduling, the closest design
-  to this PR): see the `hermit` section of `results.txt` if present; otherwise the build did not
-  complete on this host in the session.
+- **Hermit at HEAD**: neither the upstream `main` (autocargo `Cargo.toml` misses the
+  `detcore-dbi`/`reverie-kvm` path deps) nor the maintained fork (`rrnewton/hermit`, needs
+  Linux ≥ 6.9 `PIDFD_THREAD`; fails with `EINVAL` on 6.8) starts here; the row above is the last
+  v1 commit built as described in `hermit_sweep.sh`.
 
 ## Reproduce
 
@@ -86,6 +98,7 @@ sandbox/build-targets.sh
 cd sandbox/compare
 ./run.sh                          # all sections → results.txt
 ./run.sh sandbox snapshot         # subsets: native rr sandbox loom shuttle snapshot tsan
+HERMIT=/path/to/hermit ./hermit_sweep.sh 100   # hermit row (build notes in the script header)
 CRIU=/path/to/criu ./run.sh snapshot   # CRIU ≥ 4.x (Ubuntu's 3.16 segfaults on restore); needs passwordless sudo
 ```
 

@@ -42,3 +42,30 @@ tool=sandbox target=slow_setup | root: exec + run to first decision in 100.13ms 
 ## ThreadSanitizer (nightly -Zsanitizer=thread) on lost_update: the bug is not a data race
 tool=tsan target=lost_update runs=200 failures=0 hangs=0 total_ms=3101.739638000 per_run_ms=15.50
 # done
+
+### hermit (v1 20622f9 + reverie 3ca6f7f patched; see hermit_sweep.sh)
+hermit: hermit 0.1
+hermit lost_update [default]                          0/100 failed (first=none) 80.0 ms/run
+hermit lost_update [Random]                           0/100 failed (first=none) 27.2 ms/run
+hermit lost_update [StickyRandom p=0.5]               0/100 failed (first=none) 31.6 ms/run
+hermit lost_update [chaos pt=100000]                  0/100 failed (first=none) 116.5 ms/run
+./hermit_sweep.sh: line 23: 384126 Stack fault             timeout 120 "$HERMIT" run "$@" --seed="$i" -- "$T/$t" > /dev/null 2>&1
+hermit lost_update [chaos pt=10000]                   1/100 failed (first=28) 864.4 ms/run
+hermit deadlock    [default]                          0/100 failed (first=none) 25.0 ms/run
+hermit deadlock    [Random]                           0/100 failed (first=none) 23.7 ms/run
+hermit deadlock    [StickyRandom p=0.5]               0/100 failed (first=none) 23.2 ms/run
+hermit deadlock    [chaos pt=100000]                  0/100 failed (first=none) 103.6 ms/run
+hermit deadlock    [chaos pt=10000]                   0/100 failed (first=none) 865.2 ms/run
+hermit sleep_race  [default]                          0/100 failed (first=none) 27.2 ms/run
+hermit sleep_race  [Random]                           0/100 failed (first=none) 25.2 ms/run
+hermit sleep_race  [StickyRandom p=0.5]               0/100 failed (first=none) 26.8 ms/run
+hermit sleep_race  [chaos pt=100000]                  0/100 failed (first=none) 108.1 ms/run
+hermit sleep_race  [chaos pt=10000]                   0/100 failed (first=none) 856.2 ms/run
+hermit verify (2 runs + log compare):
+Done processing logs, no substantive differences found.
+:: Success: deterministic.
+real	0m0.279s
+hermit lost_update [Random] 1000 seeds: 0/1000 failed, 33.0 ms/run
+hermit lost_update [chaos pt=1000] 20 seeds: 0/20 failed, 5320 ms/run
+hermit lost_update [chaos pt=10000] seed 28: hermit itself died with SIGSTKFLT once, exit 0 on rerun (target did not fail)
+rrnewton/hermit HEAD (g5905a449948e): 'failed to initialize ptrace for tracee: EINVAL' — pidfd_open(PIDFD_THREAD) needs Linux >= 6.9
