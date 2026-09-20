@@ -19,9 +19,24 @@ use thread_scheduler::{
     CaseScheduler, FifoScheduler, Outcome, RunReport, Shm, ShmCoverage, Supervisor,
 };
 
-const DISCOVERY_CASES: usize = 2000;
-const MINIMIZATION_CASES: usize = 300;
 const REPLAYS: usize = 100;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// `SCHED_DISCOVERY_CASES`: cap on curious() cases per seed.
+fn discovery_cases() -> usize {
+    env_usize("SCHED_DISCOVERY_CASES", 2000)
+}
+
+/// `SCHED_MIN_CASES`: cap on cautious() variants.
+fn minimization_cases() -> usize {
+    env_usize("SCHED_MIN_CASES", 1500)
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -198,9 +213,10 @@ fn point_id(kind: thread_scheduler::PointKind) -> u64 {
 
 fn fuzz(sup: &Supervisor, seed: u64, verbose: bool) -> Option<(usize, usize)> {
     let start = Instant::now();
-    let Some(found) = discover(sup, seed, DISCOVERY_CASES) else {
+    let discovery_cases = discovery_cases();
+    let Some(found) = discover(sup, seed, discovery_cases) else {
         println!(
-            "seed {seed}: no failure in {DISCOVERY_CASES} cases ({:.2?})",
+            "seed {seed}: no failure in {discovery_cases} cases ({:.2?})",
             start.elapsed()
         );
         return None;
@@ -221,11 +237,13 @@ fn fuzz(sup: &Supervisor, seed: u64, verbose: bool) -> Option<(usize, usize)> {
     let start = Instant::now();
     let mut best: Option<(usize, Case, RunReport)> = None;
     let mut reproducing = 0;
+    let mut variants = 0;
     for mut variant in cautious()
         .with_coverage(coverage)
         .with_case(found.case.clone())
-        .take(MINIMIZATION_CASES)
+        .take(minimization_cases())
     {
+        variants += 1;
         let report = run_case(sup, &mut variant);
         if same_class(&report.outcome, &target_outcome) {
             reproducing += 1;
@@ -243,7 +261,7 @@ fn fuzz(sup: &Supervisor, seed: u64, verbose: bool) -> Option<(usize, usize)> {
     }
     let (cost, min_case, min_report) = best.expect("the found case itself reproduces");
     println!(
-        "minimized in {:.2?}: {reproducing}/{MINIMIZATION_CASES} variants reproduced; best cost {cost}: {} non-zero decisions, {} decisions consumed, outcome {}",
+        "minimized in {:.2?}: {reproducing}/{variants} variants reproduced; best cost {cost}: {} non-zero variant spans, {} decisions consumed, outcome {}",
         start.elapsed(),
         min_report.non_zero_decisions(),
         min_report.decisions.len(),
