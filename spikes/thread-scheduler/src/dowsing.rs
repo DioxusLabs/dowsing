@@ -62,3 +62,63 @@ impl<C: CoverageCapture> Scheduler for CaseScheduler<'_, C> {
         bytes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iterator_fuzz::{NoCoverage, curious};
+
+    #[test]
+    fn exhausted_range_schedules_deterministically() {
+        let mut rng = curious()
+            .with_coverage(NoCoverage)
+            .with_seed(7)
+            .take(1)
+            .next()
+            .unwrap();
+        let mut sched = CaseScheduler::new(&mut rng);
+        let mut consumed_bytes = Vec::new();
+        for _ in 0..MAX_DECISIONS + 5 {
+            let d = sched.decide(3);
+            assert!(d.pick < 3 && d.budget < BUDGET_TABLE.len());
+            consumed_bytes.push(sched.random_bytes(4));
+        }
+        assert!(sched.consumed <= MAX_DECISIONS);
+        // Past the range every decision is the deterministic default.
+        assert_eq!(sched.decide(3), Decision { pick: 0, budget: 0 });
+        assert_eq!(sched.random_bytes(4), sched.random_bytes(4));
+        drop(sched);
+        rng.discard();
+    }
+
+    fn decisions_of(rng: &mut CaseRng<NoCoverage>) -> Vec<(Decision, Vec<u8>)> {
+        let mut sched = CaseScheduler::new(rng);
+        (0..10)
+            .map(|_| (sched.decide(4), sched.random_bytes(8)))
+            .collect()
+    }
+
+    #[test]
+    fn forked_case_replays_identically() {
+        let mut rng = curious()
+            .with_coverage(NoCoverage)
+            .with_seed(1)
+            .take(1)
+            .next()
+            .unwrap();
+        let first = decisions_of(&mut rng);
+        assert!(
+            first
+                .iter()
+                .any(|(d, _)| *d != Decision { pick: 0, budget: 0 })
+        );
+        let case = rng.fork_case();
+        rng.discard();
+        let mut replay = case.clone().replay();
+        assert_eq!(decisions_of(&mut replay), first);
+        replay.discard();
+        let mut replay = case.replay();
+        assert_eq!(decisions_of(&mut replay), first);
+        replay.discard();
+    }
+}

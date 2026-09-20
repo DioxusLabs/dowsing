@@ -1,6 +1,7 @@
 //! Edge-callback overhead microbenchmark. Two loops:
 //! * `latency`: a serial dependency chain (callback work overlaps with the chain);
 //! * `throughput`: independent iterations (callback work is on the critical path).
+//!
 //! Prints ns/iteration and the edges seen by the shared mapping (if any); compare
 //! uninstrumented / instrumented-unattached / instrumented-attached builds.
 
@@ -18,7 +19,7 @@ fn step(x: u64) -> u64 {
     } else {
         y = y.rotate_left(7);
     }
-    if y % 3 == 0 {
+    if y.is_multiple_of(3) {
         y = y.wrapping_add(x);
     }
     y

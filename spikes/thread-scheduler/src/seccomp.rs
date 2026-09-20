@@ -48,13 +48,14 @@ const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
 
 /// Build the filter program.
 pub fn program() -> Vec<libc::sock_filter> {
-    let mut prog = Vec::new();
-    // arch check (offset 4 = seccomp_data.arch)
-    prog.push(stmt(BPF_LD_W_ABS, 4));
-    prog.push(jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0));
-    prog.push(stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
-    // nr (offset 0)
-    prog.push(stmt(BPF_LD_W_ABS, 0));
+    let mut prog = vec![
+        // arch check (offset 4 = seccomp_data.arch)
+        stmt(BPF_LD_W_ABS, 4),
+        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        // nr (offset 0)
+        stmt(BPF_LD_W_ABS, 0),
+    ];
     let n = SCHEDULING_SYSCALLS.len();
     for (i, nr) in SCHEDULING_SYSCALLS.iter().enumerate() {
         // Match -> jump over the remaining comparisons and the ALLOW to the TRACE.
@@ -89,4 +90,53 @@ pub fn install() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Interpret the classic-BPF program for a given (arch, nr) pair.
+    fn evaluate(arch: u32, nr: u32) -> u32 {
+        let prog = program();
+        let mut acc = 0u32;
+        let mut pc = 0usize;
+        loop {
+            let insn = prog[pc];
+            pc += 1;
+            match insn.code {
+                c if c == BPF_LD_W_ABS => {
+                    acc = if insn.k == 0 { nr } else { arch };
+                }
+                c if c == BPF_JMP_JEQ_K => {
+                    pc += if acc == insn.k {
+                        insn.jt as usize
+                    } else {
+                        insn.jf as usize
+                    };
+                }
+                c if c == BPF_RET_K => return insn.k,
+                other => panic!("unexpected opcode {other:#x}"),
+            }
+        }
+    }
+
+    #[test]
+    fn traces_only_scheduling_syscalls() {
+        for nr in SCHEDULING_SYSCALLS {
+            assert_eq!(evaluate(AUDIT_ARCH_X86_64, *nr as u32), SECCOMP_RET_TRACE);
+        }
+        for nr in [
+            libc::SYS_write,
+            libc::SYS_mmap,
+            libc::SYS_openat,
+            libc::SYS_read,
+        ] {
+            assert_eq!(evaluate(AUDIT_ARCH_X86_64, nr as u32), SECCOMP_RET_ALLOW);
+        }
+        assert_eq!(
+            evaluate(0xdead_beef, libc::SYS_futex as u32),
+            SECCOMP_RET_KILL_PROCESS
+        );
+    }
 }

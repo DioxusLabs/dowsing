@@ -97,8 +97,8 @@ impl Shm {
         let mut out = Vec::new();
         let bitmap =
             unsafe { std::slice::from_raw_parts(self.base.add(HEADER_BYTES), BITMAP_BYTES) };
-        for (i, chunk) in bitmap.chunks_exact(8).enumerate() {
-            let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        for (i, chunk) in bitmap.as_chunks::<8>().0.iter().enumerate() {
+            let word = u64::from_ne_bytes(*chunk);
             if word == 0 {
                 continue;
             }

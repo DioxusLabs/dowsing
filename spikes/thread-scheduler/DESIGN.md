@@ -1,6 +1,8 @@
 # Spike: deterministic, fuzzer-controlled thread scheduling
 
-Status: design memo, no prototype yet.
+Status: prototype built and measured; see [README.md](README.md) for the
+commands and the full numbers, and ["Prototype results"](#prototype-results-what-was-built-and-what-deviated)
+below for what deviated from this memo.
 Scope: Linux x86_64, single machine, no KVM, no CRIU, unprivileged user.
 
 ## TL;DR
@@ -392,7 +394,72 @@ Measurements to report from the demo:
 * replay determinism: schedule-trace hash equal over 100 replays, with ASLR
   disabled and enabled (to prove decisions do not leak addresses).
 
-## Prototype plan (next stage; nothing built yet)
+## Prototype results (what was built and what deviated)
+
+All milestones a–e were built and run (`spikes/thread-scheduler/`, commands
+in the README). Everything in this section is **[measured]** on the same box.
+
+| planned | result |
+|---|---|
+| stops/case, µs/stop | 19 ptrace stops / 12 scheduling points per `lost_update` case; **10.7–11.1 µs per scheduling stop** marginal (10 000 `sched_yield` under the supervisor vs 0.24 µs native). Slightly above the 10.2 µs microbenchmark: each stop also runs the scheduler, records the trace event and rewrites the budget word in the shared page |
+| wall vs native ≤ 2× | 1.9× (`lost_update` 0.68 → 1.29 ms), 1.8× (`deadlock`), 1.7× (`missed_notify`); dominated by fork/exec/seize |
+| edge callback ~1.3 ns/edge | **~1.6 ns/edge** on the critical path (3-edge loop 2.56 → 7.30 ns/iter), ~0.3 ns/edge when hidden behind a dependency chain. Attached (shared page) and unattached (early return) cost the same, so the `call` itself is the cost |
+| cases-to-first-failure, 20 seeds | `lost_update` 3 / 18 / 57 (min/median/max), `deadlock` 2 / 23 / 83, `missed_notify` 1 / 16 / 36; **20/20 seeds** for each |
+| minimized length ≤ 2 (`lost_update`), 1 (`deadlock`) | **3 / 5 / 9** for `lost_update`, **2 / 3 / 5** for `deadlock`, 0 for `missed_notify` — see deviation 4 |
+| trace hash equal over 100 replays, ASLR on/off | 100/100 identical for every demo and every minimized case; same hash with `setarch -R` and without |
+
+Deviations from the memo:
+
+1. **Standalone crates instead of a feature-gated `src/sched` module.** The
+   spike rules require `spikes/<name>/` with its own `[workspace]`, and the
+   target must not link dowsing at all, so there are three packages:
+   `thread-scheduler` (supervisor, depends on `iterator-fuzz`), `sched-target-rt`
+   (sancov callbacks + shm attach, `libc` only) and `sched-targets`. Nothing in
+   the root crate changed; `ShmCoverage` implements the existing
+   `CoverageCapture` trait unmodified.
+2. **The edge budget is a single `u32` in the shared page, not a
+   `thread_local!`.** With exactly one running thread there is only ever one
+   live budget; the supervisor writes it before `PTRACE_CONT` and the callback
+   decrements it with plain load/store. The bitmap and edge counter use plain
+   load/store for the same reason: switching from `fetch_or`/`fetch_add` to
+   load/store took the attached throughput loop from 23.7 to 7.3 ns/iter.
+3. **The yield marker is `getppid(0x5eed5ced)`** (risk 8 in the memo,
+   resolved): it is distinguishable from a user `yield_now()` in the trace
+   (`preempt` vs `yield`) and the filter only traces `getppid`, it does not
+   need a dedicated syscall number.
+4. **Minimized lost-update schedules are 3+ non-zero spans, not ≤ 2.** The
+   race window is between the first `unlock` and the second `lock`; the
+   geometric `BUDGET_TABLE` (…8, 12, 16…) usually lands the preemption while
+   the mutex is still held, so the other thread parks on the futex and one
+   more non-zero `pick` is needed to hand control back, then another to
+   switch again. `cautious()` reaches the 3-span path for some seeds (median 5,
+   worst 9 over 20 seeds). Fix: exact small budgets or a "preempt at the next instrumented
+   store" budget kind. Risk 2 ("budget granularity is a guess") is confirmed.
+5. **Edge coverage alone is a weak signal for interleavings** (the failing
+   outcome is not a new edge, and the demos are ~100 edges), so the harness
+   also feeds the schedule shape (`(index, thread, point kind)` per decision)
+   as features via `ShmCoverage::add_features`; `coverage_with_cost` ranks
+   shrunk variants by `non_zero_decisions*1000 + edges/1024`. **[inference]**
+   how much either signal contributes versus plain random schedules was not
+   measured separately (an A/B against `NoCoverage` is a cheap follow-up).
+6. **`missed_notify` needs no search**: the FIFO (all-zero) schedule runs the
+   main thread to `notify_one` before the worker starts, and the worker's
+   `FUTEX_WAIT` with no possible waker is reported as `deadlock` in 2 ms
+   instead of hanging. Natively 0/50 runs fail.
+7. **Timed futex waits use virtual time** rather than a fuzzer choice: a
+   timed waiter is expired (`-ETIMEDOUT`) only when no other thread can run,
+   which keeps the outcome deterministic without spending case bytes. No demo
+   exercises this path.
+8. **Startup**: `PTRACE_SEIZE` of the self-`SIGSTOP`ped child reports
+   `PTRACE_EVENT_STOP`, then `SIGCONT` delivery and `PTRACE_EVENT_EXEC`
+   arrive in either order; the spawn code consumes both. A failed `execve`
+   shows up as a seccomp stop on `exit_group` before the exec event and is
+   reported as such.
+9. **Non-blocking `poll(_, _, 0)`** (Rust std's stdio fd check at startup) is
+   allowed straight through instead of being a scheduling point; every other
+   `poll`/`epoll_wait`/`select` still stops and is logged as uncontrolled.
+
+## Prototype plan (as written before building; kept for the record)
 
 1. `src/sched/mod.rs`, `src/sched/ptrace.rs` (thin safe wrappers over
    `libc::ptrace`, `waitpid(__WALL)`, `process_vm_readv`), `src/sched/futex.rs`

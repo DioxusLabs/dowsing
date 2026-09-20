@@ -64,7 +64,7 @@ fn attach_shm() {
         if c == 0 {
             break;
         }
-        if !(b'0'..=b'9').contains(&(c as u8)) {
+        if !(c as u8).is_ascii_digit() {
             return;
         }
         fd = fd * 10 + (c as u8 - b'0') as libc::c_int;
@@ -97,7 +97,9 @@ fn yield_marker() {
 /// only pulled in when something references it).
 #[inline(never)]
 pub fn init() {
-    core::hint::black_box(__sanitizer_cov_trace_pc_guard as extern "C" fn(*mut u32) as usize);
+    core::hint::black_box(
+        __sanitizer_cov_trace_pc_guard as unsafe extern "C" fn(*mut u32) as usize,
+    );
     core::hint::black_box(
         __sanitizer_cov_trace_pc_guard_init as unsafe extern "C" fn(*mut u32, *mut u32) as usize,
     );
@@ -128,6 +130,8 @@ pub fn edges() -> u64 {
     unsafe { header_u64(base, OFF_EDGES).load(Ordering::Relaxed) }
 }
 
+/// # Safety
+/// Called by the sancov module constructor with the guard table bounds.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __sanitizer_cov_trace_pc_guard_init(start: *mut u32, end: *mut u32) {
     if start.is_null() || end.is_null() || start >= end {
@@ -149,14 +153,20 @@ pub unsafe extern "C" fn __sanitizer_cov_trace_pc_guard_init(start: *mut u32, en
     }
 }
 
+/// # Safety
+/// Called by the sancov module constructor; the PC table is ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __sanitizer_cov_pcs_init(_start: *const usize, _end: *const usize) {}
 
+/// # Safety
+/// Called by the sancov module constructor; inline counters are ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __sanitizer_cov_8bit_counters_init(_start: *mut u8, _end: *mut u8) {}
 
+/// # Safety
+/// Called by instrumented code with a pointer into the guard table.
 #[unsafe(no_mangle)]
-pub extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
+pub unsafe extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
     let base = SHM.load(Ordering::Relaxed);
     if base.is_null() {
         return;

@@ -110,12 +110,20 @@ fn replay_fifo(sup: &Supervisor, n: usize) {
         wall += report.wall;
     }
     println!(
-        "{n} FIFO replays: {} distinct trace hash(es), avg {} stops, avg wall {:.2?}",
+        "{n} FIFO replays: {} distinct trace hash(es) {:#x}, avg {} stops, avg wall {:.2?}, ASLR {}",
         hashes.len(),
+        hashes.first().copied().unwrap_or(0),
         stops / n,
-        wall / n as u32
+        wall / n as u32,
+        if aslr_disabled() { "off" } else { "on" }
     );
     assert_eq!(hashes.len(), 1, "FIFO schedule is not deterministic");
+}
+
+fn aslr_disabled() -> bool {
+    // personality(0xffffffff) queries without changing; ADDR_NO_RANDOMIZE is inherited by targets.
+    let p = unsafe { libc::personality(0xffff_ffff) };
+    p != -1 && (p as u32 & libc::ADDR_NO_RANDOMIZE as u32) != 0
 }
 
 fn bench(sup: &Supervisor, target: &str, n: usize) {
@@ -174,13 +182,13 @@ fn cost_of(report: &RunReport) -> usize {
 
 fn discover(sup: &Supervisor, seed: u64, max_cases: usize) -> Option<Found> {
     let coverage = ShmCoverage::new(Rc::clone(sup.shm()));
-    let mut tried = 0;
-    for mut rng in curious()
+    for (tried, mut rng) in curious()
         .with_coverage(coverage.clone())
         .with_seed(seed)
         .take(max_cases)
+        .enumerate()
+        .map(|(i, rng)| (i + 1, rng))
     {
-        tried += 1;
         let report = run_case(sup, &mut rng);
         // Feed the schedule shape back as coverage so curious() explores new interleavings.
         coverage.add_features(

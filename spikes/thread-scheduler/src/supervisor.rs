@@ -313,6 +313,16 @@ impl Supervisor {
     /// fork + (seccomp, SIGSTOP) + exec. Returns the child pid (stopped, seized, at its exec
     /// event already consumed) and a pipe fd for its stderr.
     fn spawn(&self) -> io::Result<(Pid, Option<libc::c_int>)> {
+        let program = std::path::Path::new(self.program.to_str().unwrap_or_default());
+        if !program.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "target binary {} not found (run build-targets.sh and pass the path)",
+                    program.display()
+                ),
+            ));
+        }
         let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(self.args.len() + 2);
         argv.push(self.program.as_ptr());
         argv.extend(self.args.iter().map(|a| a.as_ptr()));
@@ -334,10 +344,10 @@ impl Supervisor {
         envp.push(std::ptr::null());
 
         let mut stderr_pipe = [-1 as libc::c_int; 2];
-        if self.capture_stderr {
-            if unsafe { libc::pipe2(stderr_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
+        if self.capture_stderr
+            && unsafe { libc::pipe2(stderr_pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0
+        {
+            return Err(io::Error::last_os_error());
         }
 
         let pid = unsafe { libc::fork() };
@@ -412,6 +422,12 @@ impl Supervisor {
                     return Err(io::Error::other(format!(
                         "target exited with {code} before exec (seccomp install failed?)"
                     )));
+                }
+                WaitEvent::Event { event, .. } if event == libc::PTRACE_EVENT_SECCOMP => {
+                    // The only traced syscall reachable before exec is exit_group from the
+                    // child's `_exit(127)` after a failed execve.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    return Err(io::Error::other("execve of target failed"));
                 }
                 other => {
                     return Err(io::Error::other(format!(
