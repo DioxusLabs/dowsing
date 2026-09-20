@@ -13,8 +13,10 @@
 pub mod bpf;
 pub mod child;
 pub mod coverage;
+pub mod demo;
 pub mod dns;
 pub mod fake_socket;
+pub mod harness;
 pub mod notif;
 pub mod peer_model;
 pub mod sandbox;
@@ -22,5 +24,6 @@ pub mod supervisor;
 
 pub use child::{ExitStatus, Features, probe_features};
 pub use coverage::ChildCoverage;
+pub use harness::{FuzzOptions, FuzzReport, fuzz};
 pub use peer_model::{ByteSource, PayloadGen, PeerEvent, random_payload};
 pub use sandbox::{Outcome, Sandbox, SandboxConfig, Verdict};

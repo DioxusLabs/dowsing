@@ -127,6 +127,13 @@ impl Sandbox {
         let spawned = child::spawn(&bpf::network_rules(), self.config.sync_wake_up, move || {
             if quiet {
                 std::panic::set_hook(Box::new(|_| {}));
+                unsafe {
+                    let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                    if null >= 0 {
+                        libc::dup2(null, 2);
+                        libc::close(null);
+                    }
+                }
             }
             let panicked = coverage.child_run(target);
             if panicked { 101 } else { 0 }
