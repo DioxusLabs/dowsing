@@ -99,11 +99,13 @@ pub fn clear_soft_dirty(pid: Pid) -> io::Result<()> {
 }
 
 pub struct PagemapScan {
-    /// Pages with the soft-dirty bit (any presence).
+    /// Present (or swapped) pages with the soft-dirty bit.
     pub dirty: Vec<u64>,
     /// Pages currently present or swapped.
     pub present: Vec<u64>,
-    /// Pages that are neither present nor swapped (their content reads as zero).
+    /// Pages that are neither present nor swapped (their content reads as zero). The
+    /// soft-dirty bit is not tracked for them: a page that was present and became absent
+    /// is simply one whose content is now zero.
     pub absent: Vec<u64>,
 }
 
@@ -125,11 +127,11 @@ pub fn scan_pagemap(pid: Pid, maps: &[Mapping]) -> io::Result<PagemapScan> {
             let e = u64::from_ne_bytes(*chunk);
             let addr = m.start + i as u64 * PAGE;
             let here = e & (PM_PRESENT | PM_SWAPPED) != 0;
-            if e & PM_SOFT_DIRTY != 0 {
-                scan.dirty.push(addr);
-            }
             if here {
                 scan.present.push(addr);
+                if e & PM_SOFT_DIRTY != 0 {
+                    scan.dirty.push(addr);
+                }
             } else {
                 scan.absent.push(addr);
             }
@@ -162,7 +164,7 @@ pub struct Store {
 }
 
 impl Store {
-    fn zero_page(&mut self) -> Page {
+    pub fn zero_page(&mut self) -> Page {
         self.zero
             .get_or_insert_with(|| Rc::new([0u8; PAGE as usize]))
             .clone()
@@ -285,50 +287,53 @@ pub fn plan_maps(
     if live_brk != snap_brk {
         ops.push(MapOp::Brk { end: snap_brk });
     }
-    // Per-page protection maps for anonymous memory (heap handled by brk, so skip it here).
-    let anon = |ms: &[Mapping]| -> HashMap<u64, i32> {
-        let mut out = HashMap::new();
-        for m in ms
+    // Sweep the anonymous (non-heap; brk handles that) intervals of both tables: every
+    // elementary segment between consecutive boundaries has one protection on each side.
+    let anon = |ms: &[Mapping]| -> Vec<(u64, u64, i32)> {
+        let mut v: Vec<_> = ms
             .iter()
             .filter(|m| !ignore(m) && m.is_anon() && m.path != "[heap]")
-        {
-            let mut a = m.start;
-            while a < m.end {
-                out.insert(a, m.prot);
-                a += PAGE;
-            }
-        }
-        out
+            .map(|m| (m.start, m.end, m.prot))
+            .collect();
+        v.sort_unstable();
+        v
     };
     let (la, sa) = (anon(live), anon(snap));
-    let mut unmap: Vec<u64> = la.keys().filter(|a| !sa.contains_key(a)).copied().collect();
-    let mut map: Vec<(u64, i32)> = sa
+    let mut bounds: Vec<u64> = la
         .iter()
-        .filter(|(a, _)| !la.contains_key(a))
-        .map(|(a, p)| (*a, *p))
+        .chain(&sa)
+        .flat_map(|(s, e, _)| [*s, *e])
         .collect();
-    let mut prot: Vec<(u64, i32)> = sa
-        .iter()
-        .filter(|(a, p)| la.get(a).is_some_and(|lp| lp != *p))
-        .map(|(a, p)| (*a, *p))
-        .collect();
-    unmap.sort_unstable();
-    map.sort_unstable();
-    prot.sort_unstable();
-    for run in runs(unmap.iter().map(|a| (*a, 0))) {
+    bounds.sort_unstable();
+    bounds.dedup();
+    let prot_at = |v: &[(u64, u64, i32)], a: u64| -> Option<i32> {
+        let i = v.partition_point(|(s, _, _)| *s <= a);
+        v[..i].last().filter(|(_, e, _)| a < *e).map(|(_, _, p)| *p)
+    };
+    let (mut unmap, mut map, mut prot) = (Vec::new(), Vec::new(), Vec::new());
+    for w in bounds.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        match (prot_at(&la, s), prot_at(&sa, s)) {
+            (Some(_), None) => unmap.push((s, e - s, 0)),
+            (None, Some(p)) => map.push((s, e - s, p)),
+            (Some(lp), Some(p)) if lp != p => prot.push((s, e - s, p)),
+            _ => {}
+        }
+    }
+    for run in coalesce(unmap) {
         ops.push(MapOp::Munmap {
             start: run.0,
             len: run.1,
         });
     }
-    for run in runs(map.iter().copied()) {
+    for run in coalesce(map) {
         ops.push(MapOp::Mmap {
             start: run.0,
             len: run.1,
             prot: run.2,
         });
     }
-    for run in runs(prot.iter().copied()) {
+    for run in coalesce(prot) {
         ops.push(MapOp::Mprotect {
             start: run.0,
             len: run.1,
@@ -338,17 +343,17 @@ pub fn plan_maps(
     Ok(ops)
 }
 
-/// Coalesce sorted (page, tag) pairs into (start, len, tag) runs.
-fn runs(pages: impl Iterator<Item = (u64, i32)>) -> Vec<(u64, u64, i32)> {
+/// Merge adjacent (start, len, tag) runs with equal tags.
+fn coalesce(runs: Vec<(u64, u64, i32)>) -> Vec<(u64, u64, i32)> {
     let mut out: Vec<(u64, u64, i32)> = Vec::new();
-    for (addr, tag) in pages {
+    for (start, len, tag) in runs {
         if let Some(last) = out.last_mut()
-            && last.0 + last.1 == addr
+            && last.0 + last.1 == start
             && last.2 == tag
         {
-            last.1 += PAGE;
+            last.1 += len;
         } else {
-            out.push((addr, PAGE, tag));
+            out.push((start, len, tag));
         }
     }
     out
@@ -368,8 +373,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runs_coalesce() {
-        let r = runs([(0, 0), (4096, 0), (8192, 1), (20480, 1)].into_iter());
+    fn coalesce_merges_adjacent_equal_tags() {
+        let r = coalesce(vec![
+            (0, 4096, 0),
+            (4096, 4096, 0),
+            (8192, 4096, 1),
+            (20480, 4096, 1),
+        ]);
         assert_eq!(r, vec![(0, 8192, 0), (8192, 4096, 1), (20480, 4096, 1)]);
     }
 

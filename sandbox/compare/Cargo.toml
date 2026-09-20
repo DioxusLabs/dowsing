@@ -1,0 +1,16 @@
+[package]
+name = "dowsing-compare"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Ports of the sandbox demo targets to loom/shuttle, plus snapshot-cost baselines. Built by compare/run.sh."
+
+[dependencies]
+libc = "0.2"
+loom = "0.7"
+shuttle = "0.8"
+
+[profile.release]
+debug = 1
+
+[workspace]

@@ -9,4 +9,4 @@ rayon = "1.10"
 
 [workspace]
 members = ["sandbox", "sandbox/target-rt"]
-exclude = ["sandbox/targets"]
+exclude = ["sandbox/targets", "sandbox/compare"]

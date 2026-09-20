@@ -1070,7 +1070,19 @@ impl Session {
         } else {
             &scan.dirty
         };
-        let pages = self.store.read_pages(self.leader, addrs, self.head)?;
+        let mut pages = self.store.read_pages(self.leader, addrs, self.head)?;
+        if let Some(head) = self.head {
+            let zero = self.store.zero_page();
+            for &a in &scan.absent {
+                if self
+                    .store
+                    .lookup(head, a)
+                    .is_some_and(|p| p.iter().any(|b| *b != 0))
+                {
+                    pages.insert(a, zero.clone());
+                }
+            }
+        }
         let pages_copied = pages.len();
         let mut regs = Vec::new();
         for t in &self.world.threads {
@@ -1162,6 +1174,7 @@ impl Session {
             }
         }
         let snap_maps = &self.store.snapshots[id].maps;
+        let absent: HashSet<u64> = scan.absent.iter().copied().collect();
         let mut written = 0;
         let mut dirty: Vec<u64> = dirty.into_iter().collect();
         dirty.sort_unstable();
@@ -1177,6 +1190,10 @@ impl Session {
                 Some(page) => &page[..],
                 None => &zero,
             };
+            // An absent page already reads as zero; writing zeros would only allocate it.
+            if absent.contains(&addr) && content.iter().all(|b| *b == 0) {
+                continue;
+            }
             ptrace::write_mem(self.leader, addr, content)?;
             written += 1;
         }

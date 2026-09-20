@@ -1,0 +1,44 @@
+# 2026-09-20T04:10:02Z 6.8.0-1061-aws 8cpu INTEL(R) XEON(R) PLATINUM 8559C
+## native: run the unmodified binary in a loop (stress testing)
+tool=native target=lost_update runs=20000 failures=1 hangs=0 total_ms=36772.143285000 per_run_ms=1.83
+tool=native target=deadlock runs=2000 failures=0 hangs=0 total_ms=3970.912693000 per_run_ms=1.98
+tool=native target=sleep_race runs=2000 failures=0 hangs=0 total_ms=14030.324425000 per_run_ms=7.01
+## rr chaos mode (rr record -h): randomized scheduling of the unmodified binary
+tool=rr-chaos target=lost_update runs=300 failures=0 hangs=0 total_ms=89925.449033000 per_run_ms=299.75
+tool=rr-chaos target=deadlock runs=300 failures=0 hangs=0 total_ms=64263.285386000 per_run_ms=214.21
+tool=rr-chaos target=sleep_race runs=300 failures=4 hangs=0 total_ms=76657.542932000 per_run_ms=255.52
+tool=rr-replay target=lost_update replays=20 per_replay_ms=79.8 (deterministic by construction)
+## dowsing-sandbox (this PR): explore <bin> --runs 3000 --seed S --replays 100
+tool=sandbox target=lost_update seed=1 | failure on run 155: exit(101) | runs 155 in 250.02ms (620/s), features 69, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.3ms each | shrink: 24 -> 14 decisions (6 non-default) in 84 runs, 148.85ms | snapshots: 60 taken, 821 pages copied, 33.80ms total | restores: 154 done, 2782 pages written (18.1 avg), 156.06ms total (1.0ms avg)
+tool=sandbox target=lost_update seed=2 | failure on run 66: exit(101) | runs 66 in 109.81ms (601/s), features 69, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.1ms each | shrink: 16 -> 14 decisions (6 non-default) in 141 runs, 285.42ms | snapshots: 29 taken, 406 pages copied, 15.19ms total | restores: 65 done, 1172 pages written (18.0 avg), 63.08ms total (970.4µs avg)
+tool=sandbox target=lost_update seed=3 | failure on run 62: exit(101) | runs 62 in 160.52ms (386/s), features 69, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.8ms each | shrink: 14 -> 14 decisions (6 non-default) in 77 runs, 148.84ms | snapshots: 23 taken, 319 pages copied, 16.70ms total | restores: 61 done, 1076 pages written (17.6 avg), 87.38ms total (1.4ms avg)
+tool=sandbox target=deadlock seed=1 | failure on run 70: deadlock(threads [0, 1]) | runs 70 in 101.67ms (689/s), features 61, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.2ms each | shrink: 5 -> 5 decisions (3 non-default) in 11 runs, 13.01ms | snapshots: 13 taken, 200 pages copied, 6.04ms total | restores: 69 done, 1182 pages written (17.1 avg), 60.71ms total (879.8µs avg)
+tool=sandbox target=deadlock seed=2 | failure on run 20: deadlock(threads [0, 1]) | runs 20 in 30.34ms (659/s), features 63, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.3ms each | shrink: 5 -> 5 decisions (3 non-default) in 11 runs, 13.79ms | snapshots: 5 taken, 80 pages copied, 2.08ms total | restores: 19 done, 323 pages written (17.0 avg), 17.15ms total (902.5µs avg)
+tool=sandbox target=deadlock seed=3 | failure on run 45: deadlock(threads [0, 1]) | runs 45 in 57.43ms (784/s), features 61, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.3ms each | shrink: 5 -> 5 decisions (4 non-default) in 13 runs, 15.02ms | snapshots: 8 taken, 125 pages copied, 3.71ms total | restores: 44 done, 751 pages written (17.1 avg), 37.68ms total (856.4µs avg)
+tool=sandbox target=sleep_race seed=1 | failure on run 31: exit(101) | runs 31 in 52.05ms (596/s), features 52, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.2ms each | shrink: 17 -> 17 decisions (3 non-default) in 50 runs, 63.33ms | snapshots: 21 taken, 230 pages copied, 9.06ms total | restores: 30 done, 492 pages written (16.4 avg), 25.53ms total (851.0µs avg)
+tool=sandbox target=sleep_race seed=2 | failure on run 9: exit(101) | runs 9 in 13.93ms (646/s), features 52, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.1ms each | shrink: 17 -> 15 decisions (1 non-default) in 98 runs, 119.40ms | snapshots: 7 taken, 77 pages copied, 3.14ms total | restores: 8 done, 133 pages written (16.6 avg), 7.37ms total (921.3µs avg)
+tool=sandbox target=sleep_race seed=3 | failure on run 2: exit(101) | runs 2 in 6.23ms (321/s), features 49, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.0ms each | shrink: 18 -> 17 decisions (3 non-default) in 144 runs, 169.03ms | snapshots: 4 taken, 52 pages copied, 1.81ms total | restores: 1 done, 16 pages written (16.0 avg), 3.44ms total (3.4ms avg)
+## loom 0.7 (exhaustive model checker; program ported to loom::sync / loom::thread)
+tool=loom target=lost_update mode=exhaustive iterations=10 time_ms=0.4 found=true msg="assertion `left == right` failed: lost update"
+tool=loom target=deadlock mode="exhaustive x4 variants" iterations=17 time_ms=89.3 found=true msg="thread 'main' (309284) panicked at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/loom-0.7.2/src/rt/execution.rs:216:13:"
+tool=loom target=sleep_race mode=exhaustive iterations=7 time_ms=0.2 found=false 
+## shuttle 0.8 (random / PCT depth 2 / DFS schedulers; program ported to shuttle::sync)
+tool=shuttle target=lost_update mode=random max=100000 iterations=1 time_ms=0.1 found=true msg="test panicked in task 'main-thread'"
+tool=shuttle target=lost_update mode=pct max=100000 iterations=4 time_ms=0.2 found=true msg="test panicked in task 'main-thread'"
+tool=shuttle target=lost_update mode=dfs max=100000 iterations=111 time_ms=0.8 found=true msg="test panicked in task 'main-thread'"
+tool=shuttle target=deadlock mode=random max=100000 iterations=4 time_ms=0.1 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
+tool=shuttle target=deadlock mode=pct max=100000 iterations=56 time_ms=0.3 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
+tool=shuttle target=deadlock mode=dfs x4 variants iterations=182 time_ms=0.8 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
+tool=shuttle target=sleep_race mode=random max=100000 iterations=100000 time_ms=319.8 found=false 
+tool=shuttle target=sleep_race mode=pct max=100000 iterations=100000 time_ms=321.6 found=false 
+tool=shuttle target=sleep_race mode=dfs max=100000 iterations=40 time_ms=0.3 found=false 
+## snapshot/restore: resume the two-thread race after a 64 MB setup
+tool=fresh-exec target=slow_setup(instrumented) runs=10 per_run_ms=51.4
+tool=fresh-exec runs=10 per_run_ms=45.6 failures=0
+tool=fork-cow setup_ms=45.4 runs=50 per_run_ms=1.89 failures=2
+tool=criu op=dump rss_kb=67648 image_kb=65736 time_ms=76.515514000
+tool=criu op=restore runs=5 per_run_ms=41.1
+tool=sandbox target=slow_setup | root: exec + run to first decision in 100.13ms (cost of a fresh execution) | runs 49 in 187.01ms (262/s), features 86, failures 1, divergences 0 | replay x20: 1 distinct trace hash(es), outcomes {Exited(101)}, 3.0ms each | snapshots: 16 taken, 16620 pages copied, 62.45ms total | restores: 48 done, 875 pages written (18.2 avg), 86.83ms total (1.8ms avg)
+## ThreadSanitizer (nightly -Zsanitizer=thread) on lost_update: the bug is not a data race
+tool=tsan target=lost_update runs=200 failures=0 hangs=0 total_ms=3101.739638000 per_run_ms=15.50
+# done

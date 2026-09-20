@@ -1,0 +1,12 @@
+[package]
+name = "lost_update_tsan"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "lost_update without target-rt, for: RUSTFLAGS=-Zsanitizer=thread cargo +nightly build -Zbuild-std --target x86_64-unknown-linux-gnu --release"
+
+[[bin]]
+name = "lost_update_tsan"
+path = "src/main.rs"
+
+[workspace]
