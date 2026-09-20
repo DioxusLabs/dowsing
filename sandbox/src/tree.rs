@@ -3,19 +3,53 @@
 //! Every decision point the session reports becomes a [`Node`]; edges are choices. Expanding a
 //! node means restoring the nearest snapshotted ancestor, replaying the decisions down to the
 //! node, taking an untried choice and rolling out with the default policy until the run ends.
-//! Coverage novelty found beneath a node is its energy; frontier nodes are sampled by it.
+//!
+//! The rollout policy is PCT (probabilistic concurrency testing): every thread gets a random
+//! priority, the highest-priority runnable candidate runs, and at `d` random change points
+//! (edge counts) the running thread drops to the lowest priority. A `Budget` choice is the
+//! exact edge distance to the next change point, so a preemption lands on any instruction
+//! boundary the instrumentation can see, not on a coarse table entry.
+//!
+//! Energy is coverage novelty, of two kinds: new edges, and new *interleaving features* (a
+//! thread stopping at a point right after edge `g` and a different thread running next). Edge
+//! coverage saturates after a few runs on schedule bugs; interleaving features are what keep
+//! the frontier pointed at unexplored preemption points.
 
 use crate::{
     session::{Event, Session},
     shm::Bitmap,
     snapshot::SnapshotId,
-    world::{Decision, Kind, Outcome},
+    world::{BUDGET_MAX, Candidate, Decision, Kind, Outcome, Pending, Point, TraceEvent},
 };
-use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng, seq::SliceRandom};
 use std::{
-    fmt, io,
+    collections::HashSet,
+    fmt,
+    hash::{Hash, Hasher},
+    io,
     time::{Duration, Instant},
 };
+
+/// Search knobs; the defaults are the ones that won `sandbox/sweep.sh`.
+#[derive(Debug, Clone, Copy)]
+pub struct Tuning {
+    /// Distinct budgets tried per `Budget` node before it leaves the frontier.
+    pub budget_fanout: usize,
+    /// Maximum PCT change points per rollout (`d` is drawn from `1..=pct_depth`).
+    pub pct_depth: usize,
+    /// UCB exploration constant for frontier selection.
+    pub ucb_c: f64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            budget_fanout: 8,
+            pct_depth: 3,
+            ucb_c: 2.0,
+        }
+    }
+}
 
 pub type NodeId = usize;
 
@@ -27,10 +61,21 @@ pub struct Node {
     /// The decision pending at this node; `None` for terminal nodes.
     pub kind: Option<Kind>,
     pub n: u32,
+    /// Total instrumented edges executed when this node was reached.
+    pub edges: u64,
     pub children: Vec<(u32, NodeId)>,
+    /// `Budget` nodes, once the thread has been run to its natural stop from here: the guard
+    /// ids of the edges it executed. Budgets past the segment are the same run as 0, and
+    /// preempting at a second execution of the same edge is not a new program point, so the
+    /// budgets worth trying are one per distinct guard (see [`Node::budgets`]).
+    pub segment: Option<Vec<u32>>,
+    /// A `Budget` node with no known segment whose sampled offsets were all already tried.
+    pub exhausted: bool,
+    /// No untried choice remains anywhere in this subtree.
+    pub closed: bool,
     pub snapshot: Option<SnapshotId>,
     pub visits: u32,
-    /// New coverage features first found on runs through this node.
+    /// New features first found on runs through this node (the first run's baseline excluded).
     pub novelty: u32,
     pub outcome: Option<Outcome>,
 }
@@ -43,8 +88,130 @@ impl Node {
             .map(|(_, id)| *id)
     }
 
-    fn expandable(&self) -> bool {
-        self.kind.is_some() && (self.children.len() as u32) < self.n
+    fn tried(&self, choice: u32) -> bool {
+        self.child(choice).is_some()
+    }
+
+    /// Candidate budgets besides 0: the first occurrence of each distinct guard in the segment.
+    fn budgets(&self) -> Option<Vec<u32>> {
+        let seg = self.segment.as_ref()?;
+        let mut seen = HashSet::new();
+        Some(
+            seg.iter()
+                .enumerate()
+                .filter(|(_, g)| seen.insert(**g))
+                .map(|(i, _)| i as u32 + 1)
+                .collect(),
+        )
+    }
+
+    /// Candidate budgets not yet tried (`None` while the segment is unknown).
+    fn untried_budgets(&self) -> Option<Vec<u32>> {
+        self.budgets()
+            .map(|b| b.into_iter().filter(|c| !self.tried(*c)).collect())
+    }
+
+    /// Whether the node has an untried choice the search may take now. `Budget` nodes widen
+    /// progressively: `fanout` children up front, then one more per `visits²` growth, so a
+    /// long segment does not get enumerated before anything below it is explored.
+    fn expandable(&self, fanout: usize) -> bool {
+        match self.kind {
+            None => false,
+            Some(Kind::Budget) => {
+                if self.exhausted {
+                    return false;
+                }
+                if !self.tried(0) {
+                    return true;
+                }
+                let allowed = fanout + (self.visits as f64).sqrt() as usize;
+                match self.untried_budgets() {
+                    Some(u) => !u.is_empty() && self.children.len() < allowed,
+                    None => self.children.len() < fanout,
+                }
+            }
+            Some(_) => (self.children.len() as u32) < self.n,
+        }
+    }
+}
+
+/// PCT state for one rollout.
+struct Policy {
+    /// Per thread; unknown (not yet created) threads get one on first sight.
+    prio: Vec<u32>,
+    /// Priority of a thread's pending timeout when it is offered as a `Fire` candidate.
+    timer_prio: Vec<u32>,
+    /// Global edge counts at which the running thread is demoted, ascending.
+    change_points: Vec<u64>,
+    lowest: u32,
+}
+
+impl Policy {
+    /// `spent` preemptions already lie on the prefix this rollout continues (the frontier
+    /// node's own forced preemption included); they count towards the run's `d`, so the
+    /// rollout adds only the remainder. With `d` = 1 a preemption forced by the search is
+    /// followed by a preemption-free rollout, which is the schedule a depth-1 bug needs.
+    fn new(rng: &mut SmallRng, threads: usize, k_est: u64, depth: usize, spent: usize) -> Self {
+        let mut prio: Vec<u32> = (0..threads as u32).map(|i| 1000 + i).collect();
+        prio.shuffle(rng);
+        let mut timer_prio: Vec<u32> = (0..threads as u32).map(|i| 1000 + i).collect();
+        timer_prio.shuffle(rng);
+        let d = rng.random_range(1..=depth).saturating_sub(spent);
+        let mut change_points: Vec<u64> =
+            (0..d).map(|_| rng.random_range(0..k_est.max(1))).collect();
+        change_points.sort_unstable();
+        Self {
+            prio,
+            timer_prio,
+            change_points,
+            lowest: 1000,
+        }
+    }
+
+    fn ensure(&mut self, rng: &mut SmallRng, thread: usize) {
+        while self.prio.len() <= thread {
+            self.prio.push(rng.random_range(1000..2000));
+            self.timer_prio.push(rng.random_range(1000..2000));
+        }
+    }
+
+    fn schedule(&mut self, rng: &mut SmallRng, candidates: &[Candidate]) -> u32 {
+        let mut best = 0;
+        let mut best_p = 0;
+        for (i, c) in candidates.iter().enumerate() {
+            let p = match *c {
+                Candidate::Run(t) => {
+                    self.ensure(rng, t);
+                    self.prio[t]
+                }
+                Candidate::Fire(t) => {
+                    self.ensure(rng, t);
+                    self.timer_prio[t]
+                }
+            };
+            if i == 0 || p > best_p {
+                best = i;
+                best_p = p;
+            }
+        }
+        best as u32
+    }
+
+    /// Edges until the next change point after `edges`, or 0 to run to the natural stop.
+    fn budget(&mut self, edges: u64) -> u32 {
+        while let Some(cp) = self.change_points.first() {
+            if *cp > edges {
+                return (*cp - edges).min(BUDGET_MAX as u64 - 1) as u32;
+            }
+            self.change_points.remove(0);
+        }
+        0
+    }
+
+    fn demote(&mut self, rng: &mut SmallRng, thread: usize) {
+        self.ensure(rng, thread);
+        self.lowest -= 1;
+        self.prio[thread] = self.lowest;
     }
 }
 
@@ -84,7 +251,10 @@ pub struct Stats {
     pub snapshot_wall: Duration,
     pub replayed_decisions: usize,
     pub executed_decisions: usize,
+    /// Distinct coverage edges seen.
     pub features: usize,
+    /// Distinct interleaving features seen (see module docs).
+    pub sched_features: usize,
     pub divergences: usize,
     pub failures: Vec<Failure>,
     pub wall: Duration,
@@ -94,11 +264,12 @@ impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "runs {} in {:.2?} ({:.0}/s), features {}, failures {}, divergences {}",
+            "runs {} in {:.2?} ({:.0}/s), features {} edges + {} interleavings, failures {}, divergences {}",
             self.runs,
             self.wall,
             self.runs as f64 / self.wall.as_secs_f64().max(1e-9),
             self.features,
+            self.sched_features,
             self.failures.len(),
             self.divergences
         )?;
@@ -137,10 +308,16 @@ pub struct Search {
     pub session: Session,
     pub nodes: Vec<Node>,
     seen: Bitmap,
+    sched_seen: HashSet<u64>,
+    /// Largest edge total of any completed run: the PCT horizon `k`.
+    k_est: u64,
+    /// Per thread, the most edges it has executed in one run.
+    thread_est: Vec<u64>,
     rng: SmallRng,
     started: Instant,
     /// Take a snapshot every this many decisions along a rollout.
     pub snapshot_every: usize,
+    pub tuning: Tuning,
     pub stats: Stats,
     pub verbose: bool,
 }
@@ -156,7 +333,11 @@ impl Search {
                 depth: 0,
                 kind: Some(kind),
                 n,
+                edges: session.world.edges,
                 children: Vec::new(),
+                segment: None,
+                exhausted: false,
+                closed: false,
                 snapshot: None,
                 visits: 0,
                 novelty: 0,
@@ -168,7 +349,11 @@ impl Search {
                 depth: 0,
                 kind: None,
                 n: 0,
+                edges: session.world.edges,
                 children: Vec::new(),
+                segment: None,
+                exhausted: false,
+                closed: true,
                 snapshot: None,
                 visits: 0,
                 novelty: 0,
@@ -179,9 +364,13 @@ impl Search {
             session,
             nodes: vec![root],
             seen: Bitmap::default(),
+            sched_seen: HashSet::new(),
+            k_est: 64,
+            thread_est: Vec::new(),
             rng: SmallRng::seed_from_u64(seed),
             started: Instant::now(),
             snapshot_every: 8,
+            tuning: Tuning::default(),
             stats: Stats::default(),
             verbose: false,
         };
@@ -203,6 +392,45 @@ impl Search {
             }
         }
         self.stats.features += fresh as usize;
+        fresh
+    }
+
+    /// Interleaving features of the finished run: every context switch, identified by where
+    /// the outgoing thread stopped (point and last edge) and what ran next. Also refreshes
+    /// the PCT horizon estimates.
+    fn absorb_schedule(&mut self) -> u32 {
+        let trace: &[TraceEvent] = &self.session.world.trace;
+        let mut fresh = 0;
+        let mut per_thread: Vec<u64> = Vec::new();
+        for w in trace.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if per_thread.len() <= a.thread {
+                per_thread.resize(a.thread + 1, 0);
+            }
+            per_thread[a.thread] += a.edges;
+            if a.thread == b.thread {
+                continue;
+            }
+            let mut h = std::hash::DefaultHasher::new();
+            (a.thread, a.point, a.guard, b.thread).hash(&mut h);
+            if self.sched_seen.insert(h.finish()) {
+                fresh += 1;
+            }
+        }
+        if let Some(last) = trace.last() {
+            if per_thread.len() <= last.thread {
+                per_thread.resize(last.thread + 1, 0);
+            }
+            per_thread[last.thread] += last.edges;
+        }
+        self.k_est = self.k_est.max(self.session.world.edges);
+        if self.thread_est.len() < per_thread.len() {
+            self.thread_est.resize(per_thread.len(), 0);
+        }
+        for (est, seen) in self.thread_est.iter_mut().zip(per_thread) {
+            *est = (*est).max(seen);
+        }
+        self.stats.sched_features += fresh as usize;
         fresh
     }
 
@@ -271,6 +499,7 @@ impl Search {
             return existing;
         }
         let depth = self.nodes[parent].depth + 1;
+        let edges = self.session.world.edges;
         let node = match ev {
             Event::Decision { kind, n } => Node {
                 parent: Some(parent),
@@ -278,7 +507,11 @@ impl Search {
                 depth,
                 kind: Some(*kind),
                 n: *n,
+                edges,
                 children: Vec::new(),
+                segment: None,
+                exhausted: false,
+                closed: false,
                 snapshot: None,
                 visits: 0,
                 novelty: 0,
@@ -290,7 +523,11 @@ impl Search {
                 depth,
                 kind: None,
                 n: 0,
+                edges,
                 children: Vec::new(),
+                segment: None,
+                exhausted: false,
+                closed: true,
                 snapshot: None,
                 visits: 0,
                 novelty: 0,
@@ -303,11 +540,50 @@ impl Search {
         id
     }
 
-    fn default_choice(&mut self, n: u32) -> u32 {
-        if n <= 1 || self.rng.random_bool(0.5) {
-            0
+    /// The PCT policy's choice for the pending decision.
+    fn policy_choice(&mut self, policy: &mut Policy) -> u32 {
+        match self.session.world.pending.as_ref() {
+            Some(Pending::Schedule { candidates }) => {
+                let candidates = candidates.clone();
+                policy.schedule(&mut self.rng, &candidates)
+            }
+            Some(Pending::Budget { .. }) => policy.budget(self.session.world.edges),
+            Some(Pending::Variant { n, .. }) => self.rng.random_range(0..*n),
+            None => 0,
+        }
+    }
+
+    /// An untried choice at a frontier node: uniform over the unexplored siblings, except a
+    /// `Budget` node samples an exact edge offset within the thread's estimated run length.
+    fn untried_choice(&mut self, node: NodeId) -> Option<u32> {
+        let nd = &self.nodes[node];
+        let tried: Vec<u32> = nd.children.iter().map(|(c, _)| *c).collect();
+        if nd.kind == Some(Kind::Budget) {
+            if !tried.contains(&0) {
+                return Some(0);
+            }
+            if let Some(untried) = nd.untried_budgets() {
+                return (!untried.is_empty())
+                    .then(|| untried[self.rng.random_range(0..untried.len())]);
+            }
+            let thread = match self.session.world.pending {
+                Some(Pending::Budget { thread }) => thread,
+                _ => 0,
+            };
+            let horizon = self.thread_est.get(thread).copied().unwrap_or(0).max(8);
+            for _ in 0..64 {
+                let c = self.rng.random_range(1..=horizon) as u32;
+                if !tried.contains(&c) {
+                    return Some(c);
+                }
+            }
+            return None;
+        }
+        let untried: Vec<u32> = (0..nd.n).filter(|c| !tried.contains(c)).collect();
+        if untried.is_empty() {
+            None
         } else {
-            self.rng.random_range(0..n)
+            Some(untried[self.rng.random_range(0..untried.len())])
         }
     }
 
@@ -317,43 +593,91 @@ impl Search {
             return Ok(None);
         };
         self.goto(node)?;
-        let tried: Vec<u32> = self.nodes[node].children.iter().map(|(c, _)| *c).collect();
-        let untried: Vec<u32> = (0..self.nodes[node].n)
-            .filter(|c| !tried.contains(c))
-            .collect();
-        let first = untried[self.rng.random_range(0..untried.len())];
+        let Some(first) = self.untried_choice(node) else {
+            self.nodes[node].exhausted = true;
+            self.close_upwards(node);
+            return self.expand_once();
+        };
         let result = self.rollout(node, first)?;
         Ok(Some(result))
     }
 
-    /// Take `first` at `at`, then follow the default policy to the end of the run.
+    /// After stepping past a `Budget` node, whose trace had `mark` events before the step: the
+    /// budgeted thread's segment is the first event appended. If it ended at a natural stop
+    /// the segment is now known and fixes the node's candidate budgets.
+    fn learn_budgets(&mut self, node: NodeId, mark: usize) {
+        if self.nodes[node].kind != Some(Kind::Budget) || self.nodes[node].segment.is_some() {
+            return;
+        }
+        let Some(seg) = self.session.world.trace.get(mark).copied() else {
+            return;
+        };
+        if seg.point == Point::Preempt {
+            return;
+        }
+        let start = self.nodes[node].edges;
+        self.nodes[node].segment = Some(self.session.guards(start, start + seg.edges));
+    }
+
+    /// Take `first` at `at`, then follow the PCT policy to the end of the run.
     fn rollout(&mut self, at: NodeId, first: u32) -> io::Result<RunResult> {
         let mut node = at;
         let mut choice = first;
         let mut fresh_total = 0;
         let mut path = self.path(at);
+        let threads = self.session.world.threads.len();
+        let spent = self
+            .session
+            .world
+            .trace
+            .iter()
+            .filter(|e| e.point == Point::Preempt)
+            .count()
+            + usize::from(self.nodes[at].kind == Some(Kind::Budget) && first != 0);
+        let mut policy = Policy::new(
+            &mut self.rng,
+            threads,
+            self.k_est,
+            self.tuning.pct_depth,
+            spent,
+        );
         loop {
+            let mark = self.session.world.trace.len();
             self.session.choose(choice)?;
             let ev = self.session.step()?;
             self.stats.executed_decisions += 1;
             fresh_total += self.absorb_coverage();
+            self.learn_budgets(node, mark);
+            if let Some(TraceEvent {
+                thread,
+                point: Point::Preempt,
+                ..
+            }) = self.session.world.trace.last().copied()
+            {
+                policy.demote(&mut self.rng, thread);
+            }
             let child = self.add_child(node, choice, &ev);
             path.push(child);
             node = child;
             match ev {
-                Event::Decision { n, .. } => {
+                Event::Decision { .. } => {
                     if self.nodes[node].depth.is_multiple_of(self.snapshot_every)
                         && self.nodes[node].snapshot.is_none()
                     {
                         self.take_snapshot(node)?;
                     }
-                    choice = self.default_choice(n);
+                    choice = self.policy_choice(&mut policy);
                 }
                 Event::Done(outcome) => {
                     self.stats.runs += 1;
+                    fresh_total += self.absorb_schedule();
+                    self.close_upwards(node);
+                    // The first run's features are the program's baseline, not a merit of
+                    // the path it happened to take.
+                    let credit = if self.stats.runs == 1 { 0 } else { fresh_total };
                     for n in &path {
                         self.nodes[*n].visits += 1;
-                        self.nodes[*n].novelty += fresh_total;
+                        self.nodes[*n].novelty += credit;
                     }
                     let decisions = self.session.decisions().to_vec();
                     let stderr = self.session.take_stderr();
@@ -377,34 +701,55 @@ impl Search {
         }
     }
 
-    /// Weighted sample over expandable nodes: energy = (novelty + 1) / sqrt(visits + 1).
-    fn pick_frontier(&mut self) -> Option<NodeId> {
-        let weights: Vec<(NodeId, f64)> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.expandable())
-            .map(|(i, n)| {
-                (
-                    i,
-                    (n.novelty as f64 + 1.0)
-                        / ((n.visits as f64) + 1.0).sqrt()
-                        / (n.depth as f64 + 1.0),
-                )
-            })
-            .collect();
-        if weights.is_empty() {
-            return None;
-        }
-        let total: f64 = weights.iter().map(|(_, w)| w).sum();
-        let mut x = self.rng.random_range(0.0..total);
-        for (id, w) in &weights {
-            if x < *w {
-                return Some(*id);
+    /// Recompute `closed` from `node` up to the root.
+    fn close_upwards(&mut self, mut node: NodeId) {
+        loop {
+            let n = &self.nodes[node];
+            let closed = !n.expandable(self.tuning.budget_fanout)
+                && n.children.iter().all(|(_, c)| self.nodes[*c].closed);
+            self.nodes[node].closed = closed;
+            match self.nodes[node].parent {
+                Some(p) if closed => node = p,
+                _ => return,
             }
-            x -= w;
         }
-        weights.last().map(|(id, _)| *id)
+    }
+
+    /// MCTS selection: descend from the root by UCB over children (mean new features per run
+    /// through the child, plus an exploration bonus) until a node with an untried choice. The
+    /// tree structure keeps the search from drowning in the exponentially many deep leaves.
+    fn pick_frontier(&mut self) -> Option<NodeId> {
+        let mut node = 0;
+        loop {
+            if self.nodes[node].closed {
+                return None;
+            }
+            if self.nodes[node].expandable(self.tuning.budget_fanout) {
+                return Some(node);
+            }
+            let parent_visits = self.nodes[node].visits as f64 + 2.0;
+            let mut best: Option<(NodeId, f64)> = None;
+            for &(_, c) in &self.nodes[node].children {
+                if self.nodes[c].closed {
+                    continue;
+                }
+                let n = &self.nodes[c];
+                let visits = n.visits as f64 + 1.0;
+                let mean = (n.novelty as f64 + 1.0) / visits;
+                let explore = self.tuning.ucb_c * (parent_visits.ln() / visits).sqrt();
+                let score = mean + explore + self.rng.random_range(0.0..1e-6);
+                if best.is_none_or(|(_, b)| score > b) {
+                    best = Some((c, score));
+                }
+            }
+            match best {
+                Some((c, _)) => node = c,
+                None => {
+                    self.close_upwards(node);
+                    return self.pick_frontier();
+                }
+            }
+        }
     }
 
     /// Stats with `wall` refreshed to the time since `new`.
@@ -421,11 +766,16 @@ impl Search {
                 Some(r) => {
                     if self.verbose {
                         eprintln!(
-                            "run {:>5}: {:<12} {:>3} decisions, +{} features",
+                            "run {:>5}: {:<12} {:>3} decisions, +{} features  {}",
                             self.stats.runs,
                             r.outcome.to_string(),
                             r.decisions.len(),
-                            r.new_features
+                            r.new_features,
+                            r.decisions
+                                .iter()
+                                .map(|d| format!("{}:{}", d.kind, d.choice))
+                                .collect::<Vec<_>>()
+                                .join(" ")
                         );
                     }
                     if budget.stop_on_failure && !r.outcome.is_ok() {
@@ -479,15 +829,19 @@ impl Search {
                 0
             };
             i += 1;
+            let mark = self.session.world.trace.len();
             self.session.choose(choice)?;
             let ev = self.session.step()?;
             self.stats.executed_decisions += 1;
             fresh_total += self.absorb_coverage();
+            self.learn_budgets(node, mark);
             let child = self.add_child(node, choice, &ev);
             path.push(child);
             node = child;
             if let Event::Done(outcome) = ev {
                 self.stats.runs += 1;
+                fresh_total += self.absorb_schedule();
+                self.close_upwards(node);
                 let decisions = self.session.decisions().to_vec();
                 let stderr = self.session.take_stderr();
                 return Ok(RunResult {
@@ -594,4 +948,71 @@ pub fn format_decisions(decisions: &[Decision]) -> String {
         .map(|d| d.to_string())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget_node(segment: Option<Vec<u32>>, tried: &[u32]) -> Node {
+        Node {
+            parent: None,
+            choice_from_parent: 0,
+            depth: 0,
+            kind: Some(Kind::Budget),
+            n: BUDGET_MAX,
+            edges: 0,
+            children: tried.iter().map(|c| (*c, 0)).collect(),
+            segment,
+            exhausted: false,
+            closed: false,
+            snapshot: None,
+            visits: 0,
+            novelty: 0,
+            outcome: None,
+        }
+    }
+
+    #[test]
+    fn budgets_are_first_occurrences_of_distinct_guards() {
+        let n = budget_node(Some(vec![5, 5, 9, 5, 9, 2]), &[]);
+        assert_eq!(n.budgets(), Some(vec![1, 3, 6]));
+        assert_eq!(budget_node(Some(vec![]), &[]).budgets(), Some(vec![]));
+        assert_eq!(budget_node(None, &[]).budgets(), None);
+    }
+
+    #[test]
+    fn budget_node_widens_then_closes() {
+        // Nothing tried: 0 first.
+        assert!(budget_node(None, &[]).expandable(2));
+        // Unknown segment: sampled offsets up to the fanout.
+        assert!(budget_node(None, &[0, 7]).expandable(3));
+        assert!(!budget_node(None, &[0, 7, 9]).expandable(3));
+        // Known segment: only its distinct guards, and no more once all are tried.
+        let seg = Some(vec![1, 2, 3]);
+        assert!(budget_node(seg.clone(), &[0]).expandable(8));
+        assert!(!budget_node(seg.clone(), &[0, 1, 2, 3]).expandable(8));
+        assert!(!budget_node(Some(vec![]), &[0]).expandable(8));
+        // Fanout caps the up-front width; visits grow it.
+        let mut n = budget_node(Some((1..=20).collect()), &[0, 1, 2]);
+        assert!(!n.expandable(2));
+        n.visits = 4;
+        assert!(n.expandable(2));
+    }
+
+    #[test]
+    fn pct_policy_prefers_priority_and_counts_spent_preemptions() {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let p = Policy::new(&mut rng, 2, 100, 3, 3);
+        assert!(p.change_points.is_empty());
+        let mut p = Policy::new(&mut rng, 2, 100, 1, 0);
+        assert_eq!(p.change_points.len(), 1);
+        let cands = [Candidate::Run(0), Candidate::Run(1)];
+        let top = p.schedule(&mut rng, &cands) as usize;
+        p.demote(&mut rng, top);
+        assert_eq!(p.schedule(&mut rng, &cands) as usize, 1 - top);
+        let cp = p.change_points[0];
+        assert_eq!(p.budget(cp + 1), 0);
+        assert!(p.change_points.is_empty());
+    }
 }

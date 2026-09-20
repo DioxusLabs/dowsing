@@ -3,8 +3,9 @@
 //!   cargo run --release -p dowsing-sandbox --example explore -- targets/target/release/lost_update
 //!
 //! Flags: --runs N  --seed S  --verbose  --snapshot-every K  --keep-going  --replays N
+//!        --fanout N  --pct-depth D  --ucb C
 
-use dowsing_sandbox::{Budget, Options, Search, Session, tree::format_decisions};
+use dowsing_sandbox::{Budget, Options, Search, Session, tree::Tuning, tree::format_decisions};
 use std::time::Duration;
 
 fn main() {
@@ -16,6 +17,7 @@ fn main() {
     let mut snapshot_every = 8;
     let mut keep_going = false;
     let mut replays = 20;
+    let mut tuning = Tuning::default();
     let mut target_args = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -23,6 +25,9 @@ fn main() {
             "--seed" => seed = args.next().unwrap().parse().unwrap(),
             "--snapshot-every" => snapshot_every = args.next().unwrap().parse().unwrap(),
             "--replays" => replays = args.next().unwrap().parse().unwrap(),
+            "--fanout" => tuning.budget_fanout = args.next().unwrap().parse().unwrap(),
+            "--pct-depth" => tuning.pct_depth = args.next().unwrap().parse().unwrap(),
+            "--ucb" => tuning.ucb_c = args.next().unwrap().parse().unwrap(),
             "--verbose" => verbose = true,
             "--keep-going" => keep_going = true,
             _ if program.is_none() => program = Some(a),
@@ -47,6 +52,7 @@ fn main() {
     );
     search.snapshot_every = snapshot_every;
     search.verbose = verbose;
+    search.tuning = tuning;
     let budget = Budget {
         runs,
         wall: Duration::from_secs(120),

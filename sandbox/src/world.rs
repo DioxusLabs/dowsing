@@ -4,8 +4,9 @@
 use crate::{ptrace::Pid, shm::Bitmap};
 use std::fmt;
 
-/// Edge budgets selectable at a `Budget` decision; index 0 = run to the next syscall.
-pub const BUDGET_TABLE: &[u32] = &[0, 1, 2, 4, 8, 16, 32, 64, 128, 512];
+/// A `Budget` decision's choice is the exact number of instrumented edges the thread runs
+/// before it is preempted; 0 = run to its next natural stop. `n` is this bound.
+pub const BUDGET_MAX: u32 = 1 << 24;
 
 /// Virtual `CLOCK_MONOTONIC` at process start (1 s, so it is never zero).
 pub const CLOCK_START_NS: u64 = 1_000_000_000;
@@ -18,7 +19,7 @@ pub const REALTIME_BASE_NS: u64 = 1_767_225_600 * 1_000_000_000;
 pub enum Kind {
     /// Which runnable thread runs next (or which timed waiter's timeout fires).
     Schedule,
-    /// How many coverage edges the chosen thread may run before forced preemption.
+    /// How many coverage edges the chosen thread runs before forced preemption (exact).
     Budget,
     /// The target's own `dowsing_target_rt::variant(n)`.
     Variant,
@@ -110,12 +111,14 @@ impl fmt::Display for Point {
     }
 }
 
-/// One entry of the schedule trace: `thread` ran `edges` instrumented edges and stopped at `point`.
+/// One entry of the schedule trace: `thread` ran `edges` instrumented edges, the last of them
+/// `guard`, and stopped at `point`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceEvent {
     pub thread: usize,
     pub point: Point,
     pub edges: u64,
+    pub guard: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +199,7 @@ impl Pending {
     pub fn n(&self) -> u32 {
         match self {
             Pending::Schedule { candidates } => candidates.len() as u32,
-            Pending::Budget { .. } => BUDGET_TABLE.len() as u32,
+            Pending::Budget { .. } => BUDGET_MAX,
             Pending::Variant { n, .. } => *n,
         }
     }
@@ -214,6 +217,8 @@ pub struct World {
     pub coverage: Bitmap,
     pub edges: u64,
     pub edges_at_last_event: u64,
+    /// Id of the most recently executed edge (mirrors the shared mapping).
+    pub guard: u32,
     pub trace: Vec<TraceEvent>,
     pub decisions: Vec<Decision>,
     pub pending: Option<Pending>,
@@ -237,6 +242,7 @@ impl World {
             coverage: Bitmap::default(),
             edges: 0,
             edges_at_last_event: 0,
+            guard: 0,
             trace: Vec::new(),
             decisions: Vec::new(),
             pending: None,

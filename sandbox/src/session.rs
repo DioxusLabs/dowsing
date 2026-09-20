@@ -334,12 +334,15 @@ impl Session {
         let edges = edges_now - self.world.edges_at_last_event;
         self.world.edges_at_last_event = edges_now;
         self.world.edges = edges_now;
+        let guard = self.shm.guard();
+        self.world.guard = guard;
         let fresh = self.shm.drain_bitmap(&mut self.world.coverage);
         self.new_coverage.extend(fresh);
         self.world.trace.push(TraceEvent {
             thread,
             point,
             edges,
+            guard,
         });
         self.log(|| format!("T{thread} ran {edges} edges -> {point}"));
     }
@@ -393,7 +396,7 @@ impl Session {
             Pending::Schedule { candidates } => {
                 self.apply_candidate(candidates[choice as usize], true)
             }
-            Pending::Budget { thread } => self.resume(thread, BUDGET_TABLE[choice as usize]),
+            Pending::Budget { thread } => self.resume(thread, choice),
             Pending::Variant { thread, .. } => {
                 self.set_return(thread, choice as i64)?;
                 self.world.threads[thread].state = ThreadState::Stopped;
@@ -405,6 +408,12 @@ impl Session {
     /// Decisions made since the root.
     pub fn decisions(&self) -> &[Decision] {
         &self.world.decisions
+    }
+
+    /// Guard ids of the instrumented edges numbered `start..end` (global edge indices), as far
+    /// back as the target's guard log still holds them.
+    pub fn guards(&self, start: u64, end: u64) -> Vec<u32> {
+        self.shm.guards(start, end)
     }
 
     fn schedule(&mut self) -> io::Result<()> {
@@ -1217,6 +1226,7 @@ impl Session {
         self.world = snap.world.clone();
         self.shm.set_budget(0);
         self.shm.set_edges(self.world.edges);
+        self.shm.set_guard(self.world.guard);
         self.shm.drain_bitmap(&mut crate::shm::Bitmap::default());
         self.new_coverage.clear();
         snapshot::clear_soft_dirty(self.leader)?;

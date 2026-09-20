@@ -21,7 +21,7 @@ Decision points, in the order the supervisor sees them:
 | kind | when | choice set |
 |---|---|---|
 | `Schedule` | ≥2 threads runnable | index into runnable threads |
-| `Budget` | after a Schedule | how many coverage edges before forced preemption (table) |
+| `Budget` | after a Schedule | exact number of coverage edges before forced preemption; 0 = run to the next natural stop |
 | `Time` | nothing runnable, ≥1 timed waiter | which waiter's timeout fires (clock jumps to it) |
 | `Harness` | target calls `dowsing::variant(n)` / `range` / raw bytes | `0..n` |
 | `Syscall` | emulated syscall with a modelled answer set (later: net/fs/entropy) | model-defined |
@@ -121,23 +121,36 @@ Two things the kernel does that the implementation has to work around:
 ## 5. Search
 
 ```
-frontier: Node with untried choices, priority = energy(node)
 loop:
-    node   = frontier.pop_max()
+    node   = descend from the root by UCB over children          # reward = new features per run
+             until a node with an untried choice
     restore(nearest_snapshot_ancestor(node)); replay(decisions from it to node)
-    choice = pick untried choice of node                       # deterministic order per node
-    run: take choice, then default policy until exit           # default = choice 0 / lowest tid
+    choice = pick untried choice of node
+    run: take choice, then the PCT policy until exit
          every decision point along the way becomes a Node; its coverage delta is recorded
-    energy(ancestors) += novelty(coverage seen on this run)    # new edges → hot subtree
-    snapshot policy: take one every K decisions on the run, and always after new coverage
+    energy(path) += novelty(edges) + novelty(interleavings)      # new features → hot subtree
+    snapshot policy: take one every K decisions on the run
     outcome ∈ {Exit(0), Crash, Panic, Deadlock, Timeout}: non-Exit(0) → failure, Case saved
 ```
 
-`novelty` is dowsing's existing feature accounting (new `CoverageId`s, hit-count buckets) taken
-from the target's shared `trace-pc-guard` bitmap at every stop, attributed to the decision edge
-that led there. Because expansion happens at decision granularity, restoring to a hot node and
-taking a sibling choice is exactly "rewind to the interesting branch"; the snapshot makes the
-rewind O(pages touched) instead of O(prefix execution).
+The rollout policy is PCT: each thread gets a random priority, the highest-priority runnable
+candidate runs, and at `d ≤ 3` random change points (global edge counts) the running thread is
+demoted to the lowest priority. Preemptions already on the prefix count towards `d`, so a rollout
+below a forced preemption adds only the remainder. A `Budget` choice is the exact edge distance
+to the next change point, so a preemption can land on any instrumented edge; the tree does not
+enumerate those. Once a thread has run from a `Budget` node to its natural stop, the guard ids it
+executed (from a ring log the target writes next to the bitmap) fix the node's candidates: one
+budget per distinct edge of the segment, since preempting at a second execution of the same
+edge is not a new program point and a budget past the segment is the same run as 0.
+
+`novelty` has two parts: dowsing's existing feature accounting (new `CoverageId`s) from the
+target's shared `trace-pc-guard` bitmap, and *interleaving features* — a context switch
+identified by the outgoing thread, its stop point, the last edge it executed and the thread that
+ran next. Edge coverage saturates after a few runs on a schedule bug; the interleaving features
+are what keep the frontier pointed at unexplored preemption points. Because expansion happens at
+decision granularity, restoring to a hot node and taking a sibling choice is exactly "rewind to
+the interesting branch"; the snapshot makes the rewind O(pages touched) instead of O(prefix
+execution).
 
 Shrinking a failing `Case`: tree-aware `cautious()`. Candidates are (a) delete a decision (later
 decisions re-bind by position; the run is re-validated), (b) replace a choice with a smaller
@@ -187,8 +200,10 @@ on two-thread targets (lost update, deadlock, timeout-dependent bug). Acceptance
 - 100/100 identical traces replaying a `Case` — met (`explore lost_update --replays 100`:
   1 distinct trace hash);
 - search finds each bug and reports the `Case`; shrink returns a short `Case` — bugs found
-  (lost update in 60–160 runs, deadlock in 20–70, timeout race in 2–30, three seeds each);
-  shrink returns 5 decisions for the deadlock but 14 (6 non-default) for the lost update: the
+  (with PCT rollouts and the coverage-guided tree: lost update in 4–9 runs, deadlock in 1–53,
+  timeout race in 1–6, three seeds each; 10-seed medians 5.5 / 9.5 / 1.5; before that 60–160 /
+  20–70 / 2–30);
+  shrink returns 5 decisions for the deadlock but 12 (5 non-default) for the lost update: the
   race needs both threads inside the read/write window and the current shrinker only deletes
   and zeroes decisions, it does not merge adjacent `Budget` preemptions into one. Open;
 - restore-from-snapshot measured against re-execution on a target with an expensive prefix

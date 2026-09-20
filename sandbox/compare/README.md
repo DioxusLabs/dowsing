@@ -32,7 +32,8 @@ it ran and did not find the bug.
 | **ThreadSanitizer** (nightly `-Zsanitizer=thread`) | recompiled | 0/200, 3.1 s (15.5 ms/run) — not a data race | not run | not run | — | — |
 | **fork/CoW** (single-thread holder) | yes | n/a (baseline only) | n/a | n/a | 38–45 ms setup once, then **1.8–1.9 ms/run** | — (holder cannot hold two live threads) |
 | **CRIU 4.1** | yes | n/a | n/a | n/a | dump 64–77 ms (65.7 MB image), **restore 39–41 ms/run** | full-process, not per-decision |
-| **dowsing sandbox (this branch)** | yes, plus 1 harness call for T2 | 62 / 66 / 155 runs, **0.16 / 0.11 / 0.25 s** | 20 / 45 / 70 runs, **0.03 / 0.06 / 0.10 s** | 2 / 9 / 31 runs, **0.006 / 0.014 / 0.052 s** | root 100 ms once, then **1.8 ms/restore**, 3.0 ms/run incl. supervision | 100/100 replays identical, 1.0–2.8 ms each; shrinks to 14 / 5 / 15–17 decisions |
+| **dowsing sandbox, milestone 1** (coverage novelty only, budget table) | yes, plus 1 harness call for T2 | 62 / 66 / 155 runs, **0.16 / 0.11 / 0.25 s** | 20 / 45 / 70 runs, **0.03 / 0.06 / 0.10 s** | 2 / 9 / 31 runs, **0.006 / 0.014 / 0.052 s** | root 100 ms once, then **1.8 ms/restore**, 3.0 ms/run incl. supervision; 49 runs to the bug | 100/100 replays identical, 1.0–2.8 ms each; shrinks to 14 / 5 / 15–17 decisions |
+| **dowsing sandbox, PCT + coverage-guided tree** (this branch) | yes, plus 1 harness call for T2 | **9 / 6 / 4 runs, 0.014 / 0.014 / 0.005 s** (10-seed median 5.5, max 17) | **1 / 53 / 14 runs, 0.001 / 0.080 / 0.021 s** (10-seed median 9.5, max 53) | **6 / 1 / 1 runs, 0.013 / 0.001 / 0.002 s** (10-seed median 1.5, max 7) | root 104 ms once, then **1.9 ms/restore**; 10 / 11 / 4 runs to the bug | 100/100 replays identical, 1.2–2.7 ms each; shrinks to 12 / 5 / 13–15 decisions |
 
 Rates for the sandbox after the soft-dirty fix: 386–620 runs/s on T1, 659–784 on T2, 321–646 on T3,
 262 on T4 (with the 64 MB image live). Before the fix (soft-dirty scan treating never-touched
@@ -71,13 +72,17 @@ stack pages as dirty) it was 33/s on T1 and 30/s on T4; the fix is what makes th
   race has already started. The sandbox restore writes only the pages that changed since the
   snapshot (avg 18 pages) plus register sets for every thread, in 1.8 ms, and does so at any
   decision node.
-- **Runs-to-failure vs shuttle**: shuttle's random scheduler found T1 in 1 iteration and T2 in 4;
-  the sandbox needed 62–155 and 20–70. Two reasons: the sandbox's preemption points are
-  coverage-edge budgets (many decision nodes per critical section, each a search step), and its
-  search has no *guidance* yet besides coverage novelty — shuttle's PCT is a proper
-  probabilistic-concurrency-testing schedule. Porting PCT onto the decision tree is a straightforward
-  follow-up; the tree makes it cheaper than in shuttle because a restore replaces re-execution.
-- **Shrink** is where the sandbox is weakest: T1 shrinks to 14 decisions (6 non-default) while
+- **Runs-to-failure vs shuttle**: shuttle's random scheduler found T1 in 1 iteration and T2 in 4,
+  its PCT(2) in 4 and 56. Milestone 1 needed 62–155 and 20–70: its preemption points were a
+  coarse budget table (many nodes per critical section, few of them useful) and the frontier was
+  sampled by coverage novelty alone. The second row is the same supervisor with PCT rollouts on
+  the tree (random thread priorities, `d ≤ 3` change points, exact edge-distance budgets), budget
+  candidates limited to one per distinct edge of the thread's segment, interleaving features
+  (stop point + last edge + next thread) counted as novelty next to edge coverage, and UCB
+  selection down the tree instead of a flat frontier draw. That closes the gap to shuttle's PCT
+  (median 5.5 / 9.5 runs vs 4 / 56) on an unmodified binary; per-seed spread is still wide
+  (T2 seed 2: 53 runs), see `sandbox/sweep.sh` for the 10-seed numbers.
+- **Shrink** is where the sandbox is weakest: T1 shrinks to 12 decisions (5 non-default) while
   the minimal interleaving is ~4 decisions; the shrinker does not yet merge adjacent
   preemption budgets (DESIGN.md §8).
 
@@ -99,6 +104,7 @@ cd sandbox/compare
 ./run.sh                          # all sections → results.txt
 ./run.sh sandbox snapshot         # subsets: native rr sandbox loom shuttle snapshot tsan
 HERMIT=/path/to/hermit ./hermit_sweep.sh 100   # hermit row (build notes in the script header)
+../sweep.sh 10 2000 [--pct-depth D --fanout N --ucb C]   # sandbox runs-to-failure over 10 seeds
 CRIU=/path/to/criu ./run.sh snapshot   # CRIU ≥ 4.x (Ubuntu's 3.16 segfaults on restore); needs passwordless sudo
 ```
 

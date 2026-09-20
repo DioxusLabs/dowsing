@@ -10,7 +10,8 @@ use std::{
 pub const ENV_SHM_FD: &str = "DOWSING_SHM_FD";
 pub const HEADER_BYTES: usize = 4096;
 pub const BITMAP_BYTES: usize = 1 << 16;
-pub const SHM_BYTES: usize = HEADER_BYTES + BITMAP_BYTES;
+pub const LOG_ENTRIES: usize = 1 << 16;
+pub const SHM_BYTES: usize = HEADER_BYTES + BITMAP_BYTES + LOG_ENTRIES * 4;
 pub const MARKER_SYSCALL: libc::c_long = libc::SYS_getppid;
 pub const MARKER_MAGIC: u64 = 0xd0_5e_ed_5c_ed;
 pub const MARKER_PREEMPT: u64 = 0;
@@ -18,6 +19,7 @@ pub const MARKER_VARIANT: u64 = 1;
 
 const OFF_BUDGET: usize = 0;
 const OFF_EDGES: usize = 8;
+const OFF_GUARD: usize = 16;
 
 /// Coverage bitmap of one execution path; cloned into snapshots and written back on restore.
 #[derive(Clone, PartialEq, Eq)]
@@ -108,6 +110,27 @@ impl Shm {
         self.u64_at(OFF_EDGES).store(edges, Ordering::SeqCst);
     }
 
+    /// Id of the most recently executed edge.
+    pub fn guard(&self) -> u32 {
+        self.u32_at(OFF_GUARD).load(Ordering::SeqCst)
+    }
+
+    pub fn set_guard(&self, guard: u32) {
+        self.u32_at(OFF_GUARD).store(guard, Ordering::SeqCst);
+    }
+
+    /// Guard ids of edges `start..end` (global edge indices), oldest first. Only the last
+    /// `LOG_ENTRIES` edges are retained, so an older `start` is clamped forward.
+    pub fn guards(&self, start: u64, end: u64) -> Vec<u32> {
+        let start = start.max(end.saturating_sub(LOG_ENTRIES as u64));
+        (start..end)
+            .map(|e| {
+                let off = HEADER_BYTES + BITMAP_BYTES + (e as usize % LOG_ENTRIES) * 4;
+                self.u32_at(off).load(Ordering::SeqCst)
+            })
+            .collect()
+    }
+
     fn bitmap_words(&self) -> &[AtomicU64] {
         unsafe {
             std::slice::from_raw_parts(
@@ -152,5 +175,42 @@ impl Drop for Shm {
         unsafe {
             libc::munmap(self.base as *mut libc::c_void, SHM_BYTES);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(shm: &Shm, e: u64, id: u32) {
+        let off = HEADER_BYTES + BITMAP_BYTES + (e as usize % LOG_ENTRIES) * 4;
+        shm.u32_at(off).store(id, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn guards_read_by_global_edge_index_and_wrap() {
+        let shm = Shm::new().unwrap();
+        for e in 0..8u64 {
+            log(&shm, e, 100 + e as u32);
+        }
+        assert_eq!(shm.guards(2, 6), vec![102, 103, 104, 105]);
+        assert_eq!(shm.guards(3, 3), Vec::<u32>::new());
+        let far = 3 * LOG_ENTRIES as u64 + 5;
+        log(&shm, far, 7);
+        log(&shm, far + 1, 8);
+        assert_eq!(shm.guards(far, far + 2), vec![7, 8]);
+    }
+
+    #[test]
+    fn guards_clamps_to_retained_window() {
+        let shm = Shm::new().unwrap();
+        let end = 2 * LOG_ENTRIES as u64;
+        for e in end - LOG_ENTRIES as u64..end {
+            log(&shm, e, e as u32);
+        }
+        let all = shm.guards(0, end);
+        assert_eq!(all.len(), LOG_ENTRIES);
+        assert_eq!(all[0], (end - LOG_ENTRIES as u64) as u32);
+        assert_eq!(*all.last().unwrap(), (end - 1) as u32);
     }
 }

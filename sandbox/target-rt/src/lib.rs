@@ -19,7 +19,9 @@
 //! ```text
 //! offset 0      u32 budget        (0 = unlimited, n = preempt after n more edges)
 //! offset 8      u64 edges         (monotonic edge counter)
+//! offset 16     u32 guard         (id of the most recently executed edge)
 //! offset 4096   bitmap            (BITMAP_BYTES, bit i = guard i was hit)
+//! then          guard log         (LOG_ENTRIES u32: entry `e % LOG_ENTRIES` = id of edge `e`)
 //! ```
 
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -27,7 +29,8 @@ use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 pub const ENV_SHM_FD: &str = "DOWSING_SHM_FD";
 pub const HEADER_BYTES: usize = 4096;
 pub const BITMAP_BYTES: usize = 1 << 16;
-pub const SHM_BYTES: usize = HEADER_BYTES + BITMAP_BYTES;
+pub const LOG_ENTRIES: usize = 1 << 16;
+pub const SHM_BYTES: usize = HEADER_BYTES + BITMAP_BYTES + LOG_ENTRIES * 4;
 pub const MARKER_SYSCALL: libc::c_long = libc::SYS_getppid;
 pub const MARKER_MAGIC: u64 = 0xd0_5e_ed_5c_ed;
 /// Marker kinds (second syscall argument).
@@ -36,6 +39,7 @@ pub const MARKER_VARIANT: u64 = 1;
 
 const OFF_BUDGET: usize = 0;
 const OFF_EDGES: usize = 8;
+const OFF_GUARD: usize = 16;
 
 static SHM: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static NEXT_GUARD: AtomicU32 = AtomicU32::new(1);
@@ -208,7 +212,11 @@ pub unsafe extern "C" fn __sanitizer_cov_trace_pc_guard(guard: *mut u32) {
             byte.store(old | bit, Ordering::Relaxed);
         }
         let edges = header_u64(base, OFF_EDGES);
-        edges.store(edges.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        let e = edges.load(Ordering::Relaxed);
+        edges.store(e + 1, Ordering::Relaxed);
+        header_u32(base, OFF_GUARD).store(id as u32, Ordering::Relaxed);
+        let slot = HEADER_BYTES + BITMAP_BYTES + (e as usize % LOG_ENTRIES) * 4;
+        header_u32(base, slot).store(id as u32, Ordering::Relaxed);
         let budget = header_u32(base, OFF_BUDGET);
         let remaining = budget.load(Ordering::Relaxed);
         if remaining == 0 {
