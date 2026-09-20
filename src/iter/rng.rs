@@ -433,7 +433,7 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         }
     }
 
-    fn finish(
+    pub(super) fn finish(
         &mut self,
         record_coverage: bool,
         case_cost: CaseCost,

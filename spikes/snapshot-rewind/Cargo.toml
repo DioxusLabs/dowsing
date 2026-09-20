@@ -1,0 +1,23 @@
+[package]
+name = "snapshot-rewind"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }
+
+[[test]]
+name = "replay_equivalence"
+harness = false
+
+[[test]]
+name = "fd_refusal"
+harness = false
+
+[profile.release]
+debug = 1

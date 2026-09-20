@@ -260,6 +260,29 @@ impl Reader<'_> {
     }
 }
 
+/// Build a replayable case from a raw stream (no span information).
+#[doc(hidden)]
+pub fn case_from_stream(spec: StreamSpec) -> Case {
+    Case {
+        seed: spec.seed,
+        prefix: spec.prefix,
+        zero_tail: spec.zero_tail,
+        draws: Vec::new(),
+        semantics: Vec::new(),
+        sequences: Vec::new(),
+    }
+}
+
+/// The stream a case replays.
+#[doc(hidden)]
+pub fn case_stream(case: &Case) -> StreamSpec {
+    StreamSpec {
+        seed: case.seed,
+        prefix: case.prefix.clone(),
+        zero_tail: case.zero_tail,
+    }
+}
+
 impl<Capture: CoverageCapture> CaseRng<Capture> {
     /// Zero-byte checkpoint marker: tells a snapshotting supervisor that the
     /// setup phase is over and a snapshot here is likely worthwhile.
@@ -316,6 +339,13 @@ impl<Capture: CoverageCapture> CaseRng<Capture> {
         self.zero_tail = spec.zero_tail;
         self.fallback = SmallRng::seed_from_u64(spec.seed);
         Ok(())
+    }
+
+    /// Finish this execution in place (the detached runner's equivalent of
+    /// `coverage()` / `discard()`).
+    #[doc(hidden)]
+    pub fn snapshot_finish(&mut self, record_coverage: bool) -> Result<CaseCoverage, String> {
+        self.finish(record_coverage, CaseCost::zero())
     }
 
     /// Record an execution that finished in another process as this candidate's result.
