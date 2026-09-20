@@ -534,6 +534,7 @@ pub(super) struct ReductionId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ReducerPass {
+    LengthProbe,
     DrawLength,
     TailTrim,
     DrawDelete,
@@ -599,7 +600,8 @@ impl ReductionSpec {
             ReductionOp::ReplaceDictionary {
                 dictionary_index, ..
             } => *dictionary_index as u64,
-            ReductionOp::DeleteRange { .. } | ReductionOp::ZeroRange { .. } => 0,
+            ReductionOp::DeleteRange { adjust_first, .. } => *adjust_first as u64,
+            ReductionOp::ZeroRange { .. } => 0,
         }
     }
 }
@@ -612,10 +614,13 @@ pub(super) enum ReductionOp {
         target: u64,
         zero_until: Option<usize>,
     },
+    /// Delete `len` bytes at `start` and lower the first byte of the prefix by `adjust_first`
+    /// (0 leaves it alone). The first draw is usually a length, so the adjustment is expressed in
+    /// whatever unit the caller believes that length counts: draws, items, or bytes.
     DeleteRange {
         start: usize,
         len: usize,
-        adjust_first: bool,
+        adjust_first: usize,
     },
     DeleteSequenceItems {
         length_start: usize,

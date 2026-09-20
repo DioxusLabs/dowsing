@@ -10,17 +10,26 @@ use super::{
 };
 use crate::coverage::CoverageCapture;
 
-const REDUCER_PASSES: [ReducerPass; 15] = [
+/// Deterministic reducer passes in the order `cautious()` tries them.
+///
+/// Passes that remove bytes (sequence/semantic deletes, then draw- and block-granular deletes) run
+/// before passes that only lower values. `LengthProbe` is the one exception: it tries a handful of
+/// small values for the first draw, which is usually a length, so the cheap "is a tiny case enough?"
+/// question is answered before deletion work starts. The broad `DrawLength` sweep over every draw
+/// runs after deletion because its candidate count grows with the prefix and it rarely removes
+/// bytes on its own.
+const REDUCER_PASSES: [ReducerPass; 16] = [
     ReducerPass::SequenceDelete,
     ReducerPass::SemanticLength,
     ReducerPass::SemanticDelete,
-    ReducerPass::SemanticSimplify,
-    ReducerPass::DrawLength,
+    ReducerPass::LengthProbe,
     ReducerPass::TailTrim,
     ReducerPass::DrawDelete,
+    ReducerPass::WeightedBlockDelete,
     ReducerPass::SequenceProject,
     ReducerPass::SequenceReplace,
-    ReducerPass::WeightedBlockDelete,
+    ReducerPass::SemanticSimplify,
+    ReducerPass::DrawLength,
     ReducerPass::BlockZero,
     ReducerPass::WordLower,
     ReducerPass::ByteLower,
@@ -67,6 +76,40 @@ pub(super) fn reset_cautious_reducer_to_best<Capture: CoverageCapture>(state: &m
     state.cautious_reducer.reset(index, entry);
 }
 
+/// Point the reducer at the new best without restarting its pass schedule.
+///
+/// Used when the new best is only cosmetically better (same domain cost and byte length, fewer
+/// features or smaller values): every deletion pass already ran against an equivalent layout, so
+/// replaying them from pass zero would spend the budget on candidates that were just rejected.
+pub(super) fn retarget_cautious_reducer_to_best<Capture: CoverageCapture>(
+    state: &mut State<Capture>,
+) {
+    let Some(index) = state.min_path_best_index else {
+        state.cautious_reducer = CautiousReducer::default();
+        return;
+    };
+    let Some(entry) = state.corpus.get(index) else {
+        state.cautious_reducer = CautiousReducer::default();
+        return;
+    };
+    if state.cautious_reducer.exhausted || state.cautious_reducer.best_index.is_none() {
+        state.cautious_reducer.reset(index, entry);
+    } else {
+        state.cautious_reducer.retarget(index, entry);
+    }
+}
+
+/// Whether moving the cautious frontier from `previous` to `next` changes the domain cost or the
+/// byte length. Anything else (fewer features, lower hit-count weight, fewer nonzero bytes, or a
+/// lexicographic tie-break) is cosmetic and keeps the reducer's pass cursor.
+pub(super) fn is_structural_improvement(
+    previous: Option<MinPathScore>,
+    next: MinPathScore,
+) -> bool {
+    previous
+        .is_none_or(|previous| next.case_cost != previous.case_cost || next.bytes != previous.bytes)
+}
+
 pub(super) fn record_cautious_discard<Capture: CoverageCapture>(
     state: &mut State<Capture>,
     origin: &CandidateOrigin,
@@ -102,6 +145,21 @@ impl CautiousReducer {
         self.rejects = 0;
         self.preserves = 0;
         self.exhausted = false;
+    }
+
+    fn retarget(&mut self, index: usize, entry: &CorpusSeed) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.best_index = Some(index);
+        self.best_seed = entry.seed;
+        self.best_prefix = entry.prefix.clone();
+        self.best_draws = entry.draws.clone();
+        self.best_semantics = entry.semantics.clone();
+        self.best_sequences = entry.sequences.clone();
+        self.cached_pass = None;
+        self.cached_specs.clear();
+        self.tried_prefixes
+            .insert(prefix_fingerprint(&self.best_prefix));
+        self.range_pressure.resize(self.best_prefix.len(), 1);
     }
 
     fn next_candidate(
@@ -302,13 +360,14 @@ fn reduction_specs(pass: ReducerPass, context: ReductionContext<'_>) -> Vec<Redu
         ReducerPass::SemanticLength
         | ReducerPass::SemanticDelete
         | ReducerPass::SemanticSimplify => Vec::new(),
+        ReducerPass::LengthProbe => length_probe_specs(context.prefix, context.draws),
         ReducerPass::DrawLength => draw_length_specs(
             context.prefix,
             context.draws,
             context.pressure,
             context.options,
         ),
-        ReducerPass::TailTrim => tail_trim_specs(context.prefix, context.pressure),
+        ReducerPass::TailTrim => tail_trim_specs(context.prefix, context.draws, context.pressure),
         ReducerPass::DrawDelete => draw_delete_specs(
             context.prefix,
             context.draws,
@@ -696,7 +755,7 @@ fn semantic_delete_specs(
             op: ReductionOp::DeleteRange {
                 start: span.start,
                 len: span.len,
-                adjust_first: false,
+                adjust_first: 0,
             },
             weight: semantic_weight(span.kind) + range_weight(pressure, span.start, span.len),
         });
@@ -772,6 +831,36 @@ fn semantic_simplify_specs(
     specs
 }
 
+/// Try small length-like values for the first draw only.
+fn length_probe_specs(prefix: &[u8], draws: &[DrawSpan]) -> Vec<ReductionSpec> {
+    let Some(draw) = draws.first().copied() else {
+        return Vec::new();
+    };
+    if !valid_draw(prefix, draw) {
+        return Vec::new();
+    }
+    let mut specs = Vec::new();
+    for width in draw_widths(draw) {
+        if draw.start + width > prefix.len() {
+            continue;
+        }
+        let current = read_le_word(&prefix[draw.start..draw.start + width]);
+        for target in small_length_targets(current, width) {
+            specs.push(ReductionSpec {
+                op: ReductionOp::SetWord {
+                    start: draw.start,
+                    width,
+                    target,
+                    zero_until: Some(draw.end()),
+                },
+                weight: 0,
+            });
+        }
+    }
+    specs.sort_by_key(|spec| (spec.len(), spec.target()));
+    specs
+}
+
 fn draw_length_specs(
     prefix: &[u8],
     draws: &[DrawSpan],
@@ -805,7 +894,7 @@ fn draw_length_specs(
     specs
 }
 
-fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
+fn tail_trim_specs(prefix: &[u8], draws: &[DrawSpan], pressure: &[u16]) -> Vec<ReductionSpec> {
     if prefix.is_empty() {
         return Vec::new();
     }
@@ -813,17 +902,46 @@ fn tail_trim_specs(prefix: &[u8], pressure: &[u16]) -> Vec<ReductionSpec> {
     let mut specs = Vec::new();
     for trim in shrink_sizes_including_full(prefix.len()) {
         let start = prefix.len().saturating_sub(trim);
-        specs.push(ReductionSpec {
-            op: ReductionOp::DeleteRange {
-                start,
-                len: trim,
-                adjust_first: true,
-            },
-            weight: range_weight(pressure, start, trim),
-        });
+        let trimmed_draws = draws
+            .iter()
+            .filter(|draw| draw.start >= start && valid_draw(prefix, **draw))
+            .count();
+        push_delete_range(
+            &mut specs,
+            start,
+            trim,
+            [trimmed_draws, trim],
+            range_weight(pressure, start, trim),
+        );
     }
     specs.sort_by_key(|spec| (spec.weight, std::cmp::Reverse(spec.len()), spec.start()));
     specs
+}
+
+/// Push one `DeleteRange` per distinct first-byte adjustment, preserving the caller's preference
+/// order. `sort_by_key` is stable, so alternatives for the same range stay in that order.
+fn push_delete_range(
+    specs: &mut Vec<ReductionSpec>,
+    start: usize,
+    len: usize,
+    adjustments: impl IntoIterator<Item = usize>,
+    weight: u64,
+) {
+    let mut seen: Vec<usize> = Vec::new();
+    for adjust_first in adjustments {
+        if adjust_first == 0 || seen.contains(&adjust_first) {
+            continue;
+        }
+        seen.push(adjust_first);
+        specs.push(ReductionSpec {
+            op: ReductionOp::DeleteRange {
+                start,
+                len,
+                adjust_first,
+            },
+            weight,
+        });
+    }
 }
 
 fn draw_delete_specs(
@@ -836,19 +954,20 @@ fn draw_delete_specs(
         return Vec::new();
     }
 
+    // A deleted draw may be one logical item (adjust the length by one draw), but a length can
+    // also count bytes, or items that span two draws each; emit each reading as its own candidate.
     let mut specs = Vec::new();
     for draw in draws.iter().rev().take(options.draw_limit()).copied() {
         if draw.start == 0 || !valid_draw(prefix, draw) {
             continue;
         }
-        specs.push(ReductionSpec {
-            op: ReductionOp::DeleteRange {
-                start: draw.start,
-                len: draw.len,
-                adjust_first: true,
-            },
-            weight: range_weight(pressure, draw.start, draw.len),
-        });
+        push_delete_range(
+            &mut specs,
+            draw.start,
+            draw.len,
+            [1, draw.len],
+            range_weight(pressure, draw.start, draw.len),
+        );
     }
 
     for window in [32, 16, 8, 4, 3, 2] {
@@ -869,14 +988,13 @@ fn draw_delete_specs(
             if first.start >= end || end > prefix.len() {
                 continue;
             }
-            specs.push(ReductionSpec {
-                op: ReductionOp::DeleteRange {
-                    start: first.start,
-                    len: end - first.start,
-                    adjust_first: true,
-                },
-                weight: range_weight(pressure, first.start, end - first.start),
-            });
+            push_delete_range(
+                &mut specs,
+                first.start,
+                end - first.start,
+                [window, window / 2, end - first.start],
+                range_weight(pressure, first.start, end - first.start),
+            );
         }
     }
 
@@ -906,7 +1024,7 @@ fn weighted_block_delete_specs(prefix: &[u8], pressure: &[u16]) -> Vec<Reduction
                 op: ReductionOp::DeleteRange {
                     start,
                     len,
-                    adjust_first: true,
+                    adjust_first: len,
                 },
                 weight: range_weight(pressure, start, len),
             });
@@ -1084,8 +1202,8 @@ fn materialize_reduction(
                 return None;
             }
             candidate.drain(*start..*start + *len);
-            if *adjust_first {
-                shrink_first_by(&mut candidate, *len);
+            if *adjust_first > 0 {
+                shrink_first_by(&mut candidate, *adjust_first);
             }
         }
         ReductionOp::DeleteSequenceItems {
@@ -1503,4 +1621,189 @@ fn refresh_min_path_best<Capture: CoverageCapture>(state: &mut State<Capture>) {
         });
     state.min_path_best = best.map(|(_, score)| score);
     state.min_path_best_index = best.map(|(index, _)| index);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iter::prelude::{CaseCost, DrawKind};
+
+    fn word_draws(count: usize) -> Vec<DrawSpan> {
+        (0..count)
+            .map(|index| DrawSpan::new(index * 4, 4, DrawKind::Word))
+            .collect()
+    }
+
+    fn delete_ranges(specs: &[ReductionSpec]) -> Vec<(usize, usize, usize)> {
+        specs
+            .iter()
+            .filter_map(|spec| match spec.op {
+                ReductionOp::DeleteRange {
+                    start,
+                    len,
+                    adjust_first,
+                } => Some((start, len, adjust_first)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deletion_passes_run_before_broad_draw_length_lowering() {
+        let position = |pass: ReducerPass| {
+            REDUCER_PASSES
+                .iter()
+                .position(|candidate| *candidate == pass)
+                .expect("pass is scheduled")
+        };
+        let draw_length = position(ReducerPass::DrawLength);
+        for pass in [
+            ReducerPass::SequenceDelete,
+            ReducerPass::SemanticDelete,
+            ReducerPass::LengthProbe,
+            ReducerPass::TailTrim,
+            ReducerPass::DrawDelete,
+            ReducerPass::WeightedBlockDelete,
+        ] {
+            assert!(
+                position(pass) < draw_length,
+                "{pass:?} must run before DrawLength"
+            );
+        }
+        assert!(position(ReducerPass::LengthProbe) < position(ReducerPass::TailTrim));
+    }
+
+    #[test]
+    fn length_probe_only_touches_the_first_draw() {
+        let prefix = vec![200, 0, 0, 0, 9, 0, 0, 0, 9, 0, 0, 0];
+        let specs = length_probe_specs(&prefix, &word_draws(3));
+        assert!(!specs.is_empty());
+        assert!(specs.iter().all(|spec| spec.start() == 0));
+        let first: Vec<u64> = specs.iter().take(4).map(ReductionSpec::target).collect();
+        assert_eq!(first, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn draw_delete_emits_draw_and_byte_granular_adjustments() {
+        let prefix = vec![7; 16];
+        let pressure = vec![1; 16];
+        let specs = draw_delete_specs(&prefix, &word_draws(4), &pressure, CautiousOptions::new());
+        let ranges = delete_ranges(&specs);
+
+        let single: Vec<usize> = ranges
+            .iter()
+            .filter(|(start, len, _)| *start == 12 && *len == 4)
+            .map(|(_, _, adjust)| *adjust)
+            .collect();
+        assert_eq!(
+            single,
+            [1, 4],
+            "one draw: adjust by one draw, then by its bytes"
+        );
+
+        let window: Vec<usize> = ranges
+            .iter()
+            .filter(|(start, len, _)| *start == 4 && *len == 8)
+            .map(|(_, _, adjust)| *adjust)
+            .collect();
+        assert_eq!(window, [2, 1, 8], "two draws: window, half window, bytes");
+
+        let mut unique = ranges.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ranges.len(), "alternatives are deduplicated");
+    }
+
+    #[test]
+    fn tail_trim_offers_trimmed_draw_count_and_byte_count() {
+        let prefix = vec![7; 16];
+        let pressure = vec![1; 16];
+        let specs = tail_trim_specs(&prefix, &word_draws(4), &pressure);
+        let eight: Vec<usize> = delete_ranges(&specs)
+            .into_iter()
+            .filter(|(start, len, _)| *start == 8 && *len == 8)
+            .map(|(_, _, adjust)| adjust)
+            .collect();
+        assert_eq!(eight, [2, 8]);
+    }
+
+    #[test]
+    fn delete_range_adjusts_first_byte_by_the_requested_amount() {
+        let prefix = vec![52, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0];
+        let spec = ReductionSpec {
+            op: ReductionOp::DeleteRange {
+                start: 4,
+                len: 4,
+                adjust_first: 1,
+            },
+            weight: 0,
+        };
+        let reduced = materialize_reduction(&prefix, &[], &spec).expect("materialize");
+        assert_eq!(reduced, [51, 0, 0, 0, 2, 0, 0, 0]);
+
+        let spec = ReductionSpec {
+            op: ReductionOp::DeleteRange {
+                start: 4,
+                len: 4,
+                adjust_first: 0,
+            },
+            weight: 0,
+        };
+        let reduced = materialize_reduction(&prefix, &[], &spec).expect("materialize");
+        assert_eq!(reduced, [52, 0, 0, 0, 2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn structural_improvements_change_cost_or_bytes_only() {
+        let base = MinPathScore::with_case_cost(CaseCost::from(10), 100, 50, 40, 20);
+        let fewer_features = MinPathScore::with_case_cost(CaseCost::from(10), 90, 50, 40, 20);
+        let lighter = MinPathScore::with_case_cost(CaseCost::from(10), 100, 40, 40, 20);
+        let fewer_nonzero = MinPathScore::with_case_cost(CaseCost::from(10), 100, 50, 40, 10);
+        let fewer_bytes = MinPathScore::with_case_cost(CaseCost::from(10), 100, 50, 36, 20);
+        let cheaper = MinPathScore::with_case_cost(CaseCost::from(9), 100, 50, 40, 20);
+
+        assert!(is_structural_improvement(None, base));
+        assert!(!is_structural_improvement(Some(base), fewer_features));
+        assert!(!is_structural_improvement(Some(base), lighter));
+        assert!(!is_structural_improvement(Some(base), fewer_nonzero));
+        assert!(is_structural_improvement(Some(base), fewer_bytes));
+        assert!(is_structural_improvement(Some(base), cheaper));
+    }
+
+    #[test]
+    fn retarget_keeps_pass_schedule_while_reset_restarts_it() {
+        let entry = |prefix: Vec<u8>| CorpusSeed {
+            seed: 1,
+            draws: word_draws(prefix.len() / 4),
+            prefix,
+            semantics: Vec::new(),
+            sequences: Vec::new(),
+            coverage: Vec::new(),
+            removed: Vec::new(),
+            case_cost: CaseCost::zero(),
+            score: 0,
+            hit_count_weight: 0,
+            path_len: 0,
+            nonzero_bytes: 0,
+            energy: 1.0,
+        };
+        let mut reducer = CautiousReducer::default();
+        reducer.reset(0, &entry(vec![9; 16]));
+        reducer.pass_index = 6;
+        reducer.cursor = 3;
+        let tried_before = reducer.tried_prefixes.len();
+
+        reducer.retarget(1, &entry(vec![8; 16]));
+        assert_eq!(reducer.best_index, Some(1));
+        assert_eq!(reducer.best_prefix, vec![8; 16]);
+        assert_eq!(reducer.pass_index, 6);
+        assert_eq!(reducer.cursor, 3);
+        assert_eq!(reducer.cached_pass, None);
+        assert_eq!(reducer.tried_prefixes.len(), tried_before + 1);
+
+        reducer.reset(2, &entry(vec![7; 12]));
+        assert_eq!(reducer.pass_index, 0);
+        assert_eq!(reducer.cursor, 0);
+        assert_eq!(reducer.tried_prefixes.len(), 1);
+    }
 }

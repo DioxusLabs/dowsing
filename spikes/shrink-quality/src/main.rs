@@ -174,6 +174,14 @@ fn run(config: Config) -> Option<Outcome> {
                             );
                         }
                         best = Some((coverage, ops));
+                    } else if config.verbose && failing <= 60 {
+                        eprintln!(
+                            "  [{executed:>5}] kept failing but not better: ops={} bytes={} features={} weight={}",
+                            ops.len(),
+                            coverage.bytes_consumed(),
+                            coverage.feature_count(),
+                            coverage.hit_count_weight(),
+                        );
                     }
                 } else {
                     variant.discard();
@@ -182,6 +190,19 @@ fn run(config: Config) -> Option<Outcome> {
 
             let stats = cautious.stats();
             let (best, ops) = best?;
+            if config.verbose {
+                let still_failing = (0..ops.len())
+                    .filter(|&skip| {
+                        let mut shorter = ops.clone();
+                        shorter.remove(skip);
+                        check_stack(&shorter).is_err()
+                    })
+                    .count();
+                eprintln!(
+                    "  single-op deletions of the final case that still fail: {still_failing}/{}",
+                    ops.len()
+                );
+            }
             return Some(Outcome {
                 discovery_iter: index,
                 discovery_ops,

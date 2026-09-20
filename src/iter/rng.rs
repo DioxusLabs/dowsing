@@ -8,8 +8,9 @@ use super::{
     },
     run::min_path_schedule_energy,
     shrink::{
-        energy_refresh_interval, merge_dictionary_values, prune_corpus, record_cautious_discard,
-        record_cautious_preserved, reset_cautious_reducer_to_best,
+        energy_refresh_interval, is_structural_improvement, merge_dictionary_values, prune_corpus,
+        record_cautious_discard, record_cautious_preserved, reset_cautious_reducer_to_best,
+        retarget_cautious_reducer_to_best,
     },
 };
 use crate::{
@@ -637,10 +638,15 @@ where
         let inserted_index = state.corpus.len() - 1;
         state.energy_index.push(energy);
         if state.mode == Mode::Cautious && improves_best_cautious {
+            let structural = is_structural_improvement(state.min_path_best, candidate_score);
             state.min_path_best = Some(candidate_score);
             state.min_path_best_index = Some(inserted_index);
             refresh_corpus_energies(state);
-            reset_cautious_reducer_to_best(state);
+            if structural {
+                reset_cautious_reducer_to_best(state);
+            } else {
+                retarget_cautious_reducer_to_best(state);
+            }
         } else if state.mode == Mode::Cautious {
             record_cautious_preserved(state, &active.origin);
         }
