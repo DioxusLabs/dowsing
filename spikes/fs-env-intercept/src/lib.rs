@@ -20,4 +20,4 @@ pub mod vfs;
 
 pub use draw::{Draw, SessionDraw};
 pub use spec::{Content, EntropySpec, EnvSpec, IdentitySpec, NodeSpec, Spec, Uname};
-pub use supervisor::{CaseReport, Sandbox};
+pub use supervisor::{CaseReport, Options, Sandbox};

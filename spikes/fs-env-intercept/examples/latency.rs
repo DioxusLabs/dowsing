@@ -1,5 +1,6 @@
 //! Latency and throughput measurements for the sandbox. Run with
-//! `cargo run --release --example latency` (no sancov instrumentation needed).
+//! `cargo run --release --example latency [-- --no-pin]` (no sancov instrumentation needed).
+//! `--no-pin` leaves the fuzz thread and supervisor free to run on different CPUs.
 //!
 //! Every native number is taken on the same thread *before* the seccomp filter is installed
 //! (the filter is permanent for the thread), then the same operation is repeated inside cases.
@@ -12,7 +13,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fs_env_intercept::{Content, Sandbox, Spec};
+use fs_env_intercept::{Content, Options, Sandbox, Spec};
 use iterator_fuzz::{NoCoverage, curious};
 
 const ROUNDS: usize = 20_000;
@@ -59,6 +60,7 @@ fn open_read_conf() -> usize {
 }
 
 fn main() {
+    let pin = !std::env::args().any(|a| a == "--no-pin");
     println!("--- native (same thread, before the filter is installed) ---");
     let native_getpid = time("getpid", ROUNDS, getpid);
     let native_open = time("open+close /etc/hostname (real file)", ROUNDS, open_real);
@@ -70,7 +72,14 @@ fn main() {
         }
     });
 
-    let mut sandbox = Sandbox::install().expect("install sandbox");
+    let mut sandbox = Sandbox::install_with(Options { pin, cpu: None }).expect("install sandbox");
+    println!(
+        "--- sandbox installed: fuzz thread + supervisor {} ---",
+        match sandbox.pinned_cpu() {
+            Some(cpu) => format!("pinned to CPU {cpu}"),
+            None => "unpinned (--no-pin)".to_string(),
+        }
+    );
     // Entropy faults (short reads / EINTR) are variants the fuzzer explores; the latency bench
     // wants every read to succeed.
     let no_faults = |mut spec: Spec| {

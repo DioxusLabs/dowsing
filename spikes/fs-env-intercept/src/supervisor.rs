@@ -99,11 +99,29 @@ struct Shared {
     listener: i32,
 }
 
+/// How the sandbox is installed.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// Pin the fuzz thread and its supervisor to one CPU (`Some(cpu)`, or the CPU the fuzz
+    /// thread is currently on with `pin: true`). A seccomp round trip is a thread ping-pong: on
+    /// the same CPU it is a plain context switch (~2.3 us here), across CPUs it pays an IPI and a
+    /// wakeup (~12 us). Threads spawned by the target inherit the pin.
+    pub pin: bool,
+    pub cpu: Option<usize>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { pin: true, cpu: None }
+    }
+}
+
 /// A sandbox bound to the thread that called [`Sandbox::install`].
 pub struct Sandbox {
     shared: Arc<Shared>,
     fuzz_tid: u32,
     urandom_base: u32,
+    pinned_cpu: Option<usize>,
     saved_env: Vec<(String, Option<std::ffi::OsString>)>,
     /// Per-case tmpfs trees are removed by an unfiltered janitor thread: `remove_dir_all` on the
     /// fuzz thread would pay the trap tax on every `statx`/`openat` it issues.
@@ -114,14 +132,12 @@ impl Sandbox {
     /// Install the filter on the calling thread and start the supervisor. Irreversible for this
     /// thread; every thread spawned from it afterwards is filtered too.
     pub fn install() -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel::<Arc<Shared>>();
-        // The supervisor must be spawned before the filter exists so it is unfiltered.
-        let supervisor = thread::Builder::new()
-            .name("dowsing-supervisor".into())
-            .spawn(move || {
-                let shared = rx.recv().expect("sandbox handed over");
-                run_loop(shared);
-            })?;
+        Self::install_with(Options::default())
+    }
+
+    pub fn install_with(options: Options) -> io::Result<Self> {
+        // The janitor must be spawned before pinning so it keeps the wide affinity mask: its
+        // `remove_dir_all` work should not compete with the fuzz/supervisor pair for one CPU.
         let (janitor, trash) = mpsc::channel::<PathBuf>();
         thread::Builder::new()
             .name("dowsing-janitor".into())
@@ -129,6 +145,26 @@ impl Sandbox {
                 for root in trash {
                     let _ = std::fs::remove_dir_all(root);
                 }
+            })?;
+        let pinned_cpu = if options.pin {
+            let cpu = match options.cpu {
+                Some(cpu) => cpu,
+                // SAFETY: plain syscall.
+                None => unsafe { libc::sched_getcpu() }.max(0) as usize,
+            };
+            pin_current_thread(cpu)?;
+            Some(cpu)
+        } else {
+            None
+        };
+        let (tx, rx) = mpsc::channel::<Arc<Shared>>();
+        // The supervisor must be spawned before the filter exists so it is unfiltered. Spawned
+        // after pinning, it inherits the fuzz thread's single-CPU mask.
+        let supervisor = thread::Builder::new()
+            .name("dowsing-supervisor".into())
+            .spawn(move || {
+                let shared = rx.recv().expect("sandbox handed over");
+                run_loop(shared);
             })?;
         static NEXT_WINDOW: AtomicU64 = AtomicU64::new(0);
         let urandom_base =
@@ -147,6 +183,7 @@ impl Sandbox {
             shared,
             fuzz_tid,
             urandom_base,
+            pinned_cpu,
             saved_env: Vec::new(),
             janitor,
         })
@@ -154,6 +191,11 @@ impl Sandbox {
 
     pub fn fuzz_tid(&self) -> u32 {
         self.fuzz_tid
+    }
+
+    /// The CPU the fuzz thread and supervisor share, if pinned.
+    pub fn pinned_cpu(&self) -> Option<usize> {
+        self.pinned_cpu
     }
 
     /// Run `target` on this (filtered) thread with `rng` answering every trapped syscall.
@@ -281,6 +323,19 @@ impl Sandbox {
         }
         (session.draw, report)
     }
+}
+
+fn pin_current_thread(cpu: usize) -> io::Result<()> {
+    // SAFETY: cpu_set_t is plain data; CPU_ZERO/CPU_SET only touch the set we own.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn run_loop(shared: Arc<Shared>) {

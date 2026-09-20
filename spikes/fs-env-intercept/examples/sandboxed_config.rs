@@ -3,12 +3,13 @@
 //! minimizes the failing case and the harness prints the resulting config file.
 //!
 //! Build with SanitizerCoverage (see README.md) and run
-//! `target/debug/examples/sandboxed_config [--raw] [--no-dict] [--seed N] [--cases N]`.
+//! `target/release/examples/sandboxed_config [--raw] [--no-dict] [--no-pin] [--seed N] [--cases N]`.
 //!
 //! * default: `app.conf` comes from a structured line generator (`Content::Generate`).
 //! * `--raw`: `app.conf` is a flat `Content::Random` byte string; the comparison dictionary
 //!   (`trace-compares`) has to discover `mode`, `strict`, `retries` on its own.
 //! * `--no-dict`: disable the comparison dictionary (measures how much it helps).
+//! * `--no-pin`: do not pin the fuzz thread and supervisor to one CPU.
 
 #[path = "demo_target/mod.rs"]
 mod demo_target;
@@ -18,7 +19,7 @@ mod harness;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use fs_env_intercept::Sandbox;
+use fs_env_intercept::{Options, Sandbox};
 use harness::{is_bug, run_target, spec};
 use iterator_fuzz::backends::SancovCoverage;
 use iterator_fuzz::{Case, CaseCoverage, cautious, curious};
@@ -34,6 +35,7 @@ const MINIMIZATION_CASES: usize = 3_000;
 struct Args {
     raw: bool,
     dict: bool,
+    pin: bool,
     seed: u64,
     cases: usize,
 }
@@ -42,6 +44,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         raw: false,
         dict: true,
+        pin: true,
         seed: 1,
         cases: DISCOVERY_CASES,
     };
@@ -50,6 +53,7 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--raw" => args.raw = true,
             "--no-dict" => args.dict = false,
+            "--no-pin" => args.pin = false,
             "--seed" => args.seed = iter.next().expect("--seed N").parse().expect("seed"),
             "--cases" => args.cases = iter.next().expect("--cases N").parse().expect("cases"),
             other => panic!("unknown argument {other:?}"),
@@ -63,7 +67,8 @@ fn main() {
     // Panics inside the target are the bug we are hunting; keep them quiet.
     std::panic::set_hook(Box::new(|_| {}));
 
-    let mut sandbox = Sandbox::install().expect("install sandbox (needs Linux seccomp unotify)");
+    let mut sandbox = Sandbox::install_with(Options { pin: args.pin, cpu: None })
+        .expect("install sandbox (needs Linux seccomp unotify)");
     let spec = spec(args.raw);
     let coverage = || SancovCoverage::new().with_cmp_feedback(args.dict);
 
