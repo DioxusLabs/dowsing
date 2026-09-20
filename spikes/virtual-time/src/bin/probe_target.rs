@@ -25,6 +25,18 @@ fn check(name: &str, observed: Duration, expected: Duration, failures: &mut u32)
 }
 
 fn main() {
+    // `probe_target bench N`: cost of N Instant::now() reads (wall time measured by the harness).
+    if let Some(n) = std::env::args().nth(2).filter(|_| std::env::args().nth(1).as_deref() == Some("bench")) {
+        let n: u64 = n.parse().expect("bench N");
+        let t = Instant::now();
+        let mut acc = 0_u128;
+        for _ in 0..n {
+            acc = acc.wrapping_add(t.elapsed().as_nanos());
+        }
+        println!("bench: {n} reads, virtual elapsed {:.6}s (acc {acc})", t.elapsed().as_secs_f64());
+        return;
+    }
+
     let mut failures = 0;
     let start = Instant::now();
     let wall = SystemTime::now();
@@ -88,6 +100,45 @@ fn main() {
     let mono_elapsed = start.elapsed();
     let wall_elapsed = SystemTime::now().duration_since(wall).unwrap_or_default();
     check("SystemTime elapsed", wall_elapsed, mono_elapsed, &mut failures);
+
+    // timerfd armed for 7 s, waited on with poll(); then read() must return 1 expiration.
+    unsafe {
+        let tfd = libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_CLOEXEC);
+        assert!(tfd >= 0);
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 7, tv_nsec: 0 },
+        };
+        assert_eq!(libc::timerfd_settime(tfd, 0, &spec, std::ptr::null_mut()), 0);
+        let mut cur = std::mem::zeroed::<libc::itimerspec>();
+        assert_eq!(libc::timerfd_gettime(tfd, &mut cur), 0);
+        println!("timerfd_gettime after arming 7s: {}s", cur.it_value.tv_sec);
+        let t = Instant::now();
+        let mut pfd = libc::pollfd { fd: tfd, events: libc::POLLIN, revents: 0 };
+        let n = libc::poll(&mut pfd, 1, 60_000);
+        assert_eq!(n, 1, "poll on timerfd");
+        let mut expirations = 0_u64;
+        let r = libc::read(tfd, (&mut expirations as *mut u64).cast(), 8);
+        assert_eq!(r, 8);
+        assert_eq!(expirations, 1);
+        check("timerfd 7s via poll()", t.elapsed(), Duration::from_secs(7), &mut failures);
+        libc::close(tfd);
+    }
+
+    // select() with a 500 ms timeout on a pipe nobody writes to.
+    unsafe {
+        let mut fds = [0_i32; 2];
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        let mut set = std::mem::zeroed::<libc::fd_set>();
+        libc::FD_SET(fds[0], &mut set);
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 500_000 };
+        let t = Instant::now();
+        let n = libc::select(fds[0] + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
+        assert_eq!(n, 0);
+        check("select(500ms)", t.elapsed(), Duration::from_millis(500), &mut failures);
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
 
     // Spin on Instant::now() must still terminate (read quantum).
     let t = Instant::now();

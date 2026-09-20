@@ -124,6 +124,7 @@ pub struct StopStats {
     pub jumps: usize,
     pub natural_jumps: usize,
     pub getrandom: usize,
+    pub timerfd: usize,
     pub threads: usize,
 }
 
@@ -247,10 +248,10 @@ impl Sandbox {
             outcome,
             virtual_elapsed: Duration::from_nanos(run.clock.now()),
             wall: start.elapsed(),
-            stats: run.stats,
-            decisions: run.decisions,
+            stats: std::mem::take(&mut run.stats),
+            decisions: std::mem::take(&mut run.decisions),
             event_hash: run.hasher.finish(),
-            events: run.events,
+            events: std::mem::take(&mut run.events),
             coverage_bytes,
         }
     }
@@ -265,6 +266,15 @@ struct Probe {
     entry_regs: user_regs_struct,
     /// Seen the syscall-entry stop already; the next stop is the exit stop.
     seen_entry: bool,
+}
+
+/// A tracee timerfd whose expirations are driven by the virtual clock: the tracee's timer is
+/// kept disarmed and the supervisor arms a 1 ns timer on a `pidfd_getfd` mirror of the same
+/// open file description when the virtual deadline is reached.
+struct Timer {
+    deadline: Option<u64>,
+    interval_ns: u64,
+    mirror: i32,
 }
 
 struct Thread {
@@ -286,6 +296,7 @@ struct Run<'a, C: CoverageCapture> {
     main_pid: pid_t,
     main_status: Option<Outcome>,
     announced: BTreeMap<pid_t, (u64, u64)>,
+    timers: BTreeMap<(pid_t, i32), Timer>,
     counters: Option<Vec<u8>>,
     stats: StopStats,
     hasher: DefaultHasher,
@@ -294,6 +305,14 @@ struct Run<'a, C: CoverageCapture> {
     hung: Arc<AtomicBool>,
     realtime_applied: bool,
     forced: Option<Outcome>,
+}
+
+impl<C: CoverageCapture> Drop for Run<'_, C> {
+    fn drop(&mut self) {
+        for timer in self.timers.values() {
+            unsafe { libc::close(timer.mirror) };
+        }
+    }
 }
 
 fn ready_kill(pid: pid_t) {
@@ -315,6 +334,7 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
             main_pid: 0,
             main_status: None,
             announced: BTreeMap::new(),
+            timers: BTreeMap::new(),
             counters: None,
             stats: StopStats::default(),
             hasher: DefaultHasher::new(),
@@ -772,10 +792,20 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
                 self.log(tid, "getrandom", len);
                 self.skip(tid, regs, len as i64)
             }
-            libc::SYS_timerfd_settime => {
-                // Not virtualised in this spike: runs against the real clock.
-                self.log(tid, "timerfd_settime_native", a1);
-                ptrace::cont(tid, 0)
+            libc::SYS_timerfd_settime => self.timerfd_settime(tid, regs, a1 as i32, a2, a3, a4),
+            libc::SYS_timerfd_gettime => {
+                let tgid = self.threads[&tid].tgid;
+                let Some(timer) = self.timers.get(&(tgid, a1 as i32)) else {
+                    return ptrace::cont(tid, 0);
+                };
+                let remaining = timer
+                    .deadline
+                    .map_or(0, |d| d.saturating_sub(self.clock.now()));
+                let interval = timer.interval_ns;
+                if a2 != 0 {
+                    write_itimerspec(tid, a2, interval, remaining)?;
+                }
+                self.skip(tid, regs, 0)
             }
             ANNOUNCE_NR => {
                 let tgid = self.threads[&tid].tgid;
@@ -785,6 +815,123 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
             }
             _ => ptrace::cont(tid, 0),
         }
+    }
+
+    fn timerfd_settime(
+        &mut self,
+        tid: pid_t,
+        regs: user_regs_struct,
+        fd: i32,
+        flags: u64,
+        new_value: u64,
+        old_value: u64,
+    ) -> io::Result<()> {
+        if new_value == 0 {
+            return ptrace::cont(tid, 0);
+        }
+        let tgid = self.threads[&tid].tgid;
+        let (int_s, int_ns) = ptrace::read_timespec(tid, new_value)?;
+        let (val_s, val_ns) = ptrace::read_timespec(tid, new_value + 16)?;
+        let mirror = match self.timers.get(&(tgid, fd)) {
+            Some(t) => t.mirror,
+            None => {
+                let pidfd = ptrace::pidfd_open(tgid)?;
+                let mirror = ptrace::pidfd_getfd(pidfd, fd);
+                unsafe { libc::close(pidfd) };
+                match mirror {
+                    Ok(m) => m,
+                    // Not a mirrorable fd (EBADF etc.): let the kernel report the error.
+                    Err(_) => return ptrace::cont(tid, 0),
+                }
+            }
+        };
+        let interval_ns = clock::to_ns(int_s, int_ns);
+        let deadline = if val_s == 0 && val_ns == 0 {
+            None
+        } else if flags & 1 != 0 {
+            // TFD_TIMER_ABSTIME. The fd's clock is not tracked: values past ~2001 are realtime.
+            let clockid = if val_s >= 1_000_000_000 {
+                libc::CLOCK_REALTIME
+            } else {
+                libc::CLOCK_MONOTONIC
+            };
+            self.clock
+                .deadline_from_absolute(clockid as i64, val_s, val_ns)
+        } else {
+            Some(self.clock.deadline_from_relative(val_s, val_ns))
+        };
+        // Keep the kernel timer disarmed; expirations are injected through the mirror.
+        let zero = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        };
+        unsafe { libc::timerfd_settime(mirror, 0, &zero, std::ptr::null_mut()) };
+        let previous = self.timers.insert(
+            (tgid, fd),
+            Timer {
+                deadline,
+                interval_ns,
+                mirror,
+            },
+        );
+        if old_value != 0 {
+            let (interval, remaining) = previous.map_or((0, 0), |p| {
+                (
+                    p.interval_ns,
+                    p.deadline.map_or(0, |d| d.saturating_sub(self.clock.now())),
+                )
+            });
+            write_itimerspec(tid, old_value, interval, remaining)?;
+        }
+        self.stats.timerfd += 1;
+        self.log(
+            tid,
+            "timerfd_settime",
+            format!("fd={fd} deadline={deadline:?} interval={interval_ns}"),
+        );
+        self.skip(tid, regs, 0)
+    }
+
+    /// Deliver the expirations of every virtual timer whose deadline has passed.
+    fn fire_due_timers(&mut self) -> io::Result<()> {
+        let now = self.clock.now();
+        let mut fired = Vec::new();
+        for (key, timer) in self.timers.iter_mut() {
+            let Some(deadline) = timer.deadline else {
+                continue;
+            };
+            if deadline > now {
+                continue;
+            }
+            let one_ns = libc::itimerspec {
+                it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+                it_value: libc::timespec { tv_sec: 0, tv_nsec: 1 },
+            };
+            if unsafe { libc::timerfd_settime(timer.mirror, 0, &one_ns, std::ptr::null_mut()) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Wait for the 1 ns timer to actually expire so readiness probes see it.
+            let mut pfd = libc::pollfd {
+                fd: timer.mirror,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            unsafe { libc::poll(&mut pfd, 1, 100) };
+            timer.deadline = if timer.interval_ns > 0 {
+                let mut next = deadline;
+                while next <= now {
+                    next = next.saturating_add(timer.interval_ns);
+                }
+                Some(next)
+            } else {
+                None
+            };
+            fired.push(*key);
+        }
+        for (tgid, fd) in fired {
+            self.log(tgid, "timerfd_fire", fd);
+        }
+        Ok(())
     }
 
     fn restart_or_relative_ms(&mut self, tid: pid_t, timeout_ms: i32) -> Option<u64> {
@@ -1011,6 +1158,7 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
             .threads
             .values()
             .filter_map(|t| t.wait.as_ref().and_then(|w| w.deadline))
+            .chain(self.timers.values().filter_map(|t| t.deadline))
             .collect();
         let Some(&earliest) = deadlines.first() else {
             // Nothing timed: give external readiness a bounded real chance, then call it.
@@ -1088,6 +1236,13 @@ impl<'a, C: CoverageCapture> Run<'a, C> {
         for tid in due {
             self.complete_timeout(tid)?;
         }
-        Ok(())
+        self.fire_due_timers()
     }
+}
+
+fn write_itimerspec(tid: pid_t, addr: u64, interval_ns: u64, value_ns: u64) -> io::Result<()> {
+    let (is, ins) = ((interval_ns / clock::NANOS) as i64, (interval_ns % clock::NANOS) as i64);
+    let (vs, vns) = ((value_ns / clock::NANOS) as i64, (value_ns % clock::NANOS) as i64);
+    ptrace::write_timespec(tid, addr, is, ins)?;
+    ptrace::write_timespec(tid, addr + 16, vs, vns)
 }

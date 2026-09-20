@@ -34,6 +34,7 @@ pub const TRACED_SYSCALLS: &[i64] = &[
     libc::SYS_select,
     libc::SYS_pselect6,
     libc::SYS_timerfd_settime,
+    libc::SYS_timerfd_gettime,
     libc::SYS_getrandom,
     ANNOUNCE_NR,
 ];
