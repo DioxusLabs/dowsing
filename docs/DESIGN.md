@@ -106,9 +106,12 @@ Two things the kernel does that the implementation has to work around:
 
 - Soft-dirty is also a *VMA* flag (`VM_SOFTDIRTY`, set on every new mapping). A new anonymous
   mapping that lands adjacent to an old one — a thread stack below a big table, say — merges
-  with it, and from then on `pagemap` reports every page of the merged range dirty. The snapshot
-  therefore compares each reported page against the copy the parent snapshot already holds and
-  keeps only real changes; the false positives cost a read, not storage or restore writes.
+  with it, and from then on `pagemap` reports every page of the merged range dirty — including
+  the tens of thousands of never-touched pages of a 8 MB stack. Only *present* pages count as
+  dirty (an absent page reads as zero, so it is recorded as zero only if an ancestor snapshot
+  held non-zero bytes there, and on restore it is written only if the snapshot holds non-zero
+  bytes), and each present dirty page is compared against the copy the parent snapshot already
+  holds so that only real changes are kept.
 - A run typically frees its setup on the way out (`munmap` of the table when `main` returns).
   Restoring would then have to re-map and rewrite the whole range. Instead `munmap` of memory
   that exists in the current snapshot is turned into `mprotect(PROT_NONE)`: contents stay,
@@ -189,10 +192,10 @@ on two-thread targets (lost update, deadlock, timeout-dependent bug). Acceptance
   race needs both threads inside the read/write window and the current shrinker only deletes
   and zeroes decisions, it does not merge adjacent `Budget` preemptions into one. Open;
 - restore-from-snapshot measured against re-execution on a target with an expensive prefix
-  (`slow_setup`: 64 MB table, ~95 ms to first decision) — replay from snapshot 8–11 ms vs
-  ~95 ms fresh, search 28–43 runs/s vs 11/s re-executing; restores write ~1–2.5k pages
-  (most of them the VMA-merge false positives above), snapshots along a rollout copy ~0 pages
-  but spend ~55 ms comparing the falsely-dirty 64 MB;
+  (`slow_setup`: 64 MB table, ~100 ms to first decision) — replay from snapshot 3.0 ms vs
+  ~100 ms fresh, restore 1.8 ms writing ~18 pages, search 262 runs/s (vs 1.9 ms per `fork()`
+  continuation and ~40 ms per CRIU restore of the same image; `sandbox/compare/README.md`);
+  the small targets run at 400–780 runs/s with ~1 ms restores;
 - `cargo test`/`clippy` green for the root crate and `sandbox/` — met.
 
 Not in milestone 1: net/fs models (they are `Syscall` decisions and a fd model in `world`, slot
