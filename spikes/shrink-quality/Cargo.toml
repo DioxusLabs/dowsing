@@ -1,0 +1,15 @@
+[package]
+name = "shrink-quality"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "shrink-bench"
+path = "src/main.rs"
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+rand = { version = "0.9", features = ["small_rng"] }
+
+[workspace]
