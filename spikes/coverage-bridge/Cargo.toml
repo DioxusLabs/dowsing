@@ -1,0 +1,31 @@
+[package]
+name = "coverage-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+iterator-fuzz = { path = "../.." }
+libc = "0.2"
+rand = { version = "0.9", features = ["small_rng"] }
+
+[[bin]]
+name = "buggy_stack_child"
+path = "src/bin/buggy_stack_child.rs"
+
+[[bin]]
+name = "buggy_stack_bridge"
+path = "src/bin/buggy_stack_bridge.rs"
+
+[[bin]]
+name = "echo_child"
+path = "src/bin/echo_child.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[profile.release]
+debug = 1
