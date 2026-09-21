@@ -40,7 +40,16 @@ if has native; then
     stress "tool=native target=sleep_race" 2000 5 "$TGT/sleep_race"
 fi
 
-if has rr; then
+# rr and hermit need hardware perf counters; with perf_event_paranoid > 1 every run exits
+# non-zero and `stress` would count that as 300/300 failures.
+perf_ok() {
+    local p; p=$(cat /proc/sys/kernel/perf_event_paranoid)
+    [ "$p" -le 1 ] && return 0
+    say "$1 skipped: kernel.perf_event_paranoid=$p (needs <= 1; sudo sysctl kernel.perf_event_paranoid=1)"
+    return 1
+}
+
+if has rr && perf_ok "tool=rr-chaos"; then
     say "## rr chaos mode (rr record -h): randomized scheduling of the unmodified binary"
     export _RR_TRACE_DIR=/tmp/rr-compare
     rm -rf "$_RR_TRACE_DIR"; mkdir -p "$_RR_TRACE_DIR"

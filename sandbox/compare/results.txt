@@ -1,110 +1,86 @@
-# 2026-09-20T04:10:02Z 6.8.0-1061-aws 8cpu INTEL(R) XEON(R) PLATINUM 8559C
+# 2026-09-21T04:05:38Z 6.8.0-1061-aws 8cpu INTEL(R) XEON(R) PLATINUM 8559C
 ## native: run the unmodified binary in a loop (stress testing)
-tool=native target=lost_update runs=20000 failures=1 hangs=0 total_ms=36772.143285000 per_run_ms=1.83
-tool=native target=deadlock runs=2000 failures=0 hangs=0 total_ms=3970.912693000 per_run_ms=1.98
-tool=native target=sleep_race runs=2000 failures=0 hangs=0 total_ms=14030.324425000 per_run_ms=7.01
+tool=native target=lost_update runs=20000 failures=3 hangs=0 total_ms=31292.067744000 per_run_ms=1.56
+tool=native target=deadlock runs=2000 failures=0 hangs=0 total_ms=2973.528575000 per_run_ms=1.48
+tool=native target=sleep_race runs=2000 failures=0 hangs=0 total_ms=13342.405661000 per_run_ms=6.67
 ## rr chaos mode (rr record -h): randomized scheduling of the unmodified binary
-tool=rr-chaos target=lost_update runs=300 failures=0 hangs=0 total_ms=89925.449033000 per_run_ms=299.75
-tool=rr-chaos target=deadlock runs=300 failures=0 hangs=0 total_ms=64263.285386000 per_run_ms=214.21
-tool=rr-chaos target=sleep_race runs=300 failures=4 hangs=0 total_ms=76657.542932000 per_run_ms=255.52
-tool=rr-replay target=lost_update replays=20 per_replay_ms=79.8 (deterministic by construction)
+tool=rr-chaos target=lost_update runs=300 failures=0 hangs=0 total_ms=81669.292612000 per_run_ms=272.23
+tool=rr-chaos target=deadlock runs=300 failures=0 hangs=0 total_ms=60790.728985000 per_run_ms=202.63
+tool=rr-chaos target=sleep_race runs=300 failures=8 hangs=0 total_ms=74438.757110000 per_run_ms=248.12
+tool=rr-replay target=lost_update replays=20 per_replay_ms=25.0 (deterministic by construction)
 ## dowsing-sandbox (this PR): explore <bin> --runs 3000 --seed S --replays 100
-tool=sandbox target=lost_update seed=1 | failure on run 155: exit(101) | runs 155 in 250.02ms (620/s), features 69, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.3ms each | shrink: 24 -> 14 decisions (6 non-default) in 84 runs, 148.85ms | snapshots: 60 taken, 821 pages copied, 33.80ms total | restores: 154 done, 2782 pages written (18.1 avg), 156.06ms total (1.0ms avg)
-tool=sandbox target=lost_update seed=2 | failure on run 66: exit(101) | runs 66 in 109.81ms (601/s), features 69, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.1ms each | shrink: 16 -> 14 decisions (6 non-default) in 141 runs, 285.42ms | snapshots: 29 taken, 406 pages copied, 15.19ms total | restores: 65 done, 1172 pages written (18.0 avg), 63.08ms total (970.4µs avg)
-tool=sandbox target=lost_update seed=3 | failure on run 62: exit(101) | runs 62 in 160.52ms (386/s), features 69, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.8ms each | shrink: 14 -> 14 decisions (6 non-default) in 77 runs, 148.84ms | snapshots: 23 taken, 319 pages copied, 16.70ms total | restores: 61 done, 1076 pages written (17.6 avg), 87.38ms total (1.4ms avg)
-tool=sandbox target=deadlock seed=1 | failure on run 70: deadlock(threads [0, 1]) | runs 70 in 101.67ms (689/s), features 61, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.2ms each | shrink: 5 -> 5 decisions (3 non-default) in 11 runs, 13.01ms | snapshots: 13 taken, 200 pages copied, 6.04ms total | restores: 69 done, 1182 pages written (17.1 avg), 60.71ms total (879.8µs avg)
-tool=sandbox target=deadlock seed=2 | failure on run 20: deadlock(threads [0, 1]) | runs 20 in 30.34ms (659/s), features 63, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.3ms each | shrink: 5 -> 5 decisions (3 non-default) in 11 runs, 13.79ms | snapshots: 5 taken, 80 pages copied, 2.08ms total | restores: 19 done, 323 pages written (17.0 avg), 17.15ms total (902.5µs avg)
-tool=sandbox target=deadlock seed=3 | failure on run 45: deadlock(threads [0, 1]) | runs 45 in 57.43ms (784/s), features 61, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.3ms each | shrink: 5 -> 5 decisions (4 non-default) in 13 runs, 15.02ms | snapshots: 8 taken, 125 pages copied, 3.71ms total | restores: 44 done, 751 pages written (17.1 avg), 37.68ms total (856.4µs avg)
-tool=sandbox target=sleep_race seed=1 | failure on run 31: exit(101) | runs 31 in 52.05ms (596/s), features 52, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.2ms each | shrink: 17 -> 17 decisions (3 non-default) in 50 runs, 63.33ms | snapshots: 21 taken, 230 pages copied, 9.06ms total | restores: 30 done, 492 pages written (16.4 avg), 25.53ms total (851.0µs avg)
-tool=sandbox target=sleep_race seed=2 | failure on run 9: exit(101) | runs 9 in 13.93ms (646/s), features 52, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.1ms each | shrink: 17 -> 15 decisions (1 non-default) in 98 runs, 119.40ms | snapshots: 7 taken, 77 pages copied, 3.14ms total | restores: 8 done, 133 pages written (16.6 avg), 7.37ms total (921.3µs avg)
-tool=sandbox target=sleep_race seed=3 | failure on run 2: exit(101) | runs 2 in 6.23ms (321/s), features 49, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.0ms each | shrink: 18 -> 17 decisions (3 non-default) in 144 runs, 169.03ms | snapshots: 4 taken, 52 pages copied, 1.81ms total | restores: 1 done, 16 pages written (16.0 avg), 3.44ms total (3.4ms avg)
+tool=sandbox target=lost_update seed=1 | failure on run 3: exit(101) | runs 3 in 9.12ms (329/s), features 67 edges + 14 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 3.2ms each | shrink: 9 -> 5 non-default choices (18 -> 10 decisions total) in 47 runs, 95.61ms | snapshots: 3 taken, 47 pages copied, 2.17ms total | restores: 2 done, 34 pages written (17.0 avg), 3.83ms total (1.9ms avg)
+tool=sandbox target=lost_update seed=2 | failure on run 15: exit(101) | runs 15 in 35.93ms (417/s), features 69 edges + 38 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.2ms each | shrink: 5 -> 4 non-default choices (10 -> 8 decisions total) in 37 runs, 50.17ms | snapshots: 9 taken, 149 pages copied, 6.30ms total | restores: 14 done, 238 pages written (17.0 avg), 16.78ms total (1.2ms avg)
+tool=sandbox target=lost_update seed=3 | failure on run 4: exit(101) | runs 4 in 7.78ms (514/s), features 61 edges + 10 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.0ms each | shrink: 5 -> 3 non-default choices (8 -> 8 decisions total) in 15 runs, 19.38ms | snapshots: 1 taken, 20 pages copied, 199.38µs total | restores: 3 done, 51 pages written (17.0 avg), 4.18ms total (1.4ms avg)
+tool=sandbox target=deadlock seed=1 | failure on run 1: deadlock(threads [0, 1]) | runs 1 in 3.27ms (306/s), features 16 edges + 3 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.1ms each | shrink: 5 -> 4 non-default choices (5 -> 5 decisions total) in 13 runs, 14.02ms | snapshots: 1 taken, 20 pages copied, 187.70µs total | restores: 0 done, 0 pages written (0.0 avg), 0.00ns total (0.0ns avg)
+tool=sandbox target=deadlock seed=2 | failure on run 23: deadlock(threads [0, 1]) | runs 23 in 32.15ms (715/s), features 69 edges + 27 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.0ms each | shrink: 4 -> 3 non-default choices (5 -> 5 decisions total) in 12 runs, 12.33ms | snapshots: 8 taken, 125 pages copied, 3.08ms total | restores: 22 done, 374 pages written (17.0 avg), 17.35ms total (788.8µs avg)
+tool=sandbox target=deadlock seed=3 | failure on run 9: deadlock(threads [0, 1]) | runs 9 in 9.81ms (917/s), features 69 edges + 16 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 964.5µs each | shrink: 4 -> 3 non-default choices (5 -> 5 decisions total) in 12 runs, 12.27ms | snapshots: 3 taken, 50 pages copied, 907.80µs total | restores: 8 done, 136 pages written (17.0 avg), 5.99ms total (748.2µs avg)
+tool=sandbox target=sleep_race seed=1 | failure on run 10: exit(101) | runs 10 in 16.67ms (600/s), features 54 edges + 23 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 999.0µs each | shrink: 11 -> 3 non-default choices (17 -> 15 decisions total) in 133 runs, 158.77ms | snapshots: 13 taken, 143 pages copied, 5.18ms total | restores: 9 done, 144 pages written (16.0 avg), 6.83ms total (759.1µs avg)
+tool=sandbox target=sleep_race seed=2 | failure on run 1: exit(101) | runs 1 in 1.11ms (900/s), features 25 edges + 4 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.2ms each | shrink: 6 -> 2 non-default choices (13 -> 13 decisions total) in 35 runs, 40.89ms | snapshots: 2 taken, 31 pages copied, 696.42µs total | restores: 0 done, 0 pages written (0.0 avg), 0.00ns total (0.0ns avg)
+tool=sandbox target=sleep_race seed=3 | failure on run 1: exit(101) | runs 1 in 1.77ms (566/s), features 23 edges + 4 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.1ms each | shrink: 11 -> 3 non-default choices (17 -> 15 decisions total) in 133 runs, 151.42ms | snapshots: 3 taken, 40 pages copied, 1.29ms total | restores: 0 done, 0 pages written (0.0 avg), 0.00ns total (0.0ns avg)
+## axum 0.8 + tokio (2 workers), unmodified binary, driven through the virtual socket API
+## native: python client, 2 concurrent POSTs then GET /check per round, 60 s budget
+native stress /inc: lost update after 1 rounds (3 requests) in 0.0s
+native stress /inc_nowait: lost update after 18 rounds (54 requests) in 0.0s
+## sandbox: explore axum_counter --clients 3 --corpus <dir> --runs 3000 (stop on first failure)
+tool=sandbox target=axum_counter case=inc_await seed=1 | failure on run 5: panic (lost update: counter 1 != increments 2) | runs 5 in 56.03ms (89/s), features 1085 edges + 71 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 3.0ms each | shrink: 61 -> 50 non-default choices (131 -> 136 decisions total) in 400 runs, 2.03s
+tool=sandbox target=axum_counter case=inc_await seed=2 | failure on run 28: panic (lost update: counter 1 != increments 2) | runs 28 in 420.82ms (67/s), features 1086 edges + 176 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 3.9ms each | shrink: 65 -> 64 non-default choices (163 -> 162 decisions total) in 400 runs, 2.55s
+tool=sandbox target=axum_counter case=inc_await seed=3 | failure on run 26: panic (lost update: counter 1 != increments 2) | runs 26 in 426.01ms (61/s), features 1086 edges + 152 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 4.1ms each | shrink: 104 -> 93 non-default choices (203 -> 195 decisions total) in 400 runs, 2.37s
+## sandbox: /sum framing bug (HTTP 500 when the JSON body is split across reads), corpus/axum
+tool=sandbox target=axum_counter case=sum_split seed=1 | failure on run 66: protocol(http 500)  | runs 66 in 991.42ms (67/s), features 1361 edges + 277 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Protocol("http 500")}, 1.4ms each | shrink: 37 -> 20 non-default choices (58 -> 59 decisions total) in 400 runs, 2.71s
+tool=sandbox target=axum_counter case=sum_split seed=2 | failure on run 8: protocol(http 500)  | runs 8 in 135.31ms (59/s), features 1361 edges + 99 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Protocol("http 500")}, 4.6ms each | shrink: 64 -> 22 non-default choices (110 -> 75 decisions total) in 400 runs, 2.81s
+tool=sandbox target=axum_counter case=sum_split seed=3 | failure on run 3: protocol(http 500)  | runs 3 in 40.34ms (74/s), features 1317 edges + 66 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Protocol("http 500")}, 4.4ms each | shrink: 85 -> 84 non-default choices (158 -> 158 decisions total) in 400 runs, 3.24s
+## sandbox: /inc_nowait (no await between the two lock() calls), --runs 50000 --wall 600
+tool=sandbox target=axum_counter case=inc_nowait seed=1 | no failure  | runs 14534 in 600.03s (24/s), features 1083 edges + 9276 interleavings, failures 0, divergences 0 |  | 
+tool=sandbox target=axum_counter case=inc_nowait seed=2 | no failure  | runs 14497 in 600.03s (24/s), features 1083 edges + 9178 interleavings, failures 0, divergences 0 |  | 
+tool=sandbox target=axum_counter case=inc_nowait seed=3 | no failure  | runs 14348 in 600.07s (24/s), features 1083 edges + 8868 interleavings, failures 0, divergences 0 |  | 
 ## loom 0.7 (exhaustive model checker; program ported to loom::sync / loom::thread)
-tool=loom target=lost_update mode=exhaustive iterations=10 time_ms=0.4 found=true msg="assertion `left == right` failed: lost update"
-tool=loom target=deadlock mode="exhaustive x4 variants" iterations=17 time_ms=89.3 found=true msg="thread 'main' (309284) panicked at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/loom-0.7.2/src/rt/execution.rs:216:13:"
+tool=loom target=lost_update mode=exhaustive iterations=10 time_ms=0.8 found=true msg="assertion `left == right` failed: lost update"
+tool=loom target=deadlock mode="exhaustive x4 variants" iterations=17 time_ms=110.3 found=true msg="thread 'main' (161800) panicked at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/loom-0.7.2/src/rt/execution.rs:216:13:"
 tool=loom target=sleep_race mode=exhaustive iterations=7 time_ms=0.2 found=false 
 ## shuttle 0.8 (random / PCT depth 2 / DFS schedulers; program ported to shuttle::sync)
 tool=shuttle target=lost_update mode=random max=100000 iterations=1 time_ms=0.1 found=true msg="test panicked in task 'main-thread'"
-tool=shuttle target=lost_update mode=pct max=100000 iterations=4 time_ms=0.2 found=true msg="test panicked in task 'main-thread'"
+tool=shuttle target=lost_update mode=pct max=100000 iterations=2 time_ms=0.2 found=true msg="test panicked in task 'main-thread'"
 tool=shuttle target=lost_update mode=dfs max=100000 iterations=111 time_ms=0.8 found=true msg="test panicked in task 'main-thread'"
-tool=shuttle target=deadlock mode=random max=100000 iterations=4 time_ms=0.1 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
-tool=shuttle target=deadlock mode=pct max=100000 iterations=56 time_ms=0.3 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
-tool=shuttle target=deadlock mode=dfs x4 variants iterations=182 time_ms=0.8 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
-tool=shuttle target=sleep_race mode=random max=100000 iterations=100000 time_ms=319.8 found=false 
-tool=shuttle target=sleep_race mode=pct max=100000 iterations=100000 time_ms=321.6 found=false 
-tool=shuttle target=sleep_race mode=dfs max=100000 iterations=40 time_ms=0.3 found=false 
+tool=shuttle target=deadlock mode=random max=100000 iterations=16 time_ms=0.1 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
+tool=shuttle target=deadlock mode=pct max=100000 iterations=13 time_ms=0.1 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
+tool=shuttle target=deadlock mode=dfs x4 variants iterations=182 time_ms=0.7 found=true msg="deadlock! blocked tasks: [main-thread (task main-thread(0), pending future), <unknown> (task main-thread(1), pending future)]"
+tool=shuttle target=sleep_race mode=random max=100000 iterations=100000 time_ms=319.6 found=false 
+tool=shuttle target=sleep_race mode=pct max=100000 iterations=100000 time_ms=321.1 found=false 
+tool=shuttle target=sleep_race mode=dfs max=100000 iterations=40 time_ms=0.2 found=false 
 ## snapshot/restore: resume the two-thread race after a 64 MB setup
-tool=fresh-exec target=slow_setup(instrumented) runs=10 per_run_ms=51.4
-tool=fresh-exec runs=10 per_run_ms=45.6 failures=0
-tool=fork-cow setup_ms=45.4 runs=50 per_run_ms=1.89 failures=2
-tool=criu op=dump rss_kb=67648 image_kb=65736 time_ms=76.515514000
-tool=criu op=restore runs=5 per_run_ms=41.1
-tool=sandbox target=slow_setup | root: exec + run to first decision in 100.13ms (cost of a fresh execution) | runs 49 in 187.01ms (262/s), features 86, failures 1, divergences 0 | replay x20: 1 distinct trace hash(es), outcomes {Exited(101)}, 3.0ms each | snapshots: 16 taken, 16620 pages copied, 62.45ms total | restores: 48 done, 875 pages written (18.2 avg), 86.83ms total (1.8ms avg)
+tool=fresh-exec target=slow_setup(instrumented) runs=10 per_run_ms=47.7
+tool=fresh-exec runs=10 per_run_ms=39.5 failures=0
+tool=fork-cow setup_ms=36.2 runs=50 per_run_ms=1.50 failures=1
+tool=criu op=dump rss_kb=67632 image_kb=65736 time_ms=95.304949000
+tool=criu op=restore runs=5 per_run_ms=34.5
+tool=sandbox target=slow_setup | root: exec + run to first decision in 90.76ms (cost of a fresh execution) | runs 8 in 58.73ms (136/s), features 86 edges + 17 interleavings, failures 1, divergences 0 | replay x20: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.7ms each | snapshots: 3 taken, 16439 pages copied, 39.49ms total | restores: 7 done, 125 pages written (17.9 avg), 11.15ms total (1.6ms avg)
 ## ThreadSanitizer (nightly -Zsanitizer=thread) on lost_update: the bug is not a data race
-tool=tsan target=lost_update runs=200 failures=0 hangs=0 total_ms=3101.739638000 per_run_ms=15.50
+tool=tsan target=lost_update runs=200 failures=0 hangs=0 total_ms=2532.307336000 per_run_ms=12.66
 # done
-
-### hermit (v1 20622f9 + reverie 3ca6f7f patched; see hermit_sweep.sh)
+### hermit (v1 20622f9 + reverie 3ca6f7f patched; see hermit_sweep.sh); rr and hermit re-run after kernel.perf_event_paranoid=1
 hermit: hermit 0.1
-hermit lost_update [default]                          0/100 failed (first=none) 80.0 ms/run
-hermit lost_update [Random]                           0/100 failed (first=none) 27.2 ms/run
-hermit lost_update [StickyRandom p=0.5]               0/100 failed (first=none) 31.6 ms/run
-hermit lost_update [chaos pt=100000]                  0/100 failed (first=none) 116.5 ms/run
-./hermit_sweep.sh: line 23: 384126 Stack fault             timeout 120 "$HERMIT" run "$@" --seed="$i" -- "$T/$t" > /dev/null 2>&1
-hermit lost_update [chaos pt=10000]                   1/100 failed (first=28) 864.4 ms/run
-hermit deadlock    [default]                          0/100 failed (first=none) 25.0 ms/run
-hermit deadlock    [Random]                           0/100 failed (first=none) 23.7 ms/run
-hermit deadlock    [StickyRandom p=0.5]               0/100 failed (first=none) 23.2 ms/run
-hermit deadlock    [chaos pt=100000]                  0/100 failed (first=none) 103.6 ms/run
-hermit deadlock    [chaos pt=10000]                   0/100 failed (first=none) 865.2 ms/run
-hermit sleep_race  [default]                          0/100 failed (first=none) 27.2 ms/run
-hermit sleep_race  [Random]                           0/100 failed (first=none) 25.2 ms/run
-hermit sleep_race  [StickyRandom p=0.5]               0/100 failed (first=none) 26.8 ms/run
-hermit sleep_race  [chaos pt=100000]                  0/100 failed (first=none) 108.1 ms/run
-hermit sleep_race  [chaos pt=10000]                   0/100 failed (first=none) 856.2 ms/run
+hermit lost_update [default]                          0/100 failed (first=none) 26.6 ms/run
+hermit lost_update [Random]                           0/100 failed (first=none) 25.9 ms/run
+hermit lost_update [StickyRandom p=0.5]               0/100 failed (first=none) 27.3 ms/run
+hermit lost_update [chaos pt=100000]                  0/100 failed (first=none) 98.4 ms/run
+hermit lost_update [chaos pt=10000]                   0/100 failed (first=none) 853.3 ms/run
+hermit deadlock    [default]                          0/100 failed (first=none) 23.1 ms/run
+hermit deadlock    [Random]                           0/100 failed (first=none) 22.6 ms/run
+hermit deadlock    [StickyRandom p=0.5]               0/100 failed (first=none) 22.7 ms/run
+hermit deadlock    [chaos pt=100000]                  0/100 failed (first=none) 94.9 ms/run
+hermit deadlock    [chaos pt=10000]                   0/100 failed (first=none) 844.1 ms/run
+hermit sleep_race  [default]                          0/100 failed (first=none) 23.0 ms/run
+hermit sleep_race  [Random]                           0/100 failed (first=none) 21.6 ms/run
+hermit sleep_race  [StickyRandom p=0.5]               0/100 failed (first=none) 23.4 ms/run
+hermit sleep_race  [chaos pt=100000]                  0/100 failed (first=none) 94.7 ms/run
+hermit sleep_race  [chaos pt=10000]                   0/100 failed (first=none) 861.0 ms/run
 hermit verify (2 runs + log compare):
 Done processing logs, no substantive differences found.
 :: Success: deterministic.
-real	0m0.279s
-hermit lost_update [Random] 1000 seeds: 0/1000 failed, 33.0 ms/run
-hermit lost_update [chaos pt=1000] 20 seeds: 0/20 failed, 5320 ms/run
-hermit lost_update [chaos pt=10000] seed 28: hermit itself died with SIGSTKFLT once, exit 0 on rerun (target did not fail)
-rrnewton/hermit HEAD (g5905a449948e): 'failed to initialize ptrace for tracee: EINVAL' — pidfd_open(PIDFD_THREAD) needs Linux >= 6.9
-
-# 2026-09-20T05:35:58Z PCT + coverage-guided tree (sandbox rows re-measured; other tools unchanged)
-## dowsing-sandbox (PCT + coverage-guided tree): explore <bin> --runs 3000 --seed S --replays 100
-tool=sandbox target=lost_update seed=1 | failure on run 9: exit(101) | runs 9 in 13.89ms (648/s), features 69 edges + 29 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.8ms each | shrink: 12 -> 12 decisions (5 non-default) in 90 runs, 142.38ms | snapshots: 6 taken, 99 pages copied, 3.07ms total | restores: 8 done, 136 pages written (17.0 avg), 7.20ms total (900.4µs avg)
-tool=sandbox target=lost_update seed=2 | failure on run 6: exit(101) | runs 6 in 13.63ms (440/s), features 65 edges + 17 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.7ms each | shrink: 12 -> 12 decisions (5 non-default) in 86 runs, 174.41ms | snapshots: 3 taken, 54 pages copied, 1.57ms total | restores: 5 done, 85 pages written (17.0 avg), 7.92ms total (1.6ms avg)
-tool=sandbox target=lost_update seed=3 | failure on run 4: exit(101) | runs 4 in 4.70ms (851/s), features 61 edges + 10 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 2.0ms each | shrink: 8 -> 8 decisions (3 non-default) in 15 runs, 19.40ms | snapshots: 1 taken, 20 pages copied, 218.92µs total | restores: 3 done, 51 pages written (17.0 avg), 2.58ms total (859.7µs avg)
-tool=sandbox target=deadlock seed=1 | failure on run 1: deadlock(threads [0, 1]) | runs 1 in 584.57µs (1711/s), features 16 edges + 3 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.2ms each | shrink: 5 -> 5 decisions (4 non-default) in 13 runs, 14.58ms | snapshots: 1 taken, 20 pages copied, 204.65µs total | restores: 0 done, 0 pages written (0.0 avg), 0.00ns total (0.0ns avg)
-tool=sandbox target=deadlock seed=2 | failure on run 53: deadlock(threads [0, 1]) | runs 53 in 79.96ms (663/s), features 63 edges + 37 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.4ms each | shrink: 5 -> 5 decisions (3 non-default) in 12 runs, 17.13ms | snapshots: 16 taken, 245 pages copied, 6.41ms total | restores: 52 done, 884 pages written (17.0 avg), 43.73ms total (841.0µs avg)
-tool=sandbox target=deadlock seed=3 | failure on run 14: deadlock(threads [0, 1]) | runs 14 in 21.41ms (654/s), features 66 edges + 20 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Deadlock { waiting: [0, 1] }}, 1.3ms each | shrink: 5 -> 5 decisions (4 non-default) in 13 runs, 14.44ms | snapshots: 4 taken, 65 pages copied, 1.60ms total | restores: 13 done, 221 pages written (17.0 avg), 10.54ms total (810.7µs avg)
-tool=sandbox target=sleep_race seed=1 | failure on run 6: exit(101) | runs 6 in 12.93ms (464/s), features 52 edges + 15 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 302.7µs each | shrink: 15 -> 14 decisions (2 non-default) in 96 runs, 117.16ms | snapshots: 7 taken, 77 pages copied, 2.40ms total | restores: 5 done, 80 pages written (16.0 avg), 4.70ms total (940.8µs avg)
-tool=sandbox target=sleep_race seed=2 | failure on run 1: exit(101) | runs 1 in 1.06ms (946/s), features 25 edges + 4 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 927.5µs each | shrink: 13 -> 13 decisions (2 non-default) in 35 runs, 40.57ms | snapshots: 2 taken, 31 pages copied, 693.39µs total | restores: 0 done, 0 pages written (0.0 avg), 0.00ns total (0.0ns avg)
-tool=sandbox target=sleep_race seed=3 | failure on run 1: exit(101) | runs 1 in 1.79ms (559/s), features 23 edges + 4 interleavings, failures 1, divergences 0 | replay x100: 1 distinct trace hash(es), outcomes {Exited(101)}, 1.0ms each | shrink: 17 -> 15 decisions (3 non-default) in 133 runs, 158.94ms | snapshots: 3 taken, 40 pages copied, 1.35ms total | restores: 0 done, 0 pages written (0.0 avg), 0.00ns total (0.0ns avg)
-# done
+real	0m0.309s
 ## sandbox/sweep.sh 10 2000 (defaults: --fanout 8 --pct-depth 3 --ucb 2): runs to first failure per seed 1..10
-lost_update  median 5.5  total 68   [9 6 4 17 11 3 5 5 2 6]
-deadlock     median 9.5  total 155  [1 29 15 5 14 8 57 9 10 7]
-sleep_race   median 1.5  total 29   [6 1 1 1 7 1 3 1 6 2]
-## slow_setup: explore --runs 3000 --seed S
-tool=sandbox target=slow_setup seed=1 | root: exec + run to first decision in 103.73ms | runs 10 in 70.19ms (142/s), features 80 edges + 15 interleavings, failures 1 | replay x20: 1 distinct trace hash(es), outcomes {Exited(101)}, 3.5ms each | snapshots: 1 taken, 16405 pages copied, 44.30ms total | restores: 9 done, 153 pages written (17.0 avg), 16.73ms total (1.9ms avg)
-tool=sandbox target=slow_setup seed=2 | runs 11 in 71.97ms (153/s), features 86 edges + 18 interleavings, failures 1 | restores: 10 done, 170 pages written (17.0 avg), 18.08ms total (1.8ms avg)
-tool=sandbox target=slow_setup seed=3 | runs 4 in 55.26ms (72/s), features 86 edges + 12 interleavings, failures 1 | restores: 3 done, 51 pages written (17.0 avg), 6.25ms total (2.1ms avg)
-
-# axum: unmodified axum 0.8 / tokio (2 workers) through virtual sockets; ./run.sh axum (2026-09-20)
-# native baseline: axum_native_stress.py (real loopback sockets; 2 concurrent POSTs + GET /check per round; 3 tries each)
-native stress /inc: lost update after 1 rounds (3 requests) in 0.0s
-native stress /inc: lost update after 1 rounds (3 requests) in 0.0s
-native stress /inc: lost update after 1 rounds (3 requests) in 0.0s
-native stress /inc_nowait: lost update after 99 rounds (297 requests) in 0.1s
-native stress /inc_nowait: lost update after 204 rounds (612 requests) in 0.2s
-native stress /inc_nowait: lost update after 21 rounds (63 requests) in 0.0s
-tool=sandbox target=axum_counter case=inc_await seed=1 | failure on run 5: panic (lost update: counter 1 != increments 2) | runs 5 in 53.99ms (93/s), features 1085 edges + 71 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 3.0ms each | shrink: 61 -> 50 non-default choices (131 -> 136 decisions total) in 400 runs, 2.34s
-tool=sandbox target=axum_counter case=inc_await seed=2 | failure on run 28: panic (lost update: counter 1 != increments 2) | runs 28 in 401.91ms (70/s), features 1086 edges + 176 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 3.4ms each | shrink: 65 -> 64 non-default choices (163 -> 162 decisions total) in 400 runs, 2.40s
-tool=sandbox target=axum_counter case=inc_await seed=3 | failure on run 26: panic (lost update: counter 1 != increments 2) | runs 26 in 386.49ms (67/s), features 1086 edges + 152 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 4.0ms each | shrink: 104 -> 93 non-default choices (203 -> 195 decisions total) in 400 runs, 2.31s
-tool=sandbox target=axum_counter case=sum_split seed=1 | failure on run 66: http(500)  | runs 66 in 917.85ms (72/s), features 1361 edges + 277 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {HttpError(500)}, 1.1ms each | shrink: 37 -> 20 non-default choices (58 -> 59 decisions total) in 400 runs, 3.23s
-tool=sandbox target=axum_counter case=sum_split seed=2 | failure on run 8: http(500)  | runs 8 in 117.59ms (68/s), features 1361 edges + 99 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {HttpError(500)}, 3.2ms each | shrink: 64 -> 22 non-default choices (110 -> 75 decisions total) in 400 runs, 2.70s
-tool=sandbox target=axum_counter case=sum_split seed=3 | failure on run 3: http(500)  | runs 3 in 41.12ms (73/s), features 1317 edges + 66 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {HttpError(500)}, 3.9ms each | shrink: 85 -> 84 non-default choices (158 -> 158 decisions total) in 400 runs, 2.92s
-tool=sandbox target=axum_counter case=inc_nowait seed=1 | no failure  | runs 14505 in 600.05s (24/s), features 1083 edges + 9186 interleavings, failures 0, divergences 0 |  | 
-tool=sandbox target=axum_counter case=inc_nowait seed=2 | no failure  | runs 14375 in 600.02s (24/s), features 1083 edges + 9072 interleavings, failures 0, divergences 0 |  | 
-tool=sandbox target=axum_counter case=inc_nowait seed=3 | failure on run 10856: panic (lost update: counter 1 != increments 2) | runs 10856 in 363.86s (30/s), features 1116 edges + 8047 interleavings, failures 1, divergences 0 | replay x10: 1 distinct trace hash(es), outcomes {Panic}, 17.2ms each | shrink: 64 -> 48 non-default choices (144 -> 136 decisions total) in 400 runs, 16.88s
+lost_update  median      5  total      65  [3 15 4 3 9 2 9 5 10 5]
+deadlock     median   10.5  total     105  [1 23 9 2 10 6 11 11 19 13]
+sleep_race   median    1.5  total      28  [10 1 1 1 4 1 2 1 3 4]
+# all done

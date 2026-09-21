@@ -14,6 +14,12 @@ HERMIT=${HERMIT:-hermit}
 N=${1:-100}
 T=../targets/target/release
 export REVERIE_NO_PRECISE_IP=1
+# Without perf counters hermit silently resets --preemption-timeout to 0 (no preemption at all).
+p=$(cat /proc/sys/kernel/perf_event_paranoid)
+if [ "$p" -gt 1 ]; then
+  echo "hermit skipped: kernel.perf_event_paranoid=$p (needs <= 1; sudo sysctl kernel.perf_event_paranoid=1)"
+  exit 0
+fi
 
 sweep() {
   local label=$1 t=$2; shift 2

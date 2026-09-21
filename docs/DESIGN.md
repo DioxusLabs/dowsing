@@ -230,18 +230,24 @@ on two-thread targets (lost update, deadlock, timeout-dependent bug). Acceptance
 - 100/100 identical traces replaying a `Case` — met (`explore lost_update --replays 100`:
   1 distinct trace hash);
 - search finds each bug and reports the `Case`; shrink returns a short `Case` — bugs found
-  (with PCT rollouts and the coverage-guided tree: lost update in 4–9 runs, deadlock in 1–53,
-  timeout race in 1–6, three seeds each; 10-seed medians 5.5 / 9.5 / 1.5; before that 60–160 /
-  20–70 / 2–30);
-  shrink returns 5 decisions for the deadlock but 12 (5 non-default) for the lost update: the
+  (with PCT rollouts and the coverage-guided tree: lost update in 3–15 runs, deadlock in 1–53,
+  timeout race in 1–10, three seeds each; 10-seed medians 5 / 10.5 / 1.5 in the latest sitting,
+  5.5 / 9.5 / 1.5 in the one before; before the tree 60–160 / 20–70 / 2–30);
+  shrink returns 5 decisions for the deadlock but 8–12 (3–5 non-default) for the lost update: the
   race needs both threads inside the read/write window and the current shrinker only deletes
   and zeroes decisions, it does not merge adjacent `Budget` preemptions into one. Open;
 - restore-from-snapshot measured against re-execution on a target with an expensive prefix
   (`slow_setup`: 64 MB table, ~100 ms to first decision) — replay from snapshot 3.0 ms vs
-  ~100 ms fresh, restore 1.8 ms writing ~18 pages, search 262 runs/s (vs 1.9 ms per `fork()`
-  continuation and ~40 ms per CRIU restore of the same image; `sandbox/compare/README.md`);
-  the small targets run at 400–780 runs/s with ~1 ms restores;
+  ~100 ms fresh, restore 1.6–1.8 ms writing ~18 pages, search 136–262 runs/s (vs 1.5–1.9 ms per
+  `fork()` continuation and 35–41 ms per CRIU restore of the same image;
+  `sandbox/compare/README.md`); the small targets run at 300–900 runs/s with ~1 ms restores;
 - `cargo test`/`clippy` green for the root crate and `sandbox/` — met.
+
+Open: the search is deterministic per seed within one boot of the host (same run-to-failure
+repeated, pinned, under load), but between two boots of the same VM some seeds took a different
+trajectory on the same binaries (T1 seed 1: run 9 then run 3), i.e. something the target
+observes at exec time is host-state dependent and not yet under a model. Replay of a recorded
+`Case` is unaffected within a boot; cross-host replay is not yet guaranteed.
 
 Not in milestone 1: net/fs models (they are `Syscall` decisions and a fd model in `world`, slot
 already there), parallel supervisors, musl/static targets, signals as decisions.
